@@ -1,4 +1,4 @@
-﻿// Kuyumcu.PriceService/Services/GoldPriceBackgroundRefresher.cs
+// Kuyumcu.PriceService/Services/GoldPriceBackgroundRefresher.cs
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
@@ -20,7 +20,7 @@ namespace Kuyumcu.PriceService.Services
 
         public Task StartAsync(CancellationToken cancellationToken)
         {
-            var seconds = Math.Max(15, _cfg.GetValue<int>("Upstream:GoldApi:RefreshSeconds", 120));
+            var seconds = Math.Max(15, _cfg.GetValue<int>("Upstream:HaremApi:RefreshSeconds", 30));
             _timer = new Timer(async _ => await Tick(), null, TimeSpan.Zero, TimeSpan.FromSeconds(seconds));
             _log.LogInformation("Gold refresher started (every {sec}s).", seconds);
             return Task.CompletedTask;

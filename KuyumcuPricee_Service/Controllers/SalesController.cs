@@ -1,4 +1,4 @@
-﻿
+
 using System.Security.Claims;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
@@ -8,6 +8,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using kuyumcu_application.Abstractions;
 using KUYUMCU.Price_Service.Models; // DTO'lar için
+using KUYUMCU.Price_Service.Services;
 
 namespace KUYUMCU.Price_Service.Controllers;
 
@@ -130,9 +131,16 @@ public class SalesController : ControllerBase
                 ct: ct
             );
 
-            // 6) Parçayı “satıldı” yap
+            // 6) Parçayı “satıldı” yap + depo barkodlu/toplam düşümü
             item.IsInStock = false;
             item.UpdatedAt = DateTime.UtcNow;
+            var (depoOk, depoErr) = await DepoStokGramHelper.TryApplyBarcodedProductSoldAsync(_db, tenantId, sale.BranchId, item, ct);
+            if (!depoOk)
+            {
+                await tx.RollbackAsync(ct);
+                return BadRequest(new { error = depoErr });
+            }
+
             await _db.SaveChangesAsync(ct);
 
             await tx.CommitAsync(ct);
@@ -165,7 +173,7 @@ public class SalesController : ControllerBase
             foreach (var item in s.Items)
             {
                 var product = await _db.Products.AsNoTracking()
-                    .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.ProductCode == item.ProductCode, ct);
+                    .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.BranchId == s.BranchId && p.ProductCode == item.ProductCode, ct);
 
                 if (product is not null && item.Quantity > 0)
                 {
@@ -189,6 +197,12 @@ public class SalesController : ControllerBase
                         {
                             pItem.IsInStock = true;
                             pItem.UpdatedAt = DateTime.UtcNow;
+                            var (undoOk, undoErr) = await DepoStokGramHelper.TryUndoBarcodedProductSoldAsync(_db, tenantId, s.BranchId, pItem, ct);
+                            if (!undoOk)
+                            {
+                                await tx.RollbackAsync(ct);
+                                return BadRequest(new { error = undoErr });
+                            }
                         }
                     }
                 }

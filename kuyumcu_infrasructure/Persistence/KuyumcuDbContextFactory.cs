@@ -1,4 +1,4 @@
-﻿using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
 using kuyumcu_infrastructure.Tenancy;
 
@@ -22,7 +22,8 @@ namespace kuyumcu_infrastructure.Persistence
             const string connectionString = "server = .;database = KuyumcuDb8;integrated security = true; Encrypt=False;";
 
             var optionsBuilder = new DbContextOptionsBuilder<AppDbContext>();
-            optionsBuilder.UseSqlServer(connectionString);
+            // Migration sınıfları bu projede (kuyumcu_infrasructure); başlangıç projesi API olsa da aynı assembly kullanılmalı.
+            optionsBuilder.UseSqlServer(connectionString, b => b.MigrationsAssembly("kuyumcu_infrasructure"));
 
             // Tenant context'i sağlamak için mock (sahte) sınıf kullanıldı
             var dummyTenantContext = new DesignTimeTenantContext();

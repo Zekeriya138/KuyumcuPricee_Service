@@ -1,4 +1,4 @@
-﻿using kuyumcu_application.Abstractions;
+using kuyumcu_application.Abstractions;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
@@ -13,13 +13,18 @@ public class AuthService : IAuthService
 
     public async Task<User?> LoginAsync(Guid tenantId, string username, string password)
     {
+        var normalizedUsername = (username ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(normalizedUsername) || string.IsNullOrWhiteSpace(password))
+            return null;
+
         // Tenant filtresi + IsDeleted=false
         var user = await _db.Users
             .Include(u => u.Branch)
             .AsNoTracking()
             .FirstOrDefaultAsync(u =>
                 u.TenantId == tenantId &&
-                u.Username == username &&
+                u.Username == normalizedUsername &&
+                u.IsActive &&
                 !u.IsDeleted);
 
         if (user is null) return null;
@@ -27,17 +32,51 @@ public class AuthService : IAuthService
         return BCrypt.Net.BCrypt.Verify(password, user.PasswordHash) ? user : null;
     }
 
-    public async Task<bool> ResetPasswordAsync(Guid tenantId, string username, string nationalId, DateTime birthDate, string newPassword)
+    public async Task<bool> ResetPasswordAsync(Guid tenantId, string username, string nationalId, string newPassword)
     {
+        var normalizedUsername = (username ?? "").Trim();
+        var normalizedNationalId = (nationalId ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(normalizedUsername) ||
+            string.IsNullOrWhiteSpace(normalizedNationalId) ||
+            string.IsNullOrWhiteSpace(newPassword))
+            return false;
+
         var user = await _db.Users.FirstOrDefaultAsync(u =>
             u.TenantId == tenantId &&
-            u.Username == username &&
+            u.Username == normalizedUsername &&
             !u.IsDeleted);
 
         if (user is null) return false;
-        if ((user.NationalId ?? "").Trim() != (nationalId ?? "").Trim()) return false;
-        if (user.BirthDate?.Date != birthDate.Date) return false;
+        if ((user.NationalId ?? "").Trim() != normalizedNationalId) return false;
 
+        user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(newPassword);
+        await _db.SaveChangesAsync();
+        return true;
+    }
+
+    public async Task<bool> ResetCredentialsByDeveloperPasswordAsync(Guid tenantId, string nationalId, string newUsername, string newPassword)
+    {
+        var normalizedNationalId = (nationalId ?? "").Trim();
+        var normalizedUsername = (newUsername ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(normalizedNationalId) ||
+            string.IsNullOrWhiteSpace(normalizedUsername) ||
+            string.IsNullOrWhiteSpace(newPassword))
+            return false;
+
+        var user = await _db.Users.FirstOrDefaultAsync(u =>
+            u.TenantId == tenantId &&
+            !u.IsDeleted &&
+            (u.NationalId ?? "").Trim() == normalizedNationalId);
+        if (user is null) return false;
+
+        var usernameExists = await _db.Users.AnyAsync(u =>
+            u.TenantId == tenantId &&
+            !u.IsDeleted &&
+            u.Id != user.Id &&
+            u.Username == normalizedUsername);
+        if (usernameExists) return false;
+
+        user.Username = normalizedUsername;
         user.PasswordHash = BCrypt.Net.BCrypt.HashPassword(newPassword);
         await _db.SaveChangesAsync();
         return true;

@@ -1,4 +1,4 @@
-﻿// Kuyumcu.PriceService/Models/ProductItemDtos.cs
+// Kuyumcu.PriceService/Models/ProductItemDtos.cs
 using System;
 
 public sealed record CreateProductItemDto(
@@ -7,7 +7,8 @@ public sealed record CreateProductItemDto(
     string? Serial,
     string? Barcode,
     string Karat,
-    decimal Weight
+    decimal Weight,
+    decimal Cost
 );
 
 public sealed record UpdateProductItemDto(
@@ -16,7 +17,9 @@ public sealed record UpdateProductItemDto(
     decimal Weight,
     bool IsInStock,
     string? Serial,
-    string? Barcode
+    string? Barcode,
+    decimal Cost
+   
 );
 
 public sealed record ProductItemDto(
@@ -25,11 +28,24 @@ public sealed record ProductItemDto(
     Guid ProductId,
     string ProductCode,
     string ProductName,
+    string Category,
+    string? Olcu,
     string? Serial,
     string? Barcode,
     string Karat,
     decimal Weight,
+    decimal Cost,
     bool IsInStock,
     DateTime CreatedAt,
-    DateTime? UpdatedAt
+    DateTime? UpdatedAt,
+    string? MalTanim = null,
+    decimal? BelirlenenSatisFiyatiHas = null,
+    decimal? BirimSatisIscilikHas = null
 );
+public sealed class PagedResult<T>
+{
+    public int Total { get; set; }
+    public int Page { get; set; }
+    public int PageSize { get; set; }
+    public List<T> Items { get; set; } = new();
+}

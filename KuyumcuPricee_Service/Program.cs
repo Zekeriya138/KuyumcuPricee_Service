@@ -1,6 +1,10 @@
+using System.Net;
+using System.Net.Http;
+using System.Reflection;
 using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 
@@ -18,51 +22,60 @@ using kuyumcu_infrastructure.Services;
 using kuyumcu_application.Abstractions;
 using Kuyumcu.PriceService.Services;
 using Kuyumcu.PriceService.Models;
+using KUYUMCU.Price_Service.Services;
+using KUYUMCU.Price_Service.Middleware;
 using kuyumcu_infrastructure.Tenancy;
 
 var builder = WebApplication.CreateBuilder(args);
 var cfg = builder.Configuration;
 
-// ****************************** 1. SERVÝS TANIMLAMALARI ******************************
+// ****************************** 1. SERVï¿½S TANIMLAMALARI ******************************
 
 // Logging
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
 
-// DbContext
+// DbContext (MigrationsAssembly: migration'lar kuyumcu_infrasructure iÃ§inde)
 builder.Services.AddDbContext<AppDbContext>(opt =>
-    opt.UseSqlServer(cfg.GetConnectionString("SqlServer")));
+    opt.UseSqlServer(cfg.GetConnectionString("SqlServer"), b => b.MigrationsAssembly("kuyumcu_infrasructure"))
+       .ConfigureWarnings(w => w.Ignore(RelationalEventId.PendingModelChangesWarning)));
 
 // Http + CORS
 builder.Services.AddHttpClient();
 builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 
 
-// ---------------- GOLD API Feed ----------------
+// ---------------- HaremAPI fiyat beslemesi (https://haremapi.tr/docs/#prices-endpoints) ----------------
 builder.Services.AddSingleton<PriceCache>();
-builder.Services.AddHttpClient<GoldApiClient>();
+builder.Services.AddHttpClient<HaremApiClient>()
+    .ConfigurePrimaryHttpMessageHandler(static () => new SocketsHttpHandler
+    {
+        AutomaticDecompression = DecompressionMethods.All,
+        PooledConnectionLifetime = TimeSpan.FromMinutes(5)
+    });
 builder.Services.AddSingleton<GoldPriceService>();
+builder.Services.AddScoped<ExchangeRateService>();
 builder.Services.AddHostedService<GoldPriceBackgroundRefresher>();
 
 
-// ... (Satýr 75 civarý)
+// ... (Satï¿½r 75 civarï¿½)
 
-// ---------------- TENANT MANAGEMENT (GÜNCELLENDÝ) ----------------
+// ---------------- TENANT MANAGEMENT (Gï¿½NCELLENDï¿½) ----------------
 
-// ---------------- TENANT MANAGEMENT (DÜZELTÝLDÝ) ----------------
+// ---------------- TENANT MANAGEMENT (Dï¿½ZELTï¿½LDï¿½) ----------------
 builder.Services.AddHttpContextAccessor();
 
-// Tek bir TenantContext oluþtur (Scoped)
+// Tek bir TenantContext oluï¿½tur (Scoped)
 builder.Services.AddScoped<TenantContext>();
 
-// ITenantContext istendiðinde ayný instance dönsün
+// ITenantContext istendiï¿½inde aynï¿½ instance dï¿½nsï¿½n
 builder.Services.AddScoped<ITenantContext>(sp => sp.GetRequiredService<TenantContext>());
 // ---------------- END TENANT MANAGEMENT ----------------
 
 //builder.Services.AddHttpContextAccessor();
 
-//// Adým 1: Somut TenantContext sýnýfýný kaydet ve tüm lojiði buraya taþý
-//// Bu, ITenantContext'i DI'dan isteyen her þeyin doðru yapýlandýrmayý almasýný saðlar.
+//// Adï¿½m 1: Somut TenantContext sï¿½nï¿½fï¿½nï¿½ kaydet ve tï¿½m lojiï¿½i buraya taï¿½ï¿½
+//// Bu, ITenantContext'i DI'dan isteyen her ï¿½eyin doï¿½ru yapï¿½landï¿½rmayï¿½ almasï¿½nï¿½ saï¿½lar.
 //builder.Services.AddScoped<TenantContext>(sp =>
 //{
 //    var httpContextAccessor = sp.GetRequiredService<IHttpContextAccessor>();
@@ -100,30 +113,61 @@ builder.Services.AddScoped<ITenantContext>(sp => sp.GetRequiredService<TenantCon
 //    return new TenantContext { TenantId = tenantId, BranchId = branchId };
 //});
 
-//// Adým 2: ITenantContext arayüzü istendiðinde, somut sýnýfý döndür.
-//// Bu, TenantContext'in Fabrika Lojiði ile oluþturulduðunu garanti eder.
+//// Adï¿½m 2: ITenantContext arayï¿½zï¿½ istendiï¿½inde, somut sï¿½nï¿½fï¿½ dï¿½ndï¿½r.
+//// Bu, TenantContext'in Fabrika Lojiï¿½i ile oluï¿½turulduï¿½unu garanti eder.
 //builder.Services.AddScoped<ITenantContext>(sp => sp.GetRequiredService<TenantContext>());
 
 // ---------------- END TENANT MANAGEMENT ----------------
 
 
-// App services (Artýk ITenantContext'i güvenle çözebilirler)
+// App services (Artï¿½k ITenantContext'i gï¿½venle ï¿½ï¿½zebilirler)
 builder.Services.AddScoped<IAuthService, AuthService>();
 builder.Services.AddScoped<ICustomerService, CustomerService>();
 builder.Services.AddScoped<IStockService, StockService>(); // Stock 
+builder.Services.AddScoped<IScrapService, ScrapService>();   // Hurda stok
+builder.Services.AddScoped<IFinanceService, FinanceService>();
+builder.Services.AddScoped<IAiService, AiService>();
+builder.Services.AddScoped<IBranchSubscriptionService, BranchSubscriptionService>();
+builder.Services.AddScoped<IAccountingJournalService, AccountingJournalService>();
+builder.Services.AddScoped<IBalanceSheetService, BalanceSheetService>();
+builder.Services.AddSingleton<IJewelryTaxCalculator, JewelryTaxCalculator>();
+builder.Services.AddSingleton<IJewelryProductTypeMapper, JewelryProductTypeMapper>();
+builder.Services.AddScoped<IUblInvoiceBuilder, UblInvoiceBuilder>();
+builder.Services.AddScoped<IEInvoiceWorkflowService, EInvoiceWorkflowService>();
+builder.Services.AddScoped<IEInvoiceProviderResolver, EInvoiceProviderResolver>();
+builder.Services.AddHttpClient<EdmSoapEInvoiceProviderAdapter>((sp, client) =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    var endpoint = configuration["EInvoice:Edm:Endpoint"];
+    if (Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
+        client.BaseAddress = uri;
+    client.Timeout = TimeSpan.FromSeconds(60);
+});
+builder.Services.AddScoped<IEInvoiceProviderAdapter>(sp => sp.GetRequiredService<EdmSoapEInvoiceProviderAdapter>());
+builder.Services.AddHttpClient<UyumsoftEInvoiceProviderAdapter>((sp, client) =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    var baseUrl = configuration["EInvoice:Uyumsoft:BaseUrl"];
+    if (Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
+        client.BaseAddress = uri;
+    client.Timeout = TimeSpan.FromSeconds(45);
+});
+builder.Services.AddScoped<IEInvoiceProviderAdapter>(sp => sp.GetRequiredService<UyumsoftEInvoiceProviderAdapter>());
+builder.Services.AddScoped<IEInvoiceProviderAdapter, StubEInvoiceProviderAdapter>();
+builder.Services.AddHostedService<EInvoiceOutboxWorker>();
 
 // Controllers
 builder.Services.AddControllers();
 
 
-// Yetkilendirme Politikalarý
+// Yetkilendirme Politikalarï¿½
 builder.Services.AddAuthorization(opts =>
 {
-    opts.AddPolicy("BranchAdmin", p => p.RequireRole("Owner", "Manager"));
+    opts.AddPolicy("BranchAdmin", p => p.RequireRole("Owner", "Admin"));
 });
 
 
-// JWT Authentication Þemasý
+// JWT Authentication ï¿½emasï¿½
 builder.Services
     .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(o =>
@@ -145,15 +189,15 @@ builder.Services.AddAuthorization();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    // API Key Tanýmý
+    // API Key Tanï¿½mï¿½
     c.AddSecurityDefinition("ApiKey", new OpenApiSecurityScheme
     {
         In = ParameterLocation.Header,
         Name = cfg["Auth:HeaderName"] ?? "x-app-key",
         Type = SecuritySchemeType.ApiKey,
-        Description = "Uygulama anahtarý"
+        Description = "Uygulama anahtarï¿½"
     });
-    // JWT Bearer Tanýmý
+    // JWT Bearer Tanï¿½mï¿½
     c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
         Name = "Authorization",
@@ -163,7 +207,7 @@ builder.Services.AddSwaggerGen(c =>
         In = ParameterLocation.Header,
         Description = "Bearer {token}"
     });
-    // Güvenlik Gereksinimleri
+    // Gï¿½venlik Gereksinimleri
     c.AddSecurityRequirement(new OpenApiSecurityRequirement
     {
         { new OpenApiSecurityScheme{Reference=new OpenApiReference{Type=ReferenceType.SecurityScheme,Id="ApiKey"}}, Array.Empty<string>() },
@@ -171,16 +215,289 @@ builder.Services.AddSwaggerGen(c =>
     });
 });
 
+// User Secrets en son: appsettings'teki boÅŸ ApiKey ile ezilmesin (Upstream:HaremApi:ApiKey)
+builder.Configuration.AddUserSecrets(Assembly.GetExecutingAssembly(), optional: true);
+
 var app = builder.Build();
 
 // ****************************** 2. REQUEST PIPELINE ******************************
 
-// DB migrate + seed (Tek bir noktada toplandý)
+// DB migrate + seed (Tek bir noktada toplandï¿½)
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+    await db.Database.MigrateAsync();
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'InventoryType') ALTER TABLE Products ADD InventoryType int NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'StokMiktari') ALTER TABLE Products ADD StokMiktari int NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'ZiynetTipi') ALTER TABLE Products ADD ZiynetTipi nvarchar(32) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'IsSpecialProduct') ALTER TABLE Products ADD IsSpecialProduct bit NOT NULL DEFAULT 0");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'BirimSatisIscilikHas') ALTER TABLE Products ADD BirimSatisIscilikHas decimal(18,4) NULL");
+        // Ã–zel tekil Ã¼rÃ¼nlerde StokMiktari 0 kalmÄ±ÅŸ; ilgili kiracÄ±da hiÃ§ satÄ±ÅŸ kalemi yoksa 1 yap (Sales join gerekmez).
+        try
+        {
+            await db.Database.ExecuteSqlRawAsync(@"
+UPDATE p SET p.StokMiktari = 1
+FROM Products p
+WHERE p.IsDeleted = 0
+  AND p.IsSpecialProduct = 1
+  AND (p.InventoryType IS NULL OR p.InventoryType = 0)
+  AND (p.StokMiktari IS NULL OR p.StokMiktari = 0)
+  AND p.Barcode IS NOT NULL AND LEN(LTRIM(RTRIM(p.Barcode))) >= 10
+  AND NOT EXISTS (
+    SELECT 1 FROM SaleItems si
+    WHERE si.TenantId = p.TenantId AND si.ProductCode = p.ProductCode
+  )");
+        }
+        catch (Exception ex) { Console.WriteLine("FixOzelTekilStok: " + ex.Message); }
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Customers') AND name = 'Note') ALTER TABLE Customers ADD Note nvarchar(2000) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Customers') AND name = 'TedarikciExtJson') ALTER TABLE Customers ADD TedarikciExtJson nvarchar(max) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanManageUsers') ALTER TABLE Users ADD CanManageUsers bit NOT NULL CONSTRAINT DF_Users_CanManageUsers DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanManageBranches') ALTER TABLE Users ADD CanManageBranches bit NOT NULL CONSTRAINT DF_Users_CanManageBranches DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanSwitchBranches') ALTER TABLE Users ADD CanSwitchBranches bit NOT NULL CONSTRAINT DF_Users_CanSwitchBranches DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanUseEInvoice') ALTER TABLE Users ADD CanUseEInvoice bit NOT NULL CONSTRAINT DF_Users_CanUseEInvoice DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanUseEArchive') ALTER TABLE Users ADD CanUseEArchive bit NOT NULL CONSTRAINT DF_Users_CanUseEArchive DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"UPDATE Users SET Role='Admin' WHERE Role='Manager'");
+        // Users.IsActive, UserSalaryHistories, RateDisplaySettings: EF migration 20260414150057_kjdavkjahsj ile yÃ¶netiliyor.
+        // Ancak bazÄ± ortamlarda migration atlanabildiÄŸi iÃ§in RateDisplaySettings.BranchId iÃ§in emniyetli/idempotent dÃ¼zeltme.
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[RateDisplaySettings]', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('RateDisplaySettings') AND name = 'BranchId')
+    ALTER TABLE [RateDisplaySettings] ADD [BranchId] uniqueidentifier NULL");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[RateDisplaySettings]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('RateDisplaySettings') AND name = 'BidTlOffset')
+        ALTER TABLE [RateDisplaySettings] ADD [BidTlOffset] decimal(18,4) NOT NULL CONSTRAINT [DF_RateDisplaySettings_BidTlOffset] DEFAULT 0;
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('RateDisplaySettings') AND name = 'AskTlOffset')
+        ALTER TABLE [RateDisplaySettings] ADD [AskTlOffset] decimal(18,4) NOT NULL CONSTRAINT [DF_RateDisplaySettings_AskTlOffset] DEFAULT 0;
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipDocuments]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[ExpenseSlipDocuments](
+        [Id] uniqueidentifier NOT NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [SourceSaleId] uniqueidentifier NULL,
+        [DocumentNo] nvarchar(64) NOT NULL,
+        [Status] nvarchar(32) NOT NULL,
+        [Currency] nvarchar(8) NOT NULL,
+        [GrandTotal] decimal(18,2) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_GrandTotal] DEFAULT(0),
+        [BuyerName] nvarchar(256) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_BuyerName] DEFAULT(N''),
+        [BuyerTaxNumber] nvarchar(32) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_BuyerTaxNumber] DEFAULT(N''),
+        [Description] nvarchar(512) NULL,
+        [PayloadJson] nvarchar(max) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_PayloadJson] DEFAULT(N'{}'),
+        [RawLastResponse] nvarchar(max) NULL,
+        [IntegratorDocumentId] nvarchar(128) NULL,
+        [Uuid] nvarchar(64) NULL,
+        [LastError] nvarchar(1000) NULL,
+        [RetryCount] int NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_RetryCount] DEFAULT(0),
+        [SubmittedAt] datetime2 NULL,
+        CONSTRAINT [PK_ExpenseSlipDocuments] PRIMARY KEY ([Id])
+    );
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipDocuments]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('ExpenseSlipDocuments') AND name = 'RawLastResponse')
+        ALTER TABLE [dbo].[ExpenseSlipDocuments] ADD [RawLastResponse] nvarchar(max) NULL;
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ExpenseSlipDocuments_Tenant_Branch_Status_CreatedAt' AND object_id = OBJECT_ID('ExpenseSlipDocuments'))
+        CREATE INDEX [IX_ExpenseSlipDocuments_Tenant_Branch_Status_CreatedAt]
+            ON [dbo].[ExpenseSlipDocuments]([TenantId], [BranchId], [Status], [CreatedAt]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ExpenseSlipDocuments_Tenant_DocumentNo' AND object_id = OBJECT_ID('ExpenseSlipDocuments'))
+        CREATE UNIQUE INDEX [IX_ExpenseSlipDocuments_Tenant_DocumentNo]
+            ON [dbo].[ExpenseSlipDocuments]([TenantId], [DocumentNo]);
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF COL_LENGTH('EInvoiceProfiles', 'IntegratorCompanyCode') IS NOT NULL
+BEGIN
+    ALTER TABLE [dbo].[EInvoiceProfiles] ALTER COLUMN [IntegratorCompanyCode] nvarchar(max) NULL;
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipAuditLogs]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[ExpenseSlipAuditLogs](
+        [Id] uniqueidentifier NOT NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_ExpenseSlipAuditLogs_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [DocumentId] uniqueidentifier NOT NULL,
+        [Action] nvarchar(64) NOT NULL,
+        [StatusBefore] nvarchar(32) NULL,
+        [StatusAfter] nvarchar(32) NULL,
+        [IsSuccess] bit NOT NULL CONSTRAINT [DF_ExpenseSlipAuditLogs_IsSuccess] DEFAULT(0),
+        [RequestJson] nvarchar(max) NULL,
+        [ResponseRaw] nvarchar(max) NULL,
+        [ErrorMessage] nvarchar(1000) NULL,
+        CONSTRAINT [PK_ExpenseSlipAuditLogs] PRIMARY KEY ([Id])
+    );
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipAuditLogs]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_ExpenseSlipAuditLogs_Tenant_Branch_Document_CreatedAt' AND object_id = OBJECT_ID('ExpenseSlipAuditLogs'))
+        CREATE INDEX [IX_ExpenseSlipAuditLogs_Tenant_Branch_Document_CreatedAt]
+            ON [dbo].[ExpenseSlipAuditLogs]([TenantId], [BranchId], [DocumentId], [CreatedAt]);
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[RateDisplaySettings]', N'U') IS NOT NULL
+   AND EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('RateDisplaySettings') AND name = 'BranchId')
+BEGIN
+    ;WITH FirstBranch AS (
+        SELECT t.Id AS TenantId,
+               (
+                   SELECT TOP 1 b2.Id
+                   FROM Branches b2
+                   WHERE b2.TenantId = t.Id
+                   ORDER BY b2.CreatedAt
+               ) AS BranchId
+        FROM Tenants t
+    )
+    UPDATE r
+    SET r.BranchId = fb.BranchId
+    FROM RateDisplaySettings r
+    INNER JOIN FirstBranch fb ON fb.TenantId = r.TenantId
+    WHERE r.BranchId IS NULL
+      AND fb.BranchId IS NOT NULL;
+
+    UPDATE r
+    SET r.BidTlOffset = r.TlOffset,
+        r.AskTlOffset = r.TlOffset
+    FROM RateDisplaySettings r
+    WHERE r.BidTlOffset = 0
+      AND r.AskTlOffset = 0
+      AND r.TlOffset <> 0;
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[RateDisplaySettings]', N'U') IS NOT NULL
+   AND EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('RateDisplaySettings') AND name = 'BranchId')
+BEGIN
+    IF EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RateDisplaySettings_TenantId_Code' AND object_id = OBJECT_ID(N'[RateDisplaySettings]'))
+        DROP INDEX [IX_RateDisplaySettings_TenantId_Code] ON [RateDisplaySettings];
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RateDisplaySettings_BranchId' AND object_id = OBJECT_ID(N'[RateDisplaySettings]'))
+        CREATE INDEX [IX_RateDisplaySettings_BranchId] ON [RateDisplaySettings]([BranchId]);
+
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_RateDisplaySettings_TenantId_BranchId_Code' AND object_id = OBJECT_ID(N'[RateDisplaySettings]'))
+        CREATE UNIQUE INDEX [IX_RateDisplaySettings_TenantId_BranchId_Code] ON [RateDisplaySettings]([TenantId], [BranchId], [Code]);
+
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_RateDisplaySettings_Branches_BranchId')
+        ALTER TABLE [RateDisplaySettings] WITH CHECK
+        ADD CONSTRAINT [FK_RateDisplaySettings_Branches_BranchId]
+        FOREIGN KEY([BranchId]) REFERENCES [Branches]([Id]) ON DELETE NO ACTION;
+END");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'SupplierCode') ALTER TABLE Suppliers ADD SupplierCode nvarchar(32) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'CompanyName') ALTER TABLE Suppliers ADD CompanyName nvarchar(200) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'ContactName') ALTER TABLE Suppliers ADD ContactName nvarchar(100) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'SupplierType') ALTER TABLE Suppliers ADD SupplierType int NOT NULL DEFAULT 0");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'Whatsapp') ALTER TABLE Suppliers ADD Whatsapp nvarchar(32) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'City') ALTER TABLE Suppliers ADD City nvarchar(64) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'District') ALTER TABLE Suppliers ADD District nvarchar(64) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'Notes') ALTER TABLE Suppliers ADD Notes nvarchar(2000) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'Balance') ALTER TABLE Suppliers ADD Balance decimal(18,2) NOT NULL DEFAULT 0");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'IsActive') ALTER TABLE Suppliers ADD IsActive bit NOT NULL DEFAULT 1");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BranchSubscriptions]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[BranchSubscriptions](
+        [Id] uniqueidentifier NOT NULL,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [PeriodType] int NOT NULL,
+        [PackageType] int NOT NULL,
+        [Status] int NOT NULL,
+        [IsLifetime] bit NOT NULL CONSTRAINT [DF_BranchSubscriptions_IsLifetime] DEFAULT(0),
+        [IncludesEInvoice] bit NOT NULL CONSTRAINT [DF_BranchSubscriptions_IncludesEInvoice] DEFAULT(0),
+        [IncludesAiAssistant] bit NOT NULL CONSTRAINT [DF_BranchSubscriptions_IncludesAiAssistant] DEFAULT(0),
+        [Price] decimal(18,2) NOT NULL CONSTRAINT [DF_BranchSubscriptions_Price] DEFAULT(0),
+        [Currency] nvarchar(8) NOT NULL CONSTRAINT [DF_BranchSubscriptions_Currency] DEFAULT(N'TRY'),
+        [StartsAtUtc] datetime2 NULL,
+        [EndsAtUtc] datetime2 NULL,
+        [LastPaymentAtUtc] datetime2 NULL,
+        [LastCheckedAtUtc] datetime2 NULL,
+        [IyzipayConversationId] nvarchar(120) NULL,
+        [IyzipayToken] nvarchar(120) NULL,
+        [IyzipayPaymentId] nvarchar(120) NULL,
+        [IyzipayStatus] nvarchar(64) NULL,
+        [IyzipayRawResponse] nvarchar(max) NULL,
+        [Note] nvarchar(500) NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_BranchSubscriptions_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_BranchSubscriptions_CreatedAt] DEFAULT(sysutcdatetime()),
+        CONSTRAINT [PK_BranchSubscriptions] PRIMARY KEY CLUSTERED([Id] ASC)
+    );
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BranchSubscriptions]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_BranchSubscriptions_Tenant_Branch_CreatedAt' AND object_id = OBJECT_ID(N'[BranchSubscriptions]'))
+        CREATE INDEX [IX_BranchSubscriptions_Tenant_Branch_CreatedAt] ON [dbo].[BranchSubscriptions]([TenantId],[BranchId],[CreatedAt]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_BranchSubscriptions_Tenant_Branch_Status_EndsAtUtc' AND object_id = OBJECT_ID(N'[BranchSubscriptions]'))
+        CREATE INDEX [IX_BranchSubscriptions_Tenant_Branch_Status_EndsAtUtc] ON [dbo].[BranchSubscriptions]([TenantId],[BranchId],[Status],[EndsAtUtc]);
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_BranchSubscriptions_Branches_BranchId')
+        ALTER TABLE [dbo].[BranchSubscriptions]  WITH CHECK ADD CONSTRAINT [FK_BranchSubscriptions_Branches_BranchId] FOREIGN KEY([BranchId])
+        REFERENCES [dbo].[Branches] ([Id]) ON DELETE NO ACTION;
+END");
+        // Product.BranchId geÃ§iÅŸinde (eski veri) ÅŸube tarihinden eski Ã¼rÃ¼nler yanlÄ±ÅŸ ÅŸubeye dÃ¼ÅŸmÃ¼ÅŸ olabilir.
+        // Kural: Ã¼rÃ¼n tarihi > seÃ§ilen ÅŸube oluÅŸturma tarihi olmalÄ±; deÄŸilse tenant'Ä±n ilk ÅŸubesine geri taÅŸÄ±.
+        await db.Database.ExecuteSqlRawAsync(@"
+;WITH FirstBranch AS (
+    SELECT t.Id AS TenantId,
+           (
+               SELECT TOP 1 b2.Id
+               FROM Branches b2
+               WHERE b2.TenantId = t.Id
+               ORDER BY b2.CreatedAt
+           ) AS BranchId
+    FROM Tenants t
+)
+UPDATE p
+SET p.BranchId = fb.BranchId
+FROM Products p
+INNER JOIN Branches b ON b.Id = p.BranchId
+INNER JOIN FirstBranch fb ON fb.TenantId = p.TenantId
+WHERE p.CreatedAt < b.CreatedAt
+  AND fb.BranchId IS NOT NULL
+  AND p.BranchId <> fb.BranchId;
+");
+        // Ä°lk ÅŸube, yanlÄ±ÅŸlÄ±kla soft-delete olduysa tarihsel veriye eriÅŸim iÃ§in geri aÃ§.
+        await db.Database.ExecuteSqlRawAsync(@"
+;WITH FirstBranch AS (
+    SELECT t.Id AS TenantId,
+           (
+               SELECT TOP 1 b2.Id
+               FROM Branches b2
+               WHERE b2.TenantId = t.Id
+               ORDER BY b2.CreatedAt
+           ) AS BranchId
+    FROM Tenants t
+)
+UPDATE b
+SET b.IsDeleted = 0,
+    b.IsActive = 1
+FROM Branches b
+INNER JOIN FirstBranch fb ON fb.BranchId = b.Id
+WHERE b.IsDeleted = 1;
+");
+    }
+    catch (Exception ex) { Console.WriteLine("EnsureColumns: " + ex.Message); }
     var configuration = scope.ServiceProvider.GetRequiredService<IConfiguration>();
     await DbInitializer.EnsureSeedAsync(db, configuration);
+}
+
+// Harem kurlarÄ±: uygulama aÃ§Ä±lÄ±r aÃ§Ä±lmaz bir kez doldur (arka plan zamanlayÄ±cÄ±sÄ±ndan Ã¶nce)
+try
+{
+    var goldSvc = app.Services.GetRequiredService<GoldPriceService>();
+    await goldSvc.RefreshAsync(CancellationToken.None);
+}
+catch (Exception ex)
+{
+    Console.WriteLine("Ä°lk kur yenileme atlandÄ±: " + ex.Message);
 }
 
 // CORS + Swagger
@@ -188,13 +505,28 @@ app.UseCors();
 app.UseSwagger();
 app.UseSwaggerUI();
 
-// 1. Custom API-Key middleware (JWT'den önce çalýþýr)
+// Global exception handler: 500 hatalarÄ±nda JSON { "detail": "..." } dÃ¶ndÃ¼r (masaÃ¼stÃ¼ uygulama gÃ¶sterebilsin)
+app.Use(async (ctx, next) =>
+{
+    try { await next(ctx); }
+    catch (Exception ex)
+    {
+        ctx.Response.StatusCode = 500;
+        ctx.Response.ContentType = "application/json; charset=utf-8";
+        var msg = ex.Message;
+        if (ex.InnerException != null) msg += " | " + ex.InnerException.Message;
+        await ctx.Response.WriteAsJsonAsync(new { detail = msg, error = msg });
+    }
+});
+
+// 1. Custom API-Key middleware (JWT'den ï¿½nce ï¿½alï¿½ï¿½ï¿½r)
 app.Use(async (ctx, next) =>
 {
     var p = ctx.Request.Path.Value ?? "";
-    // Swagger, /api/auth ve /ping endpoint'lerini serbest býrak
+    // Swagger, /api/auth ve /ping endpoint'lerini serbest bï¿½rak
     if (p.StartsWith("/swagger", StringComparison.OrdinalIgnoreCase) ||
         p.StartsWith("/api/auth", StringComparison.OrdinalIgnoreCase) ||
+        p.StartsWith("/api/einvoice/webhook", StringComparison.OrdinalIgnoreCase) ||
         p.Equals("/ping", StringComparison.OrdinalIgnoreCase))
     { await next(); return; }
 
@@ -213,14 +545,15 @@ app.Use(async (ctx, next) =>
 });
 
 
-// Standart ASP.NET Core sýralamasý:
-// 2. Authentication (JWT Token'ý doðrular)
+// Standart ASP.NET Core sï¿½ralamasï¿½:
+// 2. Authentication (JWT Token'ï¿½ doï¿½rular)
 app.UseAuthentication();
 
-// 3. Tenant Middleware (JWT’den User.Claims dolduktan SONRA tenant’ý doldurur)
+// 3. Tenant Middleware (JWTï¿½den User.Claims dolduktan SONRA tenantï¿½ï¿½ doldurur)
 app.UseMiddleware<kuyumcu_infrastructure.Tenancy.TenantMiddleware>();
+app.UseMiddleware<BranchSubscriptionMiddleware>();
 
-// 4. Authorization (Claims'e göre [Authorize] attribute'lerini kontrol eder)
+// 4. Authorization (Claims'e gï¿½re [Authorize] attribute'lerini kontrol eder)
 app.UseAuthorization();
 
 
@@ -239,10 +572,10 @@ app.MapPost("/gold/refresh", async (GoldPriceService svc, CancellationToken ct) 
     var list = await svc.RefreshAsync(ct);
     return Results.Ok(list);
 });
-app.MapGet("/gold/fx-debug", async (GoldApiClient cli, CancellationToken ct) =>
+app.MapGet("/gold/harem-debug", async (HaremApiClient cli, CancellationToken ct) =>
 {
-    var (u, e, eu) = await cli.FetchFxAsync(ct);
-    return Results.Ok(new { usdtry = u, eurtry = e, eurusd = eu });
+    var r = await cli.FetchPricesAsync(ct);
+    return Results.Ok(new { count = r.Items.Count, updatedAt = r.UpdatedAt, stale = r.Stale, sample = r.Items.Take(12) });
 });
 
 app.Run();
@@ -259,8 +592,8 @@ app.Run();
 //using Microsoft.Extensions.Configuration;
 //using Microsoft.Extensions.DependencyInjection;
 //using System.Security.Claims;
-//using Microsoft.AspNetCore.Builder; // WebApplicationBuilder için
-//using Microsoft.AspNetCore.Hosting; // Hosting Environment için
+//using Microsoft.AspNetCore.Builder; // WebApplicationBuilder iï¿½in
+//using Microsoft.AspNetCore.Hosting; // Hosting Environment iï¿½in
 
 //// domain/app/infra
 //using kuyumcu_infrastructure.Persistence;
@@ -273,7 +606,7 @@ app.Run();
 //var builder = WebApplication.CreateBuilder(args);
 //var cfg = builder.Configuration;
 
-//// ****************************** 1. SERVÝS TANIMLAMALARI ******************************
+//// ****************************** 1. SERVï¿½S TANIMLAMALARI ******************************
 
 //// Logging
 //builder.Logging.ClearProviders();
@@ -286,23 +619,23 @@ app.Run();
 //// App services
 //builder.Services.AddScoped<IAuthService, AuthService>();
 //builder.Services.AddScoped<ICustomerService, CustomerService>();
-//// Kuyumcu.PriceService.Models namespace'indeki PriceCache ve GoldApiClient'i kullanmak için
-//// Sadece bir tanesi kaldý.
-//// builder.Services.AddScoped<kuyumcu_infrastructure.Tenancy.TenantContext>(); // Tekrarlýydý, kaldýrýldý
+//// Kuyumcu.PriceService.Models namespace'indeki PriceCache ve GoldApiClient'i kullanmak iï¿½in
+//// Sadece bir tanesi kaldï¿½.
+//// builder.Services.AddScoped<kuyumcu_infrastructure.Tenancy.TenantContext>(); // Tekrarlï¿½ydï¿½, kaldï¿½rï¿½ldï¿½
 
 //// Http + CORS
 //builder.Services.AddHttpClient();
 //builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 
 //// ---------------- GoldAPI Feed ----------------
-//// Tekrarlý kayýtlar temizlendi.
+//// Tekrarlï¿½ kayï¿½tlar temizlendi.
 //builder.Services.AddSingleton<PriceCache>();
 //builder.Services.AddHttpClient<GoldApiClient>();
 //builder.Services.AddSingleton<GoldPriceService>();
 //builder.Services.AddHostedService<GoldPriceBackgroundRefresher>();
-//// builder.Services.AddScoped<TenantContext>(); // Tekrarlýydý, kaldýrýldý
+//// builder.Services.AddScoped<TenantContext>(); // Tekrarlï¿½ydï¿½, kaldï¿½rï¿½ldï¿½
 
-//// Yetkilendirme Politikalarý
+//// Yetkilendirme Politikalarï¿½
 //builder.Services.AddAuthorization(opts =>
 //{
 //    opts.AddPolicy("BranchAdmin", p => p.RequireRole("Owner", "Manager"));
@@ -314,7 +647,7 @@ app.Run();
 //// Stock 
 //builder.Services.AddScoped<IStockService, StockService>();
 
-//// JWT Authentication Þemasý
+//// JWT Authentication ï¿½emasï¿½
 //builder.Services
 //    .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 //    .AddJwtBearer(o =>
@@ -329,11 +662,11 @@ app.Run();
 //            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(cfg["Jwt:Key"]!))
 //        };
 //    });
-//builder.Services.AddAuthorization(); // Authorization hizmetini etkinleþtir
+//builder.Services.AddAuthorization(); // Authorization hizmetini etkinleï¿½tir
 
 //// Tenant Management
 //builder.Services.AddHttpContextAccessor();
-//// Tenant Context'in JWT veya Header'dan ID okumasýný saðla
+//// Tenant Context'in JWT veya Header'dan ID okumasï¿½nï¿½ saï¿½la
 //builder.Services.AddScoped<ITenantContext>(sp =>
 //{
 //    var http = sp.GetRequiredService<IHttpContextAccessor>().HttpContext;
@@ -347,7 +680,7 @@ app.Run();
 //        tenantStr = http?.Request.Headers["X-Tenant-Id"].FirstOrDefault();
 //    }
 
-//    // Tasarým zamaný veya boþ durum için fallback
+//    // Tasarï¿½m zamanï¿½ veya boï¿½ durum iï¿½in fallback
 //    if (string.IsNullOrWhiteSpace(tenantStr) || !Guid.TryParse(tenantStr, out var tenantId))
 //    {
 //        tenantId = Guid.Parse("00000000-0000-0000-0000-000000000001"); // sabit DefaultTenant
@@ -360,15 +693,15 @@ app.Run();
 //builder.Services.AddEndpointsApiExplorer();
 //builder.Services.AddSwaggerGen(c =>
 //{
-//    // API Key Tanýmý
+//    // API Key Tanï¿½mï¿½
 //    c.AddSecurityDefinition("ApiKey", new OpenApiSecurityScheme
 //    {
 //        In = ParameterLocation.Header,
 //        Name = cfg["Auth:HeaderName"] ?? "x-app-key",
 //        Type = SecuritySchemeType.ApiKey,
-//        Description = "Uygulama anahtarý"
+//        Description = "Uygulama anahtarï¿½"
 //    });
-//    // JWT Bearer Tanýmý
+//    // JWT Bearer Tanï¿½mï¿½
 //    c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
 //    {
 //        Name = "Authorization",
@@ -378,7 +711,7 @@ app.Run();
 //        In = ParameterLocation.Header,
 //        Description = "Bearer {token}"
 //    });
-//    // Güvenlik Gereksinimleri
+//    // Gï¿½venlik Gereksinimleri
 //    c.AddSecurityRequirement(new OpenApiSecurityRequirement
 //    {
 //        { new OpenApiSecurityScheme{Reference=new OpenApiReference{Type=ReferenceType.SecurityScheme,Id="ApiKey"}}, Array.Empty<string>() },
@@ -390,12 +723,12 @@ app.Run();
 
 //// ****************************** 2. REQUEST PIPELINE ******************************
 
-//// DB migrate + seed (Tek bir noktada toplandý)
+//// DB migrate + seed (Tek bir noktada toplandï¿½)
 //using (var scope = app.Services.CreateScope())
 //{
 //    var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 //    var configuration = scope.ServiceProvider.GetRequiredService<IConfiguration>();
-//    // DbInitializer'ýn namespace'i ile çaðrýlmasý (CS0103 hatasýný çözer)
+//    // DbInitializer'ï¿½n namespace'i ile ï¿½aï¿½rï¿½lmasï¿½ (CS0103 hatasï¿½nï¿½ ï¿½ï¿½zer)
 //    await DbInitializer.EnsureSeedAsync(db, configuration);
 //}
 
@@ -404,11 +737,11 @@ app.Run();
 //app.UseSwagger();
 //app.UseSwaggerUI();
 
-//// 1. Custom API-Key middleware (JWT'den önce çalýþýr)
+//// 1. Custom API-Key middleware (JWT'den ï¿½nce ï¿½alï¿½ï¿½ï¿½r)
 //app.Use(async (ctx, next) =>
 //{
 //    var p = ctx.Request.Path.Value ?? "";
-//    // Swagger, /api/auth ve /ping endpoint'lerini serbest býrak
+//    // Swagger, /api/auth ve /ping endpoint'lerini serbest bï¿½rak
 //    if (p.StartsWith("/swagger", StringComparison.OrdinalIgnoreCase) ||
 //        p.StartsWith("/api/auth", StringComparison.OrdinalIgnoreCase) ||
 //        p.Equals("/ping", StringComparison.OrdinalIgnoreCase))
@@ -421,7 +754,7 @@ app.Run();
 //        !allowed.Contains(key.ToString(), StringComparer.Ordinal))
 //    {
 //        ctx.Response.StatusCode = 401;
-//        // ctx.Response.WriteAsync'in doðru þekilde çaðrýlmasý
+//        // ctx.Response.WriteAsync'in doï¿½ru ï¿½ekilde ï¿½aï¿½rï¿½lmasï¿½
 //        await ctx.Response.WriteAsync("Unauthorized: Missing or invalid App Key");
 //        return;
 //    }
@@ -430,16 +763,16 @@ app.Run();
 //});
 
 
-//// Standart ASP.NET Core sýralamasý:
-//// 2. Authentication (JWT Token'ý doðrular)
+//// Standart ASP.NET Core sï¿½ralamasï¿½:
+//// 2. Authentication (JWT Token'ï¿½ doï¿½rular)
 //app.UseAuthentication();
-//// Not: Duplicate UseAuthentication çaðrýsý kaldýrýldý.
+//// Not: Duplicate UseAuthentication ï¿½aï¿½rï¿½sï¿½ kaldï¿½rï¿½ldï¿½.
 
-//// 3. Tenant Middleware (JWT’den User.Claims dolduktan SONRA tenant’ý doldurur)
+//// 3. Tenant Middleware (JWTï¿½den User.Claims dolduktan SONRA tenantï¿½ï¿½ doldurur)
 //app.UseMiddleware<kuyumcu_infrastructure.Tenancy.TenantMiddleware>();
 
-//// 4. Authorization (Claims'e göre [Authorize] attribute'lerini kontrol eder)
-//// Not: Duplicate UseAuthorization çaðrýsý kaldýrýldý.
+//// 4. Authorization (Claims'e gï¿½re [Authorize] attribute'lerini kontrol eder)
+//// Not: Duplicate UseAuthorization ï¿½aï¿½rï¿½sï¿½ kaldï¿½rï¿½ldï¿½.
 //app.UseAuthorization();
 
 

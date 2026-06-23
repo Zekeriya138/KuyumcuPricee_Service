@@ -1,0 +1,13 @@
+namespace kuyumcu_domain.Enums
+{
+    /// <summary>Hatırlatma tekrar sıklığı.</summary>
+    public enum ReminderFrequency
+    {
+        Hourly = 0,
+        Daily = 1,
+        Weekly = 2,
+        Monthly = 3,
+        Yearly = 4,
+        Once = 5
+    }
+}

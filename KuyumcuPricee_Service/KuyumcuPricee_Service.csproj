@@ -1,13 +1,15 @@
-﻿<Project Sdk="Microsoft.NET.Sdk.Web">
+<Project Sdk="Microsoft.NET.Sdk.Web">
 
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <UserSecretsId>kuyumcu-price-harem-9f3c2a1e-8b7d-4c6a-9e2f-1a0b3d5e7f90</UserSecretsId>
   </PropertyGroup>
 	
 	<ItemGroup>
 		<PackageReference Include="BCrypt.Net-Next" Version="4.0.3" />
+		<PackageReference Include="Iyzipay" Version="2.1.78" />
 		<PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="8.0.19" />
 		<PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="9.0.8">
 			<PrivateAssets>all</PrivateAssets>
@@ -25,10 +27,6 @@
 		<PackageReference Include="Swashbuckle.AspNetCore" Version="9.0.4" />
 	</ItemGroup>
 	
-  <ItemGroup>
-    <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
-  </ItemGroup>
-
   <ItemGroup>
     <ProjectReference Include="..\kuyumcu_aplication\kuyumcu_aplication.csproj" />
     <ProjectReference Include="..\kuyumcu_domain\kuyumcu_domain.csproj" />

@@ -1,4 +1,4 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.13.35825.156 d17.13
@@ -10,6 +10,8 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "kuyumcu_domain", "kuyumcu_domain\kuyumcu_domain.csproj", "{86281843-51A1-4946-AF59-811E674E20C0}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "kuyumcu_infrasructure", "kuyumcu_infrasructure\kuyumcu_infrasructure.csproj", "{059DF7F1-6364-4286-A654-1AD40C1BD28D}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KuyumcuDesktop", "KuyumcuDesktop\KuyumcuDesktop.csproj", "{B1A2B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -33,6 +35,10 @@ Global
 		{059DF7F1-6364-4286-A654-1AD40C1BD28D}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{059DF7F1-6364-4286-A654-1AD40C1BD28D}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{059DF7F1-6364-4286-A654-1AD40C1BD28D}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B1A2B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B1A2B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B1A2B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B1A2B3C4-D5E6-4F78-9A0B-1C2D3E4F5A6B}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

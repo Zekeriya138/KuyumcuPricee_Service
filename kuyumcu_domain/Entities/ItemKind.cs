@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -17,6 +17,8 @@ namespace kuyumcu_domain.Entities
         Forex = 5,         // Döviz
         Other = 9,
         Finished=6,
-        Product =7
+        Product =7,
+        /// <summary>Müşteriden hurda altın (ProductItem oluşturulmaz; ScrapStock’a gider).</summary>
+        Scrap = 8
     }
 }

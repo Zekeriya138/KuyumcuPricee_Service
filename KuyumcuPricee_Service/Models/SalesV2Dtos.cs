@@ -1,4 +1,4 @@
-﻿// Kuyumcu.PriceService/Models/SalesV2Dtos.cs
+// Kuyumcu.PriceService/Models/SalesV2Dtos.cs
 using kuyumcu_domain.Entities;
 
 public sealed record CreateSaleItemReq(
@@ -17,7 +17,30 @@ public sealed record CreateSaleItemReq(
 public sealed record CreateSaleReqV2(
     Guid BranchId,
     Guid? CustomerId,
-    List<CreateSaleItemReq> Items
+    string? PaymentType,
+    List<SalePaymentReq>? Payments,
+    TakasHammaddeReq? TakasHammadde,
+    List<CreateSaleItemReq> Items,
+    string? DeliveryType = null,
+    /// <summary>Ödeme kaleminde <c>TedarikciVeresiye</c> varsa zorunlu: tedarikçi cari hareketi bu tedarikçiye yazılır.</summary>
+    Guid? SupplierIdForTedarikciVeresiye = null
+);
+
+public sealed class SalePaymentReq
+{
+    public string Method { get; set; } = "";
+    /// <summary>Seçili birimdeki miktar (USD/EUR/HAS/TL).</summary>
+    public decimal Amount { get; set; }
+    /// <summary>TL karşılığı (doğrulama ve muhasebe için esas tutar).</summary>
+    public decimal? TlAmount { get; set; }
+    public string? Currency { get; set; }
+    public string? Account { get; set; }
+}
+
+public sealed record TakasHammaddeReq(
+    string Ayar,
+    decimal Gram,
+    decimal BirimMaliyet
 );
 
 public sealed record UpdateSaleItemReq(

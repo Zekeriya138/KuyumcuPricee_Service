@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using kuyumcu_infrastructure.Persistence;
@@ -40,6 +40,9 @@ public class StockReportsController : ControllerBase
 
         if (!string.IsNullOrWhiteSpace(karat))
             products = products.Where(p => p.Karat == karat);
+
+        if (branchId.HasValue && branchId.Value != Guid.Empty)
+            products = products.Where(p => p.BranchId == branchId.Value);
 
         if (branchId.HasValue)
         {
@@ -143,10 +146,10 @@ public class StockReportsController : ControllerBase
         if (!string.IsNullOrWhiteSpace(productCode))
         {
             // ürün kodundan ProductId bul
-            var pids = await _db.Products.AsNoTracking()
-                .Where(p => p.ProductCode == productCode)
-                .Select(p => p.Id)
-                .ToListAsync(ct);
+            var pQ = _db.Products.AsNoTracking().Where(p => p.ProductCode == productCode);
+            if (branchId.HasValue && branchId.Value != Guid.Empty)
+                pQ = pQ.Where(p => p.BranchId == branchId.Value);
+            var pids = await pQ.Select(p => p.Id).ToListAsync(ct);
 
             q = q.Where(m => pids.Contains(m.ProductId));
         }
@@ -216,7 +219,11 @@ public class StockReportsController : ControllerBase
 
         if (branchId.HasValue) q = q.Where(x => x.BranchId == branchId.Value);
         if (!string.IsNullOrWhiteSpace(productCode))
+        {
             q = q.Where(x => x.Product.ProductCode == productCode);
+            if (branchId.HasValue && branchId.Value != Guid.Empty)
+                q = q.Where(x => x.Product.BranchId == branchId.Value);
+        }
         if (!string.IsNullOrWhiteSpace(barcode))
             q = q.Where(x => x.Barcode == barcode);
         if (!string.IsNullOrWhiteSpace(serial))

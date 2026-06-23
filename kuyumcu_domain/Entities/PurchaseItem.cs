@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace kuyumcu_domain.Entities
 {
@@ -19,6 +19,12 @@ namespace kuyumcu_domain.Entities
         public decimal Discount { get; set; }
         public decimal TaxRate { get; set; }
         public decimal LineTotal { get; set; }
+
+        /// <summary>Birim işçilik (has/gr).</summary>
+        public decimal? BirimIscilikHas { get; set; }
+
+        /// <summary>Ödenecek toplam has (gr).</summary>
+        public decimal? OdenecekToplamHas { get; set; }
 
         public Purchase Purchase { get; set; } = null!;
     }

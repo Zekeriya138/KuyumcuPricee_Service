@@ -1,4 +1,5 @@
-﻿using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
 using System;
 using System.Security.Claims;
 using System.Threading.Tasks;
@@ -9,12 +10,18 @@ namespace kuyumcu_infrastructure.Tenancy
     /// Her istek için TenantContext’i doldurur:
     /// 1) JWT claim (tenant_id / branch_id)
     /// 2) Header (X-Tenant-Id / X-Branch-Id)
+    /// 3) (opsiyonel) appsettings Tenancy:DefaultTenantId fallback
     /// </summary>
     public sealed class TenantMiddleware
     {
         private readonly RequestDelegate _next;
+        private readonly IConfiguration _config;
 
-        public TenantMiddleware(RequestDelegate next) => _next = next;
+        public TenantMiddleware(RequestDelegate next, IConfiguration config)
+        {
+            _next = next;
+            _config = config;
+        }
 
         public async Task Invoke(HttpContext ctx, ITenantContext tenant)
         {
@@ -41,6 +48,22 @@ namespace kuyumcu_infrastructure.Tenancy
                 tenant.TenantId = tGuid;
             }
 
+            // 3) Fallback: appsettings Tenancy:DefaultTenantId
+            if (tenant.TenantId == Guid.Empty)
+            {
+                var allowFallback = string.Equals(
+                    _config["Tenancy:AllowDefaultTenantFallback"],
+                    "true",
+                    StringComparison.OrdinalIgnoreCase);
+
+                if (allowFallback)
+                {
+                    var defaultId = _config["Tenancy:DefaultTenantId"];
+                    if (Guid.TryParse(defaultId, out var defaultGuid))
+                        tenant.TenantId = defaultGuid;
+                }
+            }
+
             if (tenant.BranchId is null &&
                 ctx.Request.Headers.TryGetValue("X-Branch-Id", out var bHdr) &&
                 Guid.TryParse(bHdr.ToString(), out var bGuid))
@@ -48,7 +71,30 @@ namespace kuyumcu_infrastructure.Tenancy
                 tenant.BranchId = bGuid;
             }
 
+            // Tenant yoksa isteği reddet (swagger/ping/auth hariç).
+            if (tenant.TenantId == Guid.Empty && RequiresTenant(ctx))
+            {
+                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                ctx.Response.ContentType = "application/json; charset=utf-8";
+                await ctx.Response.WriteAsJsonAsync(new
+                {
+                    error = "Tenant bilgisi bulunamadı. JWT claim (tenant_id) veya X-Tenant-Id header zorunludur."
+                });
+                return;
+            }
+
             await _next(ctx);
+        }
+
+        private static bool RequiresTenant(HttpContext ctx)
+        {
+            var path = ctx.Request.Path.Value ?? string.Empty;
+            if (path.StartsWith("/swagger", StringComparison.OrdinalIgnoreCase)) return false;
+            if (path.Equals("/ping", StringComparison.OrdinalIgnoreCase)) return false;
+            if (path.StartsWith("/auth", StringComparison.OrdinalIgnoreCase)) return false;
+            if (path.StartsWith("/api/auth", StringComparison.OrdinalIgnoreCase)) return false;
+            if (HttpMethods.IsOptions(ctx.Request.Method)) return false;
+            return true;
         }
 
         private static Guid? GetGuidClaim(ClaimsPrincipal user, params string[] names)

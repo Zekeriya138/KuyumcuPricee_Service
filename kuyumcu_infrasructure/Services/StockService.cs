@@ -1,4 +1,4 @@
-﻿using kuyumcu_application.Abstractions;
+using kuyumcu_application.Abstractions;
 using kuyumcu_domain.Entities;
 using kuyumcu_domain.Enums;
 using kuyumcu_infrastructure.Persistence;
@@ -39,6 +39,8 @@ namespace kuyumcu_infrastructure.Services
             var prod = await _db.Products.AsNoTracking()
                 .FirstOrDefaultAsync(p => p.Id == productId, ct)
                 ?? throw new InvalidOperationException("Geçersiz productId.");
+            if (prod.BranchId != branchId)
+                throw new InvalidOperationException("Ürün kaydı seçilen şubeye ait değil.");
 
             // ---- UPSERT: (TenantId, BranchId, ProductId) ile stok satırı
             var stock = await _db.Stocks.FirstOrDefaultAsync(

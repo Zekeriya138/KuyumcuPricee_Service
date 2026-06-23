@@ -1,4 +1,4 @@
-﻿namespace kuyumcu_domain.Entities;
+namespace kuyumcu_domain.Entities;
 
 public abstract class Entity
 {
@@ -29,10 +29,17 @@ public class User : Entity
     public string Username { get; set; } = null!;
     public string PasswordHash { get; set; } = null!;
     public string Role { get; set; } = "User";
+    public bool IsActive { get; set; } = true;
     public string? NationalId { get; set; }
     public DateTime? BirthDate { get; set; }
     public string? FullName { get; set; }
+    public string? Phone { get; set; }
     public string? Email { get; set; }
+    public bool CanManageUsers { get; set; }
+    public bool CanManageBranches { get; set; }
+    public bool CanSwitchBranches { get; set; }
+    public bool CanUseEInvoice { get; set; }
+    public bool CanUseEArchive { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public Guid BranchId { get; set; }
     public Branch Branch { get; set; } = null!;
@@ -41,6 +48,9 @@ public class User : Entity
 public class Customer : Entity
 {
     public Guid TenantId { get; set; }
+    public Guid BranchId { get; set; }
+    /// <summary>0=Müşteri, 1=Tedarikçi. Cari yönetiminde filtreleme için.</summary>
+    public int CariTip { get; set; } = 0; // 0=Müşteri, 1=Tedarikçi
     public string FullName { get; set; } = null!;
     public string? NationalId { get; set; }
     public DateTime? BirthDate { get; set; }
@@ -49,6 +59,11 @@ public class Customer : Entity
     public string? City { get; set; }
     public string? District { get; set; }
     public string? Address { get; set; }
+    /// <summary>Genel not alanı.</summary>
+    public string? Note { get; set; }
+    /// <summary>Tedarikçiye özel genişletilmiş alanlar (JSON: yetkiliKisi, whatsapp, vergiDairesi, vb.).</summary>
+    public string? TedarikciExtJson { get; set; }
+    public Branch Branch { get; set; } = null!;
 }
 public class Sale : Entity
 {
@@ -57,14 +72,31 @@ public class Sale : Entity
     public Guid UserId { get; set; }
     public Guid? CustomerId { get; set; }
 
-    // Ürün detayları kaldırıldı. Bu detaylar artık sadece SaleItem içinde yer alacak.
+    /// <summary>Nakit, Kart, Iban, Takas, Veresiye</summary>
+    public string PaymentType { get; set; } = "Nakit";
 
     public User User { get; set; } = null!;
     public Branch Branch { get; set; } = null!;
     public Customer? Customer { get; set; }
 
-    // ÖNEMLİ: null referans hatası olmaması için başlat
     public List<SaleItem> Items { get; set; } = new();
+    public List<SalePayment> Payments { get; set; } = new();
+}
+
+public class Invoice : Entity
+{
+    public Guid TenantId { get; set; }
+    public Guid SaleId { get; set; }
+    public Guid BranchId { get; set; }
+    public Guid? CustomerId { get; set; }
+    public DateTime InvoiceDate { get; set; } = DateTime.UtcNow;
+    public decimal GrandTotal { get; set; }
+    public string PaymentType { get; set; } = "IBAN";
+    public bool IsExported { get; set; }
+
+    public Sale Sale { get; set; } = null!;
+    public Branch Branch { get; set; } = null!;
+    public Customer? Customer { get; set; }
 }
 //public class Sale : Entity
 //{
