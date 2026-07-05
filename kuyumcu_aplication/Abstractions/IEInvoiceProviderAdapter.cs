@@ -9,7 +9,51 @@ public interface IEInvoiceProviderAdapter
     Task<EInvoiceStatusResult> GetStatusAsync(EInvoiceStatusRequest request, CancellationToken ct);
     Task<EInvoiceCancelResult> CancelAsync(EInvoiceCancelRequest request, CancellationToken ct);
     Task<EInvoiceWebhookVerificationResult> VerifyWebhookAsync(EInvoiceWebhookVerificationRequest request, CancellationToken ct);
+
+    /// <summary>
+    /// Entegratörün gelen kutusundaki (gelen) e-Faturaları döner.
+    /// Varsayılan olarak desteklenmez; yalnızca destekleyen sağlayıcılar (ör. EDM) override eder.
+    /// </summary>
+    Task<EInvoiceIncomingResult> GetIncomingInvoicesAsync(EInvoiceIncomingRequest request, CancellationToken ct)
+        => Task.FromResult(new EInvoiceIncomingResult(false, new List<EInvoiceIncomingItem>(), null, "Bu sağlayıcı gelen fatura sorgusunu desteklemiyor."));
 }
+
+public sealed record EInvoiceIncomingRequest(
+    Guid TenantId,
+    Guid BranchId,
+    DateTime StartDateUtc,
+    DateTime EndDateUtc,
+    int Limit,
+    string? IntegratorUsername = null,
+    string? IntegratorPassword = null
+);
+
+public sealed record EInvoiceIncomingItem(
+    string Uuid,
+    string InvoiceNumber,
+    string SenderName,
+    string SenderTaxNumber,
+    string DocumentType,
+    string Status,
+    string StatusDescription,
+    decimal PayableAmount,
+    string Currency,
+    DateTime? IssueDate,
+    string? EnvelopeIdentifier,
+    string? RawContent,
+    DateTime? CreatedAt = null,
+    string? ReceiverName = null,
+    string? ReceiverTaxNumber = null,
+    string? GibStatusDescription = null,
+    string? ProfileId = null
+);
+
+public sealed record EInvoiceIncomingResult(
+    bool IsSuccess,
+    IReadOnlyList<EInvoiceIncomingItem> Items,
+    string? RawResponse,
+    string? ErrorMessage
+);
 
 public sealed record EInvoiceSendRequest(
     Guid TenantId,

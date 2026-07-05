@@ -19,6 +19,11 @@ public class CashTransaction : Entity, ITenantScoped
     public Guid? RefId { get; set; }
     public string? Description { get; set; }
 
+    /// <summary>İşlemi yapan kullanıcı (JWT'den).</summary>
+    public Guid? UserId { get; set; }
+    /// <summary>İşlem anındaki kullanıcı görünen adı (Ad Soyad ya da kullanıcı adı).</summary>
+    public string? KullaniciAdi { get; set; }
+
     public CashAccount CashAccount { get; set; } = null!;
 }
 

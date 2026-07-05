@@ -23,6 +23,7 @@ public sealed class BalanceSheetController : ControllerBase
     [HttpGet("company")]
     public async Task<IActionResult> Company(CancellationToken ct = default)
     {
+        if (!CanViewBalanceSheet()) return Forbid();
         var tenantId = GetTenantId();
         var dto = await _balanceSheet.GetCompanyBalanceSheetAsync(tenantId, ct);
         return Ok(dto);
@@ -31,6 +32,7 @@ public sealed class BalanceSheetController : ControllerBase
     [HttpGet("branch/{branchId:guid}")]
     public async Task<IActionResult> Branch(Guid branchId, CancellationToken ct = default)
     {
+        if (!CanViewBalanceSheet()) return Forbid();
         if (branchId == Guid.Empty) return BadRequest(new { error = "branchId zorunludur." });
         var tenantId = GetTenantId();
         var dto = await _balanceSheet.GetBranchBalanceSheetAsync(tenantId, branchId, ct);
@@ -40,6 +42,7 @@ public sealed class BalanceSheetController : ControllerBase
     [HttpGet("consolidated")]
     public async Task<IActionResult> Consolidated(CancellationToken ct = default)
     {
+        if (!CanViewBalanceSheet()) return Forbid();
         var tenantId = GetTenantId();
         var dto = await _balanceSheet.GetConsolidatedBalanceSheetAsync(tenantId, ct);
         return Ok(dto);
@@ -48,6 +51,7 @@ public sealed class BalanceSheetController : ControllerBase
     [HttpGet("company/excel")]
     public async Task<IActionResult> CompanyExcel(CancellationToken ct = default)
     {
+        if (!CanViewBalanceSheet()) return Forbid();
         var tenantId = GetTenantId();
         var dto = await _balanceSheet.GetCompanyBalanceSheetAsync(tenantId, ct);
         var csv = BuildCsv(dto);
@@ -57,6 +61,7 @@ public sealed class BalanceSheetController : ControllerBase
     [HttpGet("company/pdf")]
     public async Task<IActionResult> CompanyPdf(CancellationToken ct = default)
     {
+        if (!CanViewBalanceSheet()) return Forbid();
         var tenantId = GetTenantId();
         var dto = await _balanceSheet.GetCompanyBalanceSheetAsync(tenantId, ct);
         var pdf = BuildSimplePdf(dto);
@@ -132,4 +137,14 @@ public sealed class BalanceSheetController : ControllerBase
 
     private static string Csv(string raw)
         => "\"" + (raw ?? "").Replace("\"", "\"\"") + "\"";
+
+    private bool CanViewBalanceSheet()
+    {
+        var role = User.FindFirstValue(ClaimTypes.Role) ?? "";
+        if (string.Equals(role, "Owner", StringComparison.OrdinalIgnoreCase))
+            return true;
+        var raw = User.FindFirstValue("perm_view_balance_sheet");
+        return string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase);
+    }
 }

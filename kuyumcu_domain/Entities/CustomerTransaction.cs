@@ -32,5 +32,10 @@ public class CustomerTransaction : Entity, ITenantScoped
     public Guid? RefId { get; set; }
     public string? Note { get; set; }
 
+    /// <summary>İşlemi yapan kullanıcı (JWT'den).</summary>
+    public Guid? UserId { get; set; }
+    /// <summary>İşlem anındaki kullanıcı görünen adı (Ad Soyad ya da kullanıcı adı).</summary>
+    public string? KullaniciAdi { get; set; }
+
     public Customer Customer { get; set; } = null!;
 }

@@ -94,6 +94,7 @@ public sealed class SalesV2Controller : ControllerBase
             UserId = userId,
             CustomerId = req.CustomerId,
             PaymentType = fallbackPaymentType,
+            DeliveryType = deliveryType,
             Items = new List<SaleItem>()
         };
 
@@ -103,14 +104,24 @@ public sealed class SalesV2Controller : ControllerBase
 
         foreach (var it in req.Items)
         {
-            if (string.IsNullOrWhiteSpace(it.ProductCode))
+            // EMANET delivery + ZIYNET kategori kombinasyonunda ProductCode opsiyoneldir
+            // (müşteri hesabına alacak kaydı; fiziksel stok hareketi olmaz).
+            var isZiynetEmanetItem =
+                deliveryType == "EMANET" &&
+                string.Equals((it.Category ?? "").Trim(), "ZIYNET", StringComparison.OrdinalIgnoreCase);
+
+            if (string.IsNullOrWhiteSpace(it.ProductCode) && !isZiynetEmanetItem)
                 return BadRequest(new { error = "ProductCode zorunludur." });
 
-            var isVirtualForexLine = IsVirtualForexSaleItem(it.ProductCode, it.Category);
-            var product = await _db.Products.AsNoTracking()
-                .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.BranchId == branch.Id && p.ProductCode == it.ProductCode, ct);
-            if (!isVirtualForexLine && product is null)
-                return BadRequest(new { error = $"Geçersiz ProductCode: {it.ProductCode}" });
+            var isVirtualForexLine = IsVirtualForexSaleItem(it.ProductCode ?? "", it.Category);
+            Product? product = null;
+            if (!string.IsNullOrWhiteSpace(it.ProductCode))
+            {
+                product = await _db.Products.AsNoTracking()
+                    .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.BranchId == branch.Id && p.ProductCode == it.ProductCode, ct);
+                if (!isVirtualForexLine && !isZiynetEmanetItem && product is null)
+                    return BadRequest(new { error = $"Geçersiz ProductCode: {it.ProductCode}" });
+            }
 
 
             // --- Tekil (ProductItem) / Ziynet (adet) Kontrolü ---
@@ -138,9 +149,12 @@ public sealed class SalesV2Controller : ControllerBase
                 var isZiynet = product is not null &&
                                (product.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil) == kuyumcu_domain.Enums.InventoryType.Ziynet;
                 var isSpecial = product?.IsSpecialProduct == true;
+                // EMANET teslimde (teslim edilmeyen kalem) fiziksel stok hareketi olmaz;
+                // müşteri hesabına alacak yazılır. Bu nedenle stok-adet doğrulaması atlanır.
+                var isEmanetTeslim = deliveryType == "EMANET";
                 // ProductItemId olmayan satırlarda sadece adet bazlı ürünlerde (ziynet/özel) stok-adet doğrulaması yap.
                 // Tekil ürünlerde mevcut akışta gram bazlı satış desteklenir.
-                if (isZiynet || isSpecial)
+                if ((isZiynet || isSpecial) && !isEmanetTeslim)
                 {
                     var adet = (int)Math.Round(it.Quantity);
                     var stok = product.StokMiktari ?? 0;
@@ -185,7 +199,8 @@ public sealed class SalesV2Controller : ControllerBase
         }
 
         var unitRates = _rates.GetUnitToTlRates();
-        var payments = NormalizePayments(req.Payments, fallbackPaymentType, grandTot, unitRates);
+        var sellUnitRates = _rates.GetUnitToTlSellRates();
+        var payments = NormalizePayments(req.Payments, fallbackPaymentType, grandTot, unitRates, sellUnitRates);
         if (payments.Count == 0)
             return BadRequest(new { error = "En az bir ödeme kalemi girilmelidir." });
         if (payments.Any(p => p.Amount <= 0 || p.AmountTl <= 0))
@@ -239,35 +254,54 @@ public sealed class SalesV2Controller : ControllerBase
 
             // Döviz ürün (USD/EUR/GBP) satışları e-fatura taslağına düşmez.
             var hasBillableItems = sale.Items.Any(x => !IsForexSaleItemLine(x));
+            // Profil ayarları (otomatik taslak kuralları, işçilik kuralları) IsActive durumundan
+            // bağımsız uygulanır; aksi halde pasif profilde varsayılanlara düşer ve şube ayarları yok sayılır.
             var profile = await _db.EInvoiceProfiles.AsNoTracking()
-                .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == sale.BranchId && x.IsActive, ct);
-            var shouldCreateAutoDraft = hasBillableItems &&
-                                        EInvoiceProfileSettingsCodec.ShouldCreateAutoDraft(
-                                            profile,
-                                            payments.Select(x => x.Method).ToList(),
-                                            grandTot);
+                .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == sale.BranchId, ct);
 
-            if (shouldCreateAutoDraft)
+            if (hasBillableItems)
             {
-                var invoice = new Invoice
-                {
-                    Id = Guid.NewGuid(),
-                    TenantId = tenantId,
-                    SaleId = sale.Id,
-                    BranchId = sale.BranchId,
-                    CustomerId = sale.CustomerId,
-                    InvoiceDate = DateTime.UtcNow,
-                    GrandTotal = grandTot,
-                    PaymentType = sale.PaymentType,
-                    IsExported = false
-                };
-                _db.Invoices.Add(invoice);
-                await _db.SaveChangesAsync(ct);
+                // Her ödeme yöntemi için ayrı taslak fatura oluşturma:
+                // GetQualifyingPaymentsForDraft, profil ayarlarına uyan ödeme kalemlerini döner.
+                // Tek ödeme → 1 fatura (ratio=1.0), çoklu ödeme → N fatura (her biri kendi oranıyla).
+                var qualifyingPayments = EInvoiceProfileSettingsCodec.GetQualifyingPaymentsForDraft(
+                    profile,
+                    payments.Select(x => (x.Method, x.AmountTl)).ToList(),
+                    grandTot);
 
-                var customer = sale.CustomerId.HasValue
-                    ? await _db.Customers.AsNoTracking().FirstOrDefaultAsync(x => x.Id == sale.CustomerId.Value && x.TenantId == tenantId, ct)
-                    : null;
-                await _eInvoiceWorkflow.QueueInvoiceAsync(invoice, customer, ct);
+                if (qualifyingPayments.Count > 0)
+                {
+                    var customer = sale.CustomerId.HasValue
+                        ? await _db.Customers.AsNoTracking()
+                            .FirstOrDefaultAsync(x => x.Id == sale.CustomerId.Value && x.TenantId == tenantId, ct)
+                        : null;
+
+                    foreach (var (method, amountTl) in qualifyingPayments)
+                    {
+                        var splitRatio = grandTot > 0m
+                            ? Math.Round(amountTl / grandTot, 10, MidpointRounding.AwayFromZero)
+                            : 1m;
+                        // Oran toplamının 1.0'ı aşmaması için güvenlik sınırı.
+                        splitRatio = Math.Min(1m, Math.Max(0m, splitRatio));
+
+                        var invoice = new Invoice
+                        {
+                            Id = Guid.NewGuid(),
+                            TenantId = tenantId,
+                            SaleId = sale.Id,
+                            BranchId = sale.BranchId,
+                            CustomerId = sale.CustomerId,
+                            InvoiceDate = DateTime.UtcNow,
+                            GrandTotal = Math.Round(amountTl, 2, MidpointRounding.AwayFromZero),
+                            PaymentType = method,
+                            PaymentSplitRatio = splitRatio,
+                            IsExported = false
+                        };
+                        _db.Invoices.Add(invoice);
+                        await _db.SaveChangesAsync(ct);
+                        await _eInvoiceWorkflow.QueueInvoiceAsync(invoice, customer, ct);
+                    }
+                }
             }
 
             var salePaymentRows = new List<SalePayment>();
@@ -307,8 +341,11 @@ public sealed class SalesV2Controller : ControllerBase
             var soldTekilProductIds = new HashSet<Guid>();
 
             // STOK ÇIKIŞLARI: Tekil = ProductItem IsInStock=false; Ziynet = Product.StokMiktari -= adet
+            // EMANET teslimde fiziksel stok hareketi yapılmaz (teslim edilmeyen kalem; müşteriye alacak yazılır).
             foreach (var si in sale.Items)
             {
+                if (deliveryType == "EMANET") continue;
+
                 var product = await _db.Products.AsNoTracking()
                     .FirstOrDefaultAsync(p => p.TenantId == tenantId && p.BranchId == sale.BranchId && p.ProductCode == si.ProductCode, ct);
                 if (product is null) continue;
@@ -550,6 +587,11 @@ public sealed class SalesV2Controller : ControllerBase
                     {
                         var hasRate = unitRates.TryGetValue("HAS", out var h) && h > 0 ? h : 0m;
                         var bal = await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, customerId, ct);
+                        // Ziynet tipini (Yeni/Eski) request kaleminden taşı (katalog eşleşmesi olmayan satırlar için).
+                        var reqOlcuByLine = (req.Items ?? new())
+                            .Where(x => x.LineNo.HasValue)
+                            .GroupBy(x => x.LineNo!.Value)
+                            .ToDictionary(g => g.Key, g => g.First().Olcu);
                         var productMap = new Dictionary<string, Product>(StringComparer.OrdinalIgnoreCase);
                         foreach (var code in sale.Items.Select(x => x.ProductCode).Distinct(StringComparer.OrdinalIgnoreCase))
                         {
@@ -607,6 +649,43 @@ public sealed class SalesV2Controller : ControllerBase
                                 || IsZiynetCategoryToken(prod?.ZiynetTipi);
                             if (isZiynet)
                             {
+                                // Has altın ziynet kalemi: adet defterine değil, DOVIZ/HAS bakiyesine yaz.
+                                if (IsHasAltinZiynetSaleItem(prod, si))
+                                {
+                                    var hasQtyEmanet = Math.Abs(si.Quantity);
+                                    if (hasQtyEmanet > 0m)
+                                    {
+                                        // Emanet (teslim edilmeyen) has altın: müşteri alacaklı → HAS bakiyesi artar (+).
+                                        bal.BalanceHAS += hasQtyEmanet;
+                                        await CustomerFinanceHelper.AddTransactionAsync(
+                                            _db,
+                                            tenantId,
+                                            customerId,
+                                            sale.BranchId,
+                                            groupCode: "DOVIZ",
+                                            itemName: "HAS",
+                                            itemType: null,
+                                            quantity: hasQtyEmanet,
+                                            direction: +1,
+                                            gram: hasQtyEmanet,
+                                            ayar: "HAS",
+                                            milyem: CustomerFinanceHelper.MilyemFromAyar(si.Karat),
+                                            hasEq: hasQtyEmanet,
+                                            unitPriceTl: si.UnitPrice,
+                                            totalPriceTl: si.LineTotal,
+                                            refType: "SALE",
+                                            refId: sale.Id,
+                                            note: $"Satis L{si.LineNo} (ziynet has emanet)",
+                                            txDate: sale.CreatedAt,
+                                            ct: ct);
+                                    }
+                                    continue;
+                                }
+
+                                // Tip önceliği: request Olcu (Yeni/Eski) → katalog ürünü Olcu → "Yeni".
+                                var rawTip = reqOlcuByLine.TryGetValue(si.LineNo, out var reqOlcu) && !string.IsNullOrWhiteSpace(reqOlcu)
+                                    ? reqOlcu!.Trim()
+                                    : (string.IsNullOrWhiteSpace(prod?.Olcu) ? "Yeni" : prod!.Olcu!.Trim());
                                 await CustomerFinanceHelper.AddTransactionAsync(
                                     _db,
                                     tenantId,
@@ -616,7 +695,7 @@ public sealed class SalesV2Controller : ControllerBase
                                     itemName: NormalizeZiynetName(prod, si.ProductName),
                                     itemType: NormalizeZiynetFinanceTip(
                                         NormalizeZiynetName(prod, si.ProductName),
-                                        string.IsNullOrWhiteSpace(prod?.Olcu) ? "Yeni" : prod!.Olcu!.Trim()),
+                                        rawTip),
                                     quantity: Math.Abs(si.Quantity),
                                     direction: +1,
                                     gram: null,
@@ -627,7 +706,7 @@ public sealed class SalesV2Controller : ControllerBase
                                     totalPriceTl: si.LineTotal,
                                     refType: "SALE",
                                     refId: sale.Id,
-                                    note: $"Satis L{si.LineNo} (emanet)",
+                                    note: $"Satis L{si.LineNo} (ziynet teslim edilmeyen)",
                                     txDate: sale.CreatedAt,
                                     ct: ct);
                                 continue;
@@ -1140,7 +1219,8 @@ public sealed class SalesV2Controller : ControllerBase
         List<SalePaymentReq>? raw,
         string fallbackMethod,
         decimal grandTot,
-        IReadOnlyDictionary<string, decimal> unitRates)
+        IReadOnlyDictionary<string, decimal> unitRates,
+        IReadOnlyDictionary<string, decimal> sellUnitRates)
     {
         var list = new List<NormalizedPayment>();
         if (raw != null)
@@ -1159,6 +1239,17 @@ public sealed class SalesV2Controller : ControllerBase
                     amount = currency == "TL"
                         ? amountTl
                         : Math.Round(amountTl / rate, 4, MidpointRounding.AwayFromZero);
+
+                // Veresiye seçili birim TL değilse, müşteri finansına yazılacak miktar
+                // daima seçili birimin satış kuruna göre (TL / satış kuru) hesaplanır.
+                if (string.Equals(method, "Veresiye", StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(currency, "TL", StringComparison.OrdinalIgnoreCase) &&
+                    amountTl > 0m)
+                {
+                    var sellRate = sellUnitRates.TryGetValue(currency, out var sr) && sr > 0m ? sr : rate;
+                    if (sellRate > 0m)
+                        amount = Math.Round(amountTl / sellRate, 4, MidpointRounding.AwayFromZero);
+                }
 
                 list.Add(new NormalizedPayment
                 {
@@ -1279,6 +1370,15 @@ public sealed class SalesV2Controller : ControllerBase
 
     private static bool IsHasAltinZiynetSaleItem(Product? product, SaleItem item)
     {
+        var itemName = (item.ProductName ?? "").Trim().ToUpperInvariant();
+        var itemHasAltin = itemName.Contains("HAS ALTIN") || itemName.Contains("HASALTIN");
+        var itemLegacyGramHas = itemName.Contains("GRAM ALTIN(HAS)") || itemName.Contains("GRAM ALTIN (HAS)");
+        var itemKulce = itemName.Contains("KÜLÇE") || itemName.Contains("KULCE");
+        var item22AyarGram = (itemName.Contains("22 AYAR") || itemName.Contains("22AYAR")) &&
+                             (itemName.Contains("GR") || itemName.Contains("GRAM"));
+        if ((itemHasAltin || itemLegacyGramHas) && !itemKulce && !item22AyarGram)
+            return true;
+
         var src = ((product?.ZiynetTipi ?? "") + " " +
                    (product?.Name ?? "") + " " +
                    (product?.Category ?? "") + " " +
@@ -1286,12 +1386,15 @@ public sealed class SalesV2Controller : ControllerBase
                    (item.Category ?? ""))
             .Trim()
             .ToUpperInvariant();
+        var legacyGramHas = src.Contains("GRAM ALTIN(HAS)") || src.Contains("GRAM ALTIN (HAS)");
         var karat = (item.Karat ?? product?.Karat ?? "").Trim().ToUpperInvariant();
         var is22AyarGram = (src.Contains("22 AYAR") || src.Contains("22AYAR")) &&
                            (src.Contains("GR") || src.Contains("GRAM"));
         var isKulceGram = src.Contains("KÜLÇE") || src.Contains("KULCE");
         if (is22AyarGram || isKulceGram)
             return false;
+        if (legacyGramHas)
+            return true;
 
         var hasAltinText = src.Contains("HAS ALTIN") || src.Contains("HASALTIN");
         var gramText = src.Contains("GRAM");
@@ -1484,6 +1587,11 @@ public sealed class SalesV2Controller : ControllerBase
             if (product.IsSpecialProduct)
                 return ItemKind.Product;
         }
+
+        // Katalog eşleşmesi olmayan ziynet satırları (ör. teslim=0 emanet akışı, fallback kod)
+        // kategori token'ına göre Ziynet sayılır → Raporlar Ziynet sekmesine düşer.
+        if (IsZiynetCategoryToken(category) || IsZiynetCategoryToken(productName))
+            return ItemKind.Ziynet;
 
         var cat = (category ?? product?.Category ?? string.Empty).Trim().ToUpperInvariant();
         if (cat.Contains("GUMUS", StringComparison.OrdinalIgnoreCase) || cat.Contains("GÜMÜŞ", StringComparison.OrdinalIgnoreCase))

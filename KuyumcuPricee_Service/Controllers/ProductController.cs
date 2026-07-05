@@ -144,7 +144,8 @@ WHERE p.TenantId = {0}
                 .Select(x => new ProductDto(
                     x.Id, x.ProductCode, x.Name, x.Category, x.Karat, x.WeightGr, x.Cost ?? 0m, x.Barcode, x.Olcu, x.CreatedAt,
                     (int)(x.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil), x.StokMiktari ?? 0, x.ZiynetTipi, x.IsSpecialProduct,
-                    x.MalTanim, x.DepoTedarikciFirma, x.BelirlenenSatisFiyatiHas, x.BirimSatisIscilikHas, x.DepoBirimMaliyet
+                    x.MalTanim, x.DepoTedarikciFirma, x.BelirlenenSatisFiyatiHas, x.BirimSatisIscilikHas, x.DepoBirimMaliyet,
+                    null
                 ))
                 .ToListAsync(ct);
 
@@ -190,7 +191,7 @@ WHERE p.TenantId = {0}
             if (int.TryParse(part, out int num) && num > maxNum)
                 maxNum = num;
         }
-        var nextCode = prefix + "-" + (maxNum + 1).ToString("D3");
+        var nextCode = prefix + "-" + (maxNum + 1).ToString("D7");
         return Ok(new { nextCode });
     }
 
@@ -325,7 +326,10 @@ WHERE p.TenantId = {0}
             DepoTedarikciFirma = string.IsNullOrWhiteSpace(dto.DepoTedarikciFirma) ? null : dto.DepoTedarikciFirma.Trim(),
             BelirlenenSatisFiyatiHas = dto.BelirlenenSatisFiyatiHas,
             BirimSatisIscilikHas = dto.BirimSatisIscilikHas,
-            DepoBirimMaliyet = dto.DepoBirimMaliyet,
+            DepoBirimMaliyet = dto.DepoBirimMaliyet.HasValue
+                ? DepoStokTripleHelper.RoundBirimMaliyet(dto.DepoBirimMaliyet.Value)
+                : null,
+            Image = DecodeImage(dto.ImageBase64),
         };
 
         var inv = entity.InventoryType ?? InventoryType.Tekil;
@@ -392,6 +396,9 @@ WHERE p.TenantId = {0}
                     return BadRequest(new { error = "Depo hareketi (TotalGram sabit, BarcodedGram += gram, UnbarcodedGram = TotalGram − BarcodedGram) tamamlanamadı." });
                 }
 
+                // Havuz satırındaki birim işçilik ile birebir aynı değeri kaydet.
+                entity.DepoBirimMaliyet = havuz.BirimMaliyet;
+
                 _db.Products.Add(entity);
                 await _db.SaveChangesAsync(ct);
                 await tx.CommitAsync(ct);
@@ -453,7 +460,11 @@ WHERE p.TenantId = {0}
         if (dto.DepoTedarikciFirma != null) p.DepoTedarikciFirma = string.IsNullOrWhiteSpace(dto.DepoTedarikciFirma) ? null : dto.DepoTedarikciFirma.Trim();
         p.BelirlenenSatisFiyatiHas = dto.BelirlenenSatisFiyatiHas;
         p.BirimSatisIscilikHas = dto.BirimSatisIscilikHas;
-        if (dto.DepoBirimMaliyet.HasValue) p.DepoBirimMaliyet = dto.DepoBirimMaliyet.Value;
+        if (dto.DepoBirimMaliyet.HasValue)
+            p.DepoBirimMaliyet = DepoStokTripleHelper.RoundBirimMaliyet(dto.DepoBirimMaliyet.Value);
+        // null = görseli koru; "" = sil; dolu = güncelle.
+        if (dto.ImageBase64 != null)
+            p.Image = dto.ImageBase64.Length == 0 ? null : DecodeImage(dto.ImageBase64);
 
         await _db.SaveChangesAsync(ct);
         return Ok(ToDto(p));
@@ -474,7 +485,19 @@ WHERE p.TenantId = {0}
     }
 
     private static ProductDto ToDto(Product p) =>
-        new(p.Id, p.ProductCode, p.Name, p.Category, p.Karat, p.WeightGr, p.Cost ?? 0m, p.Barcode, p.Olcu, p.CreatedAt, (int)(p.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil), p.StokMiktari ?? 0, p.ZiynetTipi, p.IsSpecialProduct, p.MalTanim, p.DepoTedarikciFirma, p.BelirlenenSatisFiyatiHas, p.BirimSatisIscilikHas, p.DepoBirimMaliyet);
+        new(p.Id, p.ProductCode, p.Name, p.Category, p.Karat, p.WeightGr, p.Cost ?? 0m, p.Barcode, p.Olcu, p.CreatedAt, (int)(p.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil), p.StokMiktari ?? 0, p.ZiynetTipi, p.IsSpecialProduct, p.MalTanim, p.DepoTedarikciFirma, p.BelirlenenSatisFiyatiHas, p.BirimSatisIscilikHas, p.DepoBirimMaliyet, p.Image != null ? Convert.ToBase64String(p.Image) : null);
+
+    /// <summary>Base64 (data URI veya düz) görseli bayt dizisine çevirir; geçersizse null döner.</summary>
+    private static byte[]? DecodeImage(string? base64)
+    {
+        if (string.IsNullOrWhiteSpace(base64)) return null;
+        var raw = base64.Trim();
+        var comma = raw.IndexOf(',');
+        if (raw.StartsWith("data:", StringComparison.OrdinalIgnoreCase) && comma >= 0)
+            raw = raw[(comma + 1)..];
+        try { return Convert.FromBase64String(raw); }
+        catch { return null; }
+    }
 
     private async Task EnsureProductCodeIndexCompatibilityAsync(CancellationToken ct)
     {

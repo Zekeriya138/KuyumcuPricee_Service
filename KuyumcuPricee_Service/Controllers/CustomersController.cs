@@ -1,9 +1,11 @@
 using kuyumcu_application.Abstractions;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
+using KUYUMCU.Price_Service.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using static KUYUMCU.Price_Service.Persistence.UserDisplayNames;
 
 namespace KUYUMCU.Price_Service.Controllers;
 
@@ -120,7 +122,8 @@ public class CustomersController : ControllerBase
         string Kalem,
         string Deger,
         string CariDurum,
-        string Aciklama
+        string Aciklama,
+        string Kullanici
     );
 
     public sealed record CustomerFinanceDto(
@@ -162,16 +165,14 @@ public class CustomersController : ControllerBase
             .GroupBy(x => new
             {
                 ItemName = NormalizeZiynetItemName(x.ItemName),
-                Tip = NormalizeZiynetTipGroupingKey(NormalizeZiynetItemName(x.ItemName), x.ItemType),
-                IsEmanet = IsEmanetKaydi(x)
+                Tip = NormalizeZiynetTipGroupingKey(NormalizeZiynetItemName(x.ItemName), x.ItemType)
             })
             .Select(g =>
             {
                 var adet = g.Sum(x => x.Direction >= 0 ? x.Quantity : -x.Quantity);
-                var tip = g.Key.IsEmanet ? $"{g.Key.Tip} (Emanet)" : g.Key.Tip;
                 return new CustomerZiynetRowDto(
                     g.Key.ItemName,
-                    tip,
+                    g.Key.Tip,
                     adet
                 );
             })
@@ -207,7 +208,8 @@ public class CustomersController : ControllerBase
                 ResolveRecentKalem(x),
                 FormatRecentValue(x),
                 ResolveRecentCariDurum(x),
-                x.Note ?? ""
+                x.Note ?? "",
+                x.KullaniciAdi ?? ""
             ))
             .ToList();
 
@@ -232,7 +234,7 @@ public class CustomersController : ControllerBase
                 x.BranchId == customer.BranchId &&
                 x.CustomerId == id &&
                 !x.IsDeleted)
-            .Select(x => new { x.Id, x.CreatedAt, x.PaymentType })
+            .Select(x => new { x.Id, x.CreatedAt, x.PaymentType, x.UserId })
             .OrderByDescending(x => x.CreatedAt)
             .Take(200)
             .ToListAsync(ct);
@@ -243,10 +245,17 @@ public class CustomersController : ControllerBase
                 x.BranchId == customer.BranchId &&
                 x.CustomerId == id &&
                 !x.IsDeleted)
-            .Select(x => new { x.Id, x.Date, x.PaymentMethod })
+            .Select(x => new { x.Id, x.Date, x.PaymentMethod, x.UserId })
             .OrderByDescending(x => x.Date)
             .Take(200)
             .ToListAsync(ct);
+
+        var userIds = salesDocs.Select(x => x.UserId)
+            .Concat(purchaseDocs.Select(x => x.UserId))
+            .Where(x => x != Guid.Empty)
+            .Distinct()
+            .ToList();
+        var userNames = await BuildUserNameMapAsync(_db, customer.TenantId, userIds, ct);
 
         foreach (var sale in salesDocs)
         {
@@ -257,7 +266,8 @@ public class CustomersController : ControllerBase
                 "Satış İşlemi",
                 "İşlem kaydı",
                 "İşlem",
-                $"Satış belgesi (Ref: {sale.Id}, Ödeme: {sale.PaymentType ?? "-"})"));
+                $"Satış belgesi (Ref: {sale.Id}, Ödeme: {sale.PaymentType ?? "-"})",
+                userNames.TryGetValue(sale.UserId, out var sn) ? sn : ""));
         }
         foreach (var purchase in purchaseDocs)
         {
@@ -268,7 +278,8 @@ public class CustomersController : ControllerBase
                 "Alış İşlemi",
                 "İşlem kaydı",
                 "İşlem",
-                $"Alış belgesi (Ref: {purchase.Id}, Ödeme: {purchase.PaymentMethod})"));
+                $"Alış belgesi (Ref: {purchase.Id}, Ödeme: {purchase.PaymentMethod})",
+                userNames.TryGetValue(purchase.UserId, out var pn) ? pn : ""));
         }
 
         sonIslemler = sonIslemler
@@ -441,10 +452,10 @@ public class CustomersController : ControllerBase
 
     private static bool IsEmanetKaydi(CustomerTransaction x)
     {
-        if (string.Equals((x.CariDurum ?? "").Trim(), "Emanet", StringComparison.OrdinalIgnoreCase))
-            return true;
-        var note = (x.Note ?? "").Trim();
-        return note.Contains("emanet", StringComparison.OrdinalIgnoreCase);
+        // "Emanet" kavramı kaldırıldı. Borç/alacak dili kullanılır.
+        // Bu yardımcı yalnızca eski kayıtların tekilleştirme mantığı için korunur ve
+        // hiçbir satırı artık emanet olarak etiketlemez.
+        return false;
     }
 
     private static List<CustomerTransaction> FilterDuplicateZiynetEmanetRecentRows(List<CustomerTransaction> rows)

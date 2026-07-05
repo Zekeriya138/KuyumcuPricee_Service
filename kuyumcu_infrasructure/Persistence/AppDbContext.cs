@@ -35,6 +35,7 @@ namespace kuyumcu_infrastructure.Persistence
         public DbSet<Invoice> Invoices => Set<Invoice>();
         public DbSet<EInvoiceProfile> EInvoiceProfiles => Set<EInvoiceProfile>();
         public DbSet<EInvoiceDocument> EInvoiceDocuments => Set<EInvoiceDocument>();
+        public DbSet<IncomingEInvoice> IncomingEInvoices => Set<IncomingEInvoice>();
         public DbSet<EInvoiceOutbox> EInvoiceOutboxes => Set<EInvoiceOutbox>();
         public DbSet<EInvoiceWebhookLog> EInvoiceWebhookLogs => Set<EInvoiceWebhookLog>();
         public DbSet<ExpenseSlipDocument> ExpenseSlipDocuments => Set<ExpenseSlipDocument>();
@@ -45,12 +46,15 @@ namespace kuyumcu_infrastructure.Persistence
         public DbSet<SupplierTransaction> SupplierTransactions => Set<SupplierTransaction>();
         public DbSet<DepoStok> DepoStoklar => Set<DepoStok>();
         public DbSet<DepoStokHavuz> DepoStokHavuzlar => Set<DepoStokHavuz>();
+        public DbSet<DepoGumusLot> DepoGumusLots => Set<DepoGumusLot>();
         public DbSet<ScrapStock> ScrapStocks => Set<ScrapStock>();
         public DbSet<ScrapLedger> ScrapLedgers => Set<ScrapLedger>();
         public DbSet<AyarAyar> AyarAyarlari => Set<AyarAyar>();
         public DbSet<CashAccount> CashAccounts => Set<CashAccount>();
         public DbSet<CashTransaction> CashTransactions => Set<CashTransaction>();
         public DbSet<DayEndReport> DayEndReports => Set<DayEndReport>();
+        public DbSet<StockCountSession> StockCountSessions => Set<StockCountSession>();
+        public DbSet<StockCountScan> StockCountScans => Set<StockCountScan>();
         public DbSet<BranchNote> BranchNotes => Set<BranchNote>();
         public DbSet<BranchReminder> BranchReminders => Set<BranchReminder>();
         public DbSet<Account> Accounts => Set<Account>();
@@ -126,6 +130,14 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.CanSwitchBranches).HasDefaultValue(false);
                 e.Property(x => x.CanUseEInvoice).HasDefaultValue(false);
                 e.Property(x => x.CanUseEArchive).HasDefaultValue(false);
+                e.Property(x => x.CanUseExpenseSlip).HasDefaultValue(false);
+                e.Property(x => x.CanManageRates).HasDefaultValue(false);
+                e.Property(x => x.CanViewBalanceSheet).HasDefaultValue(false);
+                e.Property(x => x.CanAccessCustomers).HasDefaultValue(false);
+                e.Property(x => x.CanAccessSuppliers).HasDefaultValue(false);
+                e.Property(x => x.CanAccessPurchase).HasDefaultValue(false);
+                e.Property(x => x.CanAccessSales).HasDefaultValue(false);
+                e.Property(x => x.CanCreateIncomeExpense).HasDefaultValue(false);
 
                 e.HasOne(x => x.Branch)
                     .WithMany(x => x.Users)
@@ -266,6 +278,7 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.CariDurum).HasMaxLength(16);
                 e.Property(x => x.RefType).HasMaxLength(24);
                 e.Property(x => x.Note).HasMaxLength(500);
+                e.Property(x => x.KullaniciAdi).HasMaxLength(200);
                 e.HasIndex(x => new { x.TenantId, x.CustomerId, x.GroupCode, x.ItemName, x.ItemType, x.CreatedAt });
                 e.HasOne(x => x.Customer).WithMany().HasForeignKey(x => x.CustomerId).OnDelete(DeleteBehavior.Cascade);
                 e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.SetNull);
@@ -332,6 +345,22 @@ namespace kuyumcu_infrastructure.Persistence
                 e.HasQueryFilter(x => x.TenantId == _tenant.TenantId);
             });
 
+            // ===== DepoGumusLot (manuel gümüş stok girişi — alış/kasa hariç) =====
+            b.Entity<DepoGumusLot>(e =>
+            {
+                e.ToTable("DepoGumusLots");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.SupplierName).HasMaxLength(256).IsRequired();
+                e.Property(x => x.ProductCode).HasMaxLength(64).IsRequired();
+                e.Property(x => x.ProductName).HasMaxLength(256).IsRequired();
+                e.Property(x => x.Gram).HasColumnType("decimal(18,4)");
+                e.Property(x => x.UnitCostTl).HasColumnType("decimal(18,2)");
+                e.Property(x => x.Note).HasMaxLength(512);
+                e.HasIndex(x => new { x.TenantId, x.BranchId, x.ProductCode });
+                e.HasOne(x => x.Branch).WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
+                e.HasQueryFilter(x => x.TenantId == _tenant.TenantId);
+            });
+
             // ===== AyarAyar (Ayar Ayarları) =====
             b.Entity<AyarAyar>(e =>
             {
@@ -383,7 +412,8 @@ namespace kuyumcu_infrastructure.Persistence
                 e.ToTable("Invoices");
                 e.HasKey(x => x.Id);
                 e.Property(x => x.PaymentType).HasMaxLength(32);
-                e.HasOne(x => x.Sale).WithMany().HasForeignKey(x => x.SaleId).OnDelete(DeleteBehavior.Restrict);
+                e.Property(x => x.PaymentSplitRatio).HasColumnType("decimal(18,10)").HasDefaultValue(1.0m);
+                e.HasOne(x => x.Sale).WithMany().HasForeignKey(x => x.SaleId).OnDelete(DeleteBehavior.Restrict).IsRequired(false);
                 e.HasOne(x => x.Branch).WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
                 e.HasOne(x => x.Customer).WithMany().HasForeignKey(x => x.CustomerId).OnDelete(DeleteBehavior.SetNull);
                 e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
@@ -406,6 +436,26 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.DefaultArchivePrefix).HasMaxLength(16).IsRequired();
                 e.HasOne(x => x.Branch).WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
                 e.HasIndex(x => new { x.TenantId, x.BranchId }).IsUnique();
+                e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
+            });
+
+            b.Entity<IncomingEInvoice>(e =>
+            {
+                e.ToTable("IncomingEInvoices");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Uuid).HasMaxLength(64).IsRequired();
+                e.Property(x => x.InvoiceNumber).HasMaxLength(64);
+                e.Property(x => x.SenderName).HasMaxLength(400);
+                e.Property(x => x.SenderTaxNumber).HasMaxLength(16);
+                e.Property(x => x.DocumentType).HasMaxLength(16);
+                e.Property(x => x.Status).HasMaxLength(64);
+                e.Property(x => x.StatusDescription).HasMaxLength(400);
+                e.Property(x => x.Currency).HasMaxLength(8);
+                e.Property(x => x.PayableAmount).HasColumnType("decimal(18,2)");
+                e.Property(x => x.EnvelopeIdentifier).HasMaxLength(128);
+                e.Property(x => x.RawContent).HasColumnType("nvarchar(max)");
+                e.HasIndex(x => new { x.TenantId, x.Uuid }).IsUnique();
+                e.HasIndex(x => new { x.TenantId, x.BranchId, x.IssueDate });
                 e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
             });
 
@@ -567,6 +617,7 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.Amount).HasColumnType("decimal(18,4)");
                 e.Property(x => x.RefType).HasMaxLength(32);
                 e.Property(x => x.Description).HasMaxLength(500);
+                e.Property(x => x.KullaniciAdi).HasMaxLength(200);
                 e.HasOne(x => x.CashAccount).WithMany().HasForeignKey(x => x.CashAccountId).OnDelete(DeleteBehavior.Restrict);
                 e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
                 e.HasIndex(x => new { x.TenantId, x.BranchId, x.TxDate, x.CreatedAt });
@@ -594,6 +645,31 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.PdfPath).HasMaxLength(256);
                 e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
                 e.HasIndex(x => new { x.TenantId, x.BranchId, x.BusinessDate }).IsUnique();
+                e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
+            });
+
+            // ===== Ürün Sayımı (Stock Count) =====
+            b.Entity<StockCountSession>(e =>
+            {
+                e.ToTable("StockCountSessions");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Name).HasMaxLength(160);
+                e.Property(x => x.Status).HasMaxLength(16).IsRequired();
+                e.Property(x => x.CreatedByName).HasMaxLength(160);
+                e.HasIndex(x => new { x.TenantId, x.BranchId, x.Status, x.CreatedAt });
+                e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
+            });
+
+            b.Entity<StockCountScan>(e =>
+            {
+                e.ToTable("StockCountScans");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Barcode).HasMaxLength(64).IsRequired();
+                e.Property(x => x.ProductCode).HasMaxLength(64);
+                e.Property(x => x.ProductName).HasMaxLength(200);
+                e.Property(x => x.MatchStatus).HasMaxLength(16).IsRequired();
+                e.Property(x => x.ScannedByName).HasMaxLength(160);
+                e.HasIndex(x => new { x.TenantId, x.SessionId, x.ScannedAt });
                 e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
             });
 
@@ -734,6 +810,7 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.SourceUnitTlRate).HasColumnType("decimal(18,6)");
                 e.Property(x => x.TargetUnitTlRate).HasColumnType("decimal(18,6)");
                 e.Property(x => x.Description).HasMaxLength(500);
+                e.Property(x => x.KullaniciAdi).HasMaxLength(200);
                 e.HasIndex(x => new { x.TenantId, x.SupplierId, x.TxDate, x.CreatedAt });
                 e.HasOne(x => x.Supplier).WithMany().HasForeignKey(x => x.SupplierId).OnDelete(DeleteBehavior.Cascade);
                 e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.SetNull);
@@ -908,6 +985,7 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.IsSpecialProduct).HasDefaultValue(false);
                 e.Property(x => x.BelirlenenSatisFiyatiHas).HasColumnType("decimal(18,4)");
                 e.Property(x => x.BirimSatisIscilikHas).HasColumnType("decimal(18,4)");
+                e.Property(x => x.DepoBirimMaliyet).HasColumnType("decimal(18,6)");
 
                 e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
 
@@ -919,7 +997,7 @@ namespace kuyumcu_infrastructure.Persistence
         }
         public override Task<int> SaveChangesAsync(CancellationToken ct = default)
         {
-            if (_tenant != null)
+            if (_tenant != null && _tenant.TenantId != Guid.Empty)
             {
                 var entries = ChangeTracker.Entries()
                     .Where(e => e.State == EntityState.Added && e.Entity is ITenantScoped);

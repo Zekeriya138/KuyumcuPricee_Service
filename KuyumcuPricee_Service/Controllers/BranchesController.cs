@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -95,14 +96,17 @@ public class BranchesController : ControllerBase
     // ===== LIST =====
     [HttpGet]
     [AllowAnonymous]   // 🔹 BUNU EKLE
-    public async Task<IActionResult> List([FromQuery] bool? onlyActive, CancellationToken ct)
+    public async Task<IActionResult> List([FromQuery] bool? onlyActive, [FromQuery] bool? forManagement, CancellationToken ct)
     {
         var tid = GetTenantId();
         var q = _db.Branches.AsNoTracking().Where(x => x.TenantId == tid);
 
-        // Owner dışındaki kullanıcılar sadece kendi şubelerini görür.
         var isOwner = User?.Identity?.IsAuthenticated == true && User.IsInRole("Owner");
-        if (User?.Identity?.IsAuthenticated == true && !isOwner)
+        var forMgmt = forManagement == true;
+        var canSeeAllBranches = isOwner
+            || (forMgmt && (HasPermissionClaim("perm_manage_branches") || HasPermissionClaim("perm_switch_branches")))
+            || (!forMgmt && HasPermissionClaim("perm_switch_branches"));
+        if (User?.Identity?.IsAuthenticated == true && !canSeeAllBranches)
         {
             var branchId = GetClaimBranchId();
             if (!branchId.HasValue || branchId.Value == Guid.Empty)
@@ -137,9 +141,9 @@ public class BranchesController : ControllerBase
 
     // ===== CREATE =====
     [HttpPost]
-    [Authorize(Roles = "Owner,Admin")]
     public async Task<IActionResult> Create([FromBody] BranchCreateReq req, CancellationToken ct)
     {
+        if (!CanManageBranchesPerm()) return Forbid();
         var tid = GetTenantId();
 
         var b = new Branch
@@ -161,9 +165,9 @@ public class BranchesController : ControllerBase
 
     // ===== UPDATE =====
     [HttpPut("{id:guid}")]
-    [Authorize(Roles = "Owner,Admin")]
     public async Task<IActionResult> Update(Guid id, [FromBody] BranchUpdateReq req, CancellationToken ct)
     {
+        if (!CanManageBranchesPerm()) return Forbid();
         var tid = GetTenantId();
 
         var b = await _db.Branches.FirstOrDefaultAsync(x => x.Id == id && x.TenantId == tid, ct);
@@ -183,9 +187,9 @@ public class BranchesController : ControllerBase
 
     // ===== DELETE =====
     [HttpDelete("{id:guid}")]
-    [Authorize(Roles = "Owner,Admin")]
     public async Task<IActionResult> Delete(Guid id, CancellationToken ct)
     {
+        if (!CanManageBranchesPerm()) return Forbid();
         var tid = GetTenantId();
 
         var b = await _db.Branches.FirstOrDefaultAsync(x => x.Id == id && x.TenantId == tid, ct);
@@ -317,5 +321,18 @@ public class BranchesController : ControllerBase
             await tx.RollbackAsync(ct);
             throw;
         }
+    }
+
+    private bool HasPermissionClaim(string claimType)
+    {
+        var raw = User?.FindFirstValue(claimType);
+        return string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool CanManageBranchesPerm()
+    {
+        return User?.Identity?.IsAuthenticated == true
+               && (User.IsInRole("Owner") || HasPermissionClaim("perm_manage_branches"));
     }
 }

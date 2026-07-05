@@ -41,7 +41,15 @@ public sealed class UsersController : ControllerBase
         bool CanManageBranches,
         bool CanSwitchBranches,
         bool CanUseEInvoice,
-        bool CanUseEArchive
+        bool CanUseEArchive,
+        bool CanUseExpenseSlip,
+        bool CanManageRates,
+        bool CanViewBalanceSheet,
+        bool CanAccessCustomers,
+        bool CanAccessSuppliers,
+        bool CanAccessPurchase,
+        bool CanAccessSales,
+        bool CanCreateIncomeExpense
     );
 
     public sealed record UserUpsertReq(
@@ -58,7 +66,15 @@ public sealed class UsersController : ControllerBase
         bool? CanManageBranches,
         bool? CanSwitchBranches,
         bool? CanUseEInvoice,
-        bool? CanUseEArchive
+        bool? CanUseEArchive,
+        bool? CanUseExpenseSlip,
+        bool? CanManageRates,
+        bool? CanViewBalanceSheet,
+        bool? CanAccessCustomers,
+        bool? CanAccessSuppliers,
+        bool? CanAccessPurchase,
+        bool? CanAccessSales,
+        bool? CanCreateIncomeExpense
     );
 
     public sealed record ChangePasswordReq(string NewPassword);
@@ -112,7 +128,15 @@ public sealed class UsersController : ControllerBase
                 x.CanManageBranches,
                 x.CanSwitchBranches,
                 x.CanUseEInvoice,
-                x.CanUseEArchive
+                x.CanUseEArchive,
+                x.CanUseExpenseSlip,
+                x.CanManageRates,
+                x.CanViewBalanceSheet,
+                x.CanAccessCustomers,
+                x.CanAccessSuppliers,
+                x.CanAccessPurchase,
+                x.CanAccessSales,
+                x.CanCreateIncomeExpense
             ))
             .ToListAsync(ct);
 
@@ -156,7 +180,15 @@ public sealed class UsersController : ControllerBase
                 x.CanManageBranches,
                 x.CanSwitchBranches,
                 x.CanUseEInvoice,
-                x.CanUseEArchive
+                x.CanUseEArchive,
+                x.CanUseExpenseSlip,
+                x.CanManageRates,
+                x.CanViewBalanceSheet,
+                x.CanAccessCustomers,
+                x.CanAccessSuppliers,
+                x.CanAccessPurchase,
+                x.CanAccessSales,
+                x.CanCreateIncomeExpense
             ))
             .FirstOrDefaultAsync(ct);
 
@@ -188,7 +220,9 @@ public sealed class UsersController : ControllerBase
                 return BadRequest(new { error = "Bu işletmede zaten bir Sahip kullanıcı var. Sahip rolü tek kişiye atanabilir." });
         }
 
-        var perms = ResolvePermissions(normalizedRole, req);
+        var perms = IsOwner()
+            ? ResolvePermissions(normalizedRole, req)
+            : BuildDefaultPermissions(normalizedRole);
         var user = new User
         {
             TenantId = _tenant.TenantId,
@@ -206,7 +240,15 @@ public sealed class UsersController : ControllerBase
             CanManageBranches = perms.CanManageBranches,
             CanSwitchBranches = perms.CanSwitchBranches,
             CanUseEInvoice = perms.CanUseEInvoice,
-            CanUseEArchive = perms.CanUseEArchive
+            CanUseEArchive = perms.CanUseEArchive,
+            CanUseExpenseSlip = perms.CanUseExpenseSlip,
+            CanManageRates = perms.CanManageRates,
+            CanViewBalanceSheet = perms.CanViewBalanceSheet,
+            CanAccessCustomers = perms.CanAccessCustomers,
+            CanAccessSuppliers = perms.CanAccessSuppliers,
+            CanAccessPurchase = perms.CanAccessPurchase,
+            CanAccessSales = perms.CanAccessSales,
+            CanCreateIncomeExpense = perms.CanCreateIncomeExpense
         };
 
         _db.Users.Add(user);
@@ -219,6 +261,7 @@ public sealed class UsersController : ControllerBase
     public async Task<IActionResult> Update(Guid id, [FromBody] UserUpsertReq req, CancellationToken ct)
     {
         var canManage = CanManageUsers();
+        var canEditPermissions = IsOwner();
         if (!canManage && !IsCurrentUser(id)) return Forbid();
 
         var user = await _db.Users.FirstOrDefaultAsync(x => x.Id == id && !x.IsDeleted, ct);
@@ -240,35 +283,48 @@ public sealed class UsersController : ControllerBase
             user.Username = username;
             user.BranchId = req.BranchId;
             user.DefaultBranchId = req.BranchId;
-            var normalizedRole = NormalizeRole(req.Role);
-            if (!string.Equals(user.Role, normalizedRole, StringComparison.OrdinalIgnoreCase))
-            {
-                if (normalizedRole.Equals("Owner", StringComparison.OrdinalIgnoreCase))
-                {
-                    var ownerExists = await _db.Users.AsNoTracking()
-                        .AnyAsync(x => x.Id != id && !x.IsDeleted && x.Role == "Owner", ct);
-                    if (ownerExists)
-                        return BadRequest(new { error = "Bu işletmede zaten bir Sahip kullanıcı var. Sahip rolü tek kişiye atanabilir." });
-                }
-                else if (string.Equals(user.Role, "Owner", StringComparison.OrdinalIgnoreCase))
-                {
-                    var ownerCount = await _db.Users.AsNoTracking()
-                        .CountAsync(x => !x.IsDeleted && x.Role == "Owner", ct);
-                    if (ownerCount <= 1)
-                        return BadRequest(new { error = "Sistemde en az bir Sahip kullanıcı bulunmalıdır." });
-                }
-            }
-            user.Role = normalizedRole;
             user.IsActive = req.IsActive;
             if (!IsValidNationalId(req.NationalId))
                 return BadRequest(new { error = "TC kimlik numarası zorunludur ve 11 haneli olmalıdır." });
             user.NationalId = NormalizeNationalId(req.NationalId)!;
-            var perms = ResolvePermissions(normalizedRole, req);
-            user.CanManageUsers = perms.CanManageUsers;
-            user.CanManageBranches = perms.CanManageBranches;
-            user.CanSwitchBranches = perms.CanSwitchBranches;
-            user.CanUseEInvoice = perms.CanUseEInvoice;
-            user.CanUseEArchive = perms.CanUseEArchive;
+
+            if (canEditPermissions)
+            {
+                var normalizedRole = NormalizeRole(req.Role);
+                if (!string.Equals(user.Role, normalizedRole, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (normalizedRole.Equals("Owner", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var ownerExists = await _db.Users.AsNoTracking()
+                            .AnyAsync(x => x.Id != id && !x.IsDeleted && x.Role == "Owner", ct);
+                        if (ownerExists)
+                            return BadRequest(new { error = "Bu işletmede zaten bir Sahip kullanıcı var. Sahip rolü tek kişiye atanabilir." });
+                    }
+                    else if (string.Equals(user.Role, "Owner", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var ownerCount = await _db.Users.AsNoTracking()
+                            .CountAsync(x => !x.IsDeleted && x.Role == "Owner", ct);
+                        if (ownerCount <= 1)
+                            return BadRequest(new { error = "Sistemde en az bir Sahip kullanıcı bulunmalıdır." });
+                    }
+                }
+
+                user.Role = normalizedRole;
+                var perms = ResolvePermissions(normalizedRole, req);
+                user.CanManageUsers = perms.CanManageUsers;
+                user.CanManageBranches = perms.CanManageBranches;
+                user.CanSwitchBranches = perms.CanSwitchBranches;
+                user.CanUseEInvoice = perms.CanUseEInvoice;
+                user.CanUseEArchive = perms.CanUseEArchive;
+                user.CanUseExpenseSlip = perms.CanUseExpenseSlip;
+                user.CanManageRates = perms.CanManageRates;
+                user.CanViewBalanceSheet = perms.CanViewBalanceSheet;
+                user.CanAccessCustomers = perms.CanAccessCustomers;
+                user.CanAccessSuppliers = perms.CanAccessSuppliers;
+                user.CanAccessPurchase = perms.CanAccessPurchase;
+                user.CanAccessSales = perms.CanAccessSales;
+                user.CanCreateIncomeExpense = perms.CanCreateIncomeExpense;
+            }
         }
 
         user.FullName = NormalizeNullable(req.FullName);
@@ -355,11 +411,15 @@ public sealed class UsersController : ControllerBase
         return Ok(new SalaryHistoryDto(entry.Id, entry.Amount, entry.EffectiveFrom, entry.Note, entry.CreatedAt));
     }
 
-    private bool CanManageUsers()
+    private bool IsOwner()
     {
         var role = User.FindFirstValue(ClaimTypes.Role) ?? "";
-        if (role.Equals("Owner", StringComparison.OrdinalIgnoreCase))
-            return true;
+        return role.Equals("Owner", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool CanManageUsers()
+    {
+        if (IsOwner()) return true;
         return HasPermissionClaim("perm_manage_users");
     }
 
@@ -404,16 +464,24 @@ public sealed class UsersController : ControllerBase
             req.CanManageBranches ?? defaults.CanManageBranches,
             req.CanSwitchBranches ?? defaults.CanSwitchBranches,
             req.CanUseEInvoice ?? defaults.CanUseEInvoice,
-            req.CanUseEArchive ?? defaults.CanUseEArchive);
+            req.CanUseEArchive ?? defaults.CanUseEArchive,
+            req.CanUseExpenseSlip ?? defaults.CanUseExpenseSlip,
+            req.CanManageRates ?? defaults.CanManageRates,
+            req.CanViewBalanceSheet ?? defaults.CanViewBalanceSheet,
+            req.CanAccessCustomers ?? defaults.CanAccessCustomers,
+            req.CanAccessSuppliers ?? defaults.CanAccessSuppliers,
+            req.CanAccessPurchase ?? defaults.CanAccessPurchase,
+            req.CanAccessSales ?? defaults.CanAccessSales,
+            req.CanCreateIncomeExpense ?? defaults.CanCreateIncomeExpense);
     }
 
     private static UserPermissionSet BuildDefaultPermissions(string normalizedRole)
     {
         if (normalizedRole.Equals("Owner", StringComparison.OrdinalIgnoreCase))
-            return new UserPermissionSet(true, true, true, true, true);
+            return new UserPermissionSet(true, true, true, true, true, true, true, true, true, true, true, true, true);
         if (normalizedRole.Equals("Admin", StringComparison.OrdinalIgnoreCase))
-            return new UserPermissionSet(false, true, false, true, true);
-        return new UserPermissionSet(false, false, false, false, false);
+            return new UserPermissionSet(false, true, false, true, true, true, true, false, true, true, true, true, true);
+        return new UserPermissionSet(false, false, false, false, false, false, false, false, false, false, false, false, false);
     }
 
     private readonly record struct UserPermissionSet(
@@ -421,7 +489,15 @@ public sealed class UsersController : ControllerBase
         bool CanManageBranches,
         bool CanSwitchBranches,
         bool CanUseEInvoice,
-        bool CanUseEArchive
+        bool CanUseEArchive,
+        bool CanUseExpenseSlip,
+        bool CanManageRates,
+        bool CanViewBalanceSheet,
+        bool CanAccessCustomers,
+        bool CanAccessSuppliers,
+        bool CanAccessPurchase,
+        bool CanAccessSales,
+        bool CanCreateIncomeExpense
     );
 
     private static string? NormalizeNullable(string? value)

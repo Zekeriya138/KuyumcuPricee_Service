@@ -38,7 +38,10 @@ public sealed class CustomerTransactionsController : ControllerBase
         decimal? NakitAmount,
         decimal? HavaleAmount,
         string? Description,
-        DateTime? TxDate);
+        DateTime? TxDate,
+        decimal? SourceUnitTlRate = null,
+        decimal? TargetUnitTlRate = null,
+        decimal? TargetAmount = null);
 
     [HttpPost("process")]
     public async Task<IActionResult> Process([FromBody] ProcessReq req, CancellationToken ct)
@@ -189,7 +192,7 @@ public sealed class CustomerTransactionsController : ControllerBase
                 BranchId = branchId,
                 GroupCode = "ZIYNET",
                 ItemName = (z.Ad ?? string.Empty).Trim().ToUpperInvariant(),
-                ItemType = string.IsNullOrWhiteSpace(z.Tip) ? "Yeni" : z.Tip!.Trim(),
+                ItemType = string.IsNullOrWhiteSpace(z.Tip) ? null : z.Tip!.Trim(),
                 Quantity = decimal.Round(Math.Abs(z.Adet), 3, MidpointRounding.AwayFromZero),
                 Direction = dir,
                 TxDate = txDate,
@@ -232,27 +235,34 @@ public sealed class CustomerTransactionsController : ControllerBase
         if (req.SourceAmount <= 0m)
             throw new InvalidOperationException("Dönüştürülecek kaynak miktar 0'dan büyük olmalıdır.");
 
-        var src = NormalizeUnit(req.SourceUnit);
-        var tgt = NormalizeUnit(req.TargetUnit);
-        if (src == tgt)
+        if (!BalanceConversionZiynetHelper.TryParseUnit(req.SourceUnit, out var srcU))
+            throw new InvalidOperationException("Kaynak birim geçersiz.");
+        if (!BalanceConversionZiynetHelper.TryParseUnit(req.TargetUnit, out var tgtU))
+            throw new InvalidOperationException("Hedef birim geçersiz.");
+        if (BalanceConversionZiynetHelper.UnitsEqual(srcU, tgtU))
             throw new InvalidOperationException("Kaynak ve hedef birim aynı olamaz.");
 
         var bal = await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, req.CustomerId, ct);
-        var sourceBalance = GetCustomerBalanceByUnit(bal, src);
-        var conversionMap = sourceBalance >= 0m
-            ? _rates.GetUnitToTlBuyRates()
-            : _rates.GetUnitToTlSellRates();
-        var srcMap = conversionMap;
-        var tgtMap = conversionMap;
-        var srcRate = srcMap.TryGetValue(src, out var sr) ? sr : 0m;
-        var tgtRate = tgtMap.TryGetValue(tgt, out var tr) ? tr : 0m;
+
+        // Kaynak→TL ve TL→hedef için ayrı alış/satış yönü (müşteri mantığı).
+        var sourceBalance = srcU.IsZiynet
+            ? await GetCustomerZiynetNetAsync(tenantId, req.CustomerId, branchId, srcU.ZiynetAd, srcU.ZiynetTip, ct)
+            : GetCustomerBalanceByUnit(bal, srcU.CurrencyUnit);
+        var (useBuySrc, useBuyTgt) = BalanceConversionZiynetHelper.ResolveRateSides(isSupplier: false, sourceBalance);
+
+        var srcRate = req.SourceUnitTlRate is > 0m
+            ? req.SourceUnitTlRate.Value
+            : BalanceConversionZiynetHelper.ResolveUnitTlRate(_rates, srcU, useBuySrc);
+        var tgtRate = req.TargetUnitTlRate is > 0m
+            ? req.TargetUnitTlRate.Value
+            : BalanceConversionZiynetHelper.ResolveUnitTlRate(_rates, tgtU, useBuyTgt);
         if (srcRate <= 0m || tgtRate <= 0m)
             throw new InvalidOperationException("Kur bilgisi alınamadı.");
 
         var srcAmt = decimal.Round(req.SourceAmount, 6, MidpointRounding.AwayFromZero);
-        var tgtAmt = decimal.Round((srcAmt * srcRate) / tgtRate, 6, MidpointRounding.AwayFromZero);
-        if (TryConvertHasByKgRateForBalanceConversion(src, tgt, sourceBalance, srcAmt, out var kgConverted))
-            tgtAmt = kgConverted;
+        var tgtAmt = req.TargetAmount is > 0m
+            ? decimal.Round(req.TargetAmount.Value, 6, MidpointRounding.AwayFromZero)
+            : decimal.Round((srcAmt * srcRate) / tgtRate, 6, MidpointRounding.AwayFromZero);
 
         // Bakiye dönüşümünde işaret yönü her zaman birim-1 (kaynak) bakiyesine göre belirlenir:
         // - Kaynak bakiye eksi ise: borç birim değiştirir -> kaynak (+), hedef (-)
@@ -260,44 +270,80 @@ public sealed class CustomerTransactionsController : ControllerBase
         var sourceIsNegative = sourceBalance < 0m;
         var srcDelta = sourceIsNegative ? +srcAmt : -srcAmt;
         var tgtDelta = sourceIsNegative ? -tgtAmt : +tgtAmt;
-        ApplyCustomerBalanceDelta(bal, src, srcDelta);
-        ApplyCustomerBalanceDelta(bal, tgt, tgtDelta);
-        bal.UpdatedAt = DateTime.UtcNow;
 
+        var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
+        ApplyCustomerConversionSide(bal, tenantId, req.CustomerId, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate);
+        ApplyCustomerConversionSide(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate);
+        bal.UpdatedAt = DateTime.UtcNow;
+    }
+
+    private void ApplyCustomerConversionSide(
+        CustomerBalance bal, Guid tenantId, Guid customerId, Guid branchId,
+        BalanceConversionZiynetHelper.ConversionUnit unit,
+        decimal amount, decimal delta, decimal rate, string note, DateTime txDate)
+    {
+        var totalTl = decimal.Round(amount * rate, 4, MidpointRounding.AwayFromZero);
+        if (unit.IsZiynet)
+        {
+            _db.CustomerTransactions.Add(new CustomerTransaction
+            {
+                TenantId = tenantId,
+                CustomerId = customerId,
+                BranchId = branchId,
+                GroupCode = "ZIYNET",
+                ItemName = unit.ZiynetAd.Trim().ToUpperInvariant(),
+                ItemType = string.IsNullOrWhiteSpace(unit.ZiynetTip) ? null : unit.ZiynetTip.Trim(),
+                Quantity = amount,
+                Direction = delta >= 0m ? 1 : -1,
+                UnitPriceTl = rate,
+                TotalPriceTl = totalTl,
+                TxDate = txDate,
+                CariDurum = delta >= 0m ? "Alacakli" : "Borclu",
+                RefType = "BALANCE_CONVERSION",
+                Note = note
+            });
+            return;
+        }
+
+        ApplyCustomerBalanceDelta(bal, unit.CurrencyUnit, delta);
         _db.CustomerTransactions.Add(new CustomerTransaction
         {
             TenantId = tenantId,
-            CustomerId = req.CustomerId,
+            CustomerId = customerId,
             BranchId = branchId,
             GroupCode = "DOVIZ",
-            ItemName = src,
-            Quantity = srcAmt,
-            Direction = srcDelta >= 0m ? 1 : -1,
-            UnitPriceTl = srcRate,
-            TotalPriceTl = decimal.Round(srcAmt * srcRate, 4, MidpointRounding.AwayFromZero),
+            ItemName = unit.CurrencyUnit,
+            Quantity = amount,
+            Direction = delta >= 0m ? 1 : -1,
+            UnitPriceTl = rate,
+            TotalPriceTl = totalTl,
             TxDate = txDate,
             CariDurum = "Dönüşüm",
             RefType = "BALANCE_CONVERSION",
-            Note = req.Description
+            Note = note
         });
-        _db.CustomerTransactions.Add(new CustomerTransaction
+    }
+
+    private async Task<decimal> GetCustomerZiynetNetAsync(
+        Guid tenantId, Guid customerId, Guid branchId, string ad, string? tip, CancellationToken ct)
+    {
+        var targetCode = BalanceConversionZiynetHelper.ZiynetRateCode(ad, tip);
+        if (string.IsNullOrEmpty(targetCode)) return 0m;
+
+        var rows = await _db.CustomerTransactions
+            .Where(x => x.TenantId == tenantId && x.CustomerId == customerId && x.BranchId == branchId
+                        && !x.IsDeleted && x.GroupCode == "ZIYNET")
+            .Select(x => new { x.ItemName, x.ItemType, x.Quantity, x.Direction })
+            .ToListAsync(ct);
+
+        decimal net = 0m;
+        foreach (var r in rows)
         {
-            TenantId = tenantId,
-            CustomerId = req.CustomerId,
-            BranchId = branchId,
-            GroupCode = "DOVIZ",
-            ItemName = tgt,
-            Quantity = tgtAmt,
-            Direction = tgtDelta >= 0m ? 1 : -1,
-            UnitPriceTl = tgtRate,
-            TotalPriceTl = decimal.Round(tgtAmt * tgtRate, 4, MidpointRounding.AwayFromZero),
-            TxDate = txDate,
-            CariDurum = "Dönüşüm",
-            RefType = "BALANCE_CONVERSION",
-            Note = string.IsNullOrWhiteSpace(req.Description)
-                ? $"{srcAmt:N6} {src} -> {tgtAmt:N6} {tgt}"
-                : req.Description
-        });
+            var code = BalanceConversionZiynetHelper.ZiynetRateCode(r.ItemName, r.ItemType);
+            if (!string.Equals(code, targetCode, StringComparison.OrdinalIgnoreCase)) continue;
+            net += r.Direction >= 0 ? r.Quantity : -r.Quantity;
+        }
+        return net;
     }
 
     private bool TryConvertHasByKgRateForBalanceConversion(string src, string tgt, decimal sourceBalance, decimal srcAmount, out decimal converted)
@@ -420,11 +466,25 @@ public sealed class CustomerTransactionsController : ControllerBase
         });
     }
 
+    /// <summary>Has altın ziynet kalemi mi? (Külçe ve 22 ayar gram ziynet hariç) → DOVIZ/HAS bakiyesine yazılır.</summary>
+    internal static bool IsHasAltinZiynetAd(string? ad)
+    {
+        var s = (ad ?? "").Trim().ToUpperInvariant();
+        if (string.IsNullOrEmpty(s)) return false;
+        if (s.Contains("KÜLÇE") || s.Contains("KULCE") || s.Contains("22 AYAR") || s.Contains("22AYAR"))
+            return false;
+        return s.Contains("HAS ALTIN") || s.Contains("HASALTIN") || s.Contains("HAS ALTİN") || s == "HAS";
+    }
+
     private async Task ApplyZiynetAsync(ProcessReq req, Guid tenantId, Guid branchId, string txType, DateTime txDate, CancellationToken ct)
     {
         var items = req.ZiynetItems ?? new();
         if (items.Count == 0) return;
-        var emanetFlow = (req.Description ?? "").Contains("emanet", StringComparison.OrdinalIgnoreCase);
+        // Yeni alacak/borç ziynet satırı oluşturma akışı (teslim edilmeyen kalemler).
+        // Geriye dönük uyumluluk için "emanet" anahtarı da tetikleyici kabul edilir.
+        var desc = req.Description ?? "";
+        var emanetFlow = desc.Contains("ZIYNET_ALACAK", StringComparison.OrdinalIgnoreCase)
+                         || desc.Contains("emanet", StringComparison.OrdinalIgnoreCase);
 
         var rows = await _db.CustomerTransactions
             .Where(x => x.TenantId == tenantId && x.CustomerId == req.CustomerId && x.BranchId == branchId && !x.IsDeleted && x.GroupCode == "ZIYNET")
@@ -447,6 +507,7 @@ public sealed class CustomerTransactionsController : ControllerBase
                 x => (x.Ad, x.Tip),
                 x => x.Qty);
 
+        CustomerBalance? balForHas = null;
         foreach (var it in items.Where(x => x.Adet > 0))
         {
             var key = (
@@ -464,6 +525,38 @@ public sealed class CustomerTransactionsController : ControllerBase
                 var toplamTutarTl = birimFiyatTl.HasValue
                     ? decimal.Round(it.Adet * birimFiyatTl.Value, 2, MidpointRounding.AwayFromZero)
                     : (decimal?)null;
+
+                // Has altın teslim edilmeyen kalem: adet defterine değil, DOVIZ/HAS bakiyesine yaz.
+                if (IsHasAltinZiynetAd(key.Item1))
+                {
+                    balForHas ??= await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, req.CustomerId, ct);
+                    var hasQty = decimal.Round(it.Adet, 6, MidpointRounding.AwayFromZero);
+                    balForHas.BalanceHAS += emanetDirection * hasQty;
+                    balForHas.UpdatedAt = DateTime.UtcNow;
+                    await CustomerFinanceHelper.AddTransactionAsync(
+                        _db,
+                        tenantId,
+                        req.CustomerId,
+                        branchId,
+                        groupCode: "DOVIZ",
+                        itemName: "HAS",
+                        itemType: null,
+                        quantity: hasQty,
+                        direction: emanetDirection,
+                        gram: hasQty,
+                        ayar: "HAS",
+                        milyem: null,
+                        hasEq: hasQty,
+                        unitPriceTl: birimFiyatTl,
+                        totalPriceTl: toplamTutarTl,
+                        refType: "SALE",
+                        refId: null,
+                        note: req.Description,
+                        txDate: txDate,
+                        ct: ct);
+                    continue;
+                }
+
                 _db.CustomerTransactions.Add(new CustomerTransaction
                 {
                     TenantId = tenantId,
@@ -478,7 +571,7 @@ public sealed class CustomerTransactionsController : ControllerBase
                     TotalPriceTl = toplamTutarTl,
                     HasEquivalent = birimAlisTl,
                     TxDate = txDate,
-                    CariDurum = "Emanet",
+                    CariDurum = emanetDirection >= 0 ? "Alacakli" : "Borclu",
                     RefType = "SALE",
                     Note = req.Description
                 });

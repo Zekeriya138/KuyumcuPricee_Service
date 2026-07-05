@@ -88,9 +88,10 @@ namespace kuyumcu_infrastructure.Tenancy
 
         private static bool RequiresTenant(HttpContext ctx)
         {
-            var path = ctx.Request.Path.Value ?? string.Empty;
+            var path = (ctx.Request.Path.Value ?? string.Empty).TrimEnd('/');
             if (path.StartsWith("/swagger", StringComparison.OrdinalIgnoreCase)) return false;
             if (path.Equals("/ping", StringComparison.OrdinalIgnoreCase)) return false;
+            if (path.Equals("/health", StringComparison.OrdinalIgnoreCase)) return false;
             if (path.StartsWith("/auth", StringComparison.OrdinalIgnoreCase)) return false;
             if (path.StartsWith("/api/auth", StringComparison.OrdinalIgnoreCase)) return false;
             if (HttpMethods.IsOptions(ctx.Request.Method)) return false;

@@ -33,6 +33,8 @@ public static class EInvoiceProfileSettingsCodec
     private const string Prefix = "v1";
     public const string WorkmanshipProductTypeCrafted = "Iscilikli";
     public const string WorkmanshipProductTypeZiynet = "Ziynet";
+    public const string WorkmanshipProductTypeCollection = "Tahsilat";
+    public const string WorkmanshipCollectionSelector = "HASALTIN";
     public static readonly HashSet<string> AllowedKaratValues = new(StringComparer.OrdinalIgnoreCase)
     {
         "24K", "22K", "18K", "14K", "8K"
@@ -190,6 +192,7 @@ public static class EInvoiceProfileSettingsCodec
         return text switch
         {
             "ZIYNET" or "ZIYNET/SARRAFIYE" => WorkmanshipProductTypeZiynet,
+            "TAHSILAT" => WorkmanshipProductTypeCollection,
             _ => WorkmanshipProductTypeCrafted
         };
     }
@@ -197,6 +200,8 @@ public static class EInvoiceProfileSettingsCodec
     public static string? NormalizeWorkmanshipSelector(string? productType, string? value)
     {
         var type = NormalizeWorkmanshipProductType(productType);
+        if (string.Equals(type, WorkmanshipProductTypeCollection, StringComparison.OrdinalIgnoreCase))
+            return WorkmanshipCollectionSelector;
         if (string.Equals(type, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase))
             return NormalizeWorkmanshipZiynetProduct(value);
         return NormalizeWorkmanshipKarat(value);
@@ -277,6 +282,8 @@ public static class EInvoiceProfileSettingsCodec
     public static string ToWorkmanshipSelectorDisplay(string? productType, string? selector)
     {
         var type = NormalizeWorkmanshipProductType(productType);
+        if (string.Equals(type, WorkmanshipProductTypeCollection, StringComparison.OrdinalIgnoreCase))
+            return "Has altın";
         if (!string.Equals(type, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase))
             return NormalizeWorkmanshipKarat(selector) ?? "22K";
 
@@ -288,29 +295,71 @@ public static class EInvoiceProfileSettingsCodec
         EInvoiceProfile? profile,
         IReadOnlyCollection<string> salePaymentMethods,
         decimal saleGrandTotal)
+        => GetQualifyingPaymentsForDraft(
+               profile,
+               salePaymentMethods.Select(m => (m, 0m)).ToList(),
+               saleGrandTotal).Count > 0;
+
+    /// <summary>
+    /// Her ödeme yöntemi için ayrı taslak oluşturma özelliği:
+    /// Profil ayarlarına göre taslak oluşturulacak ödeme kalemlerini döner.
+    /// Tek ödeme yöntemi için geri dönüş listesi 1 elemanlı, birden fazlası için N elemanlıdır.
+    /// </summary>
+    /// <summary>
+    /// Hiçbir zaman e-fatura taslağı oluşturmayacak ödeme yöntemleri (normalize edilmiş adlarla).
+    /// Döviz tahsilatı, takas ve veresiye/tedarikçi veresiyesi e-faturaya dahil edilmez.
+    /// </summary>
+    private static readonly HashSet<string> NeverDraftPaymentMethods = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "USD",
+        "Euro",
+        "GBP",
+        "Takas",
+        "Veresiye",
+        "TedarikciVeresiye"
+    };
+
+    public static List<(string Method, decimal AmountTl)> GetQualifyingPaymentsForDraft(
+        EInvoiceProfile? profile,
+        IReadOnlyList<(string Method, decimal AmountTl)> payments,
+        decimal saleGrandTotal)
     {
         var settings = Decode(profile?.IntegratorCompanyCode);
         if (!settings.AutoDraftEnabled)
-            return false;
-
+            return new List<(string, decimal)>();
         if (settings.AutoDraftMinTotal.HasValue && saleGrandTotal < settings.AutoDraftMinTotal.Value)
-            return false;
+            return new List<(string, decimal)>();
         if (settings.AutoDraftMaxTotal.HasValue && settings.AutoDraftMaxTotal.Value > 0m && saleGrandTotal > settings.AutoDraftMaxTotal.Value)
-            return false;
+            return new List<(string, decimal)>();
 
+        // Yalnızca pozitif TL tutarlı ödemeleri dikkate al.
+        var candidates = payments.Where(p => p.AmountTl > 0m).ToList();
+        if (candidates.Count == 0) return new List<(string, decimal)>();
+
+        // Kalıcı hariç tutma: bu ödeme yöntemleri hiçbir zaman taslak fatura oluşturmaz.
+        // Döviz tahsilatı (USD/Euro/GBP), takas (mal değişimi) ve veresiye (henüz tahsilat yok)
+        // ile tedarikçi veresiyesi e-fatura taslağına dahil edilmez.
+        candidates = candidates
+            .Where(p => !NeverDraftPaymentMethods.Contains(NormalizePaymentMethod(p.Method)))
+            .ToList();
+        if (candidates.Count == 0) return new List<(string, decimal)>();
+
+        // Yöntem filtresi yoksa (kalıcı hariç tutma sonrası) kalan ödeme kalemleri taslak alır.
         if (settings.AutoDraftAllowedPaymentMethods.Count == 0)
-            return true;
+            return candidates;
 
-        var selected = new HashSet<string>(
+        var allowed = new HashSet<string>(
             settings.AutoDraftAllowedPaymentMethods.Select(NormalizePaymentMethod),
             StringComparer.OrdinalIgnoreCase);
-        var sale = salePaymentMethods.Select(NormalizePaymentMethod).ToList();
-        if (sale.Count == 0) return false;
 
         return NormalizeMatchMode(settings.AutoDraftMatchMode) switch
         {
-            "ALL" => sale.All(selected.Contains),
-            _ => sale.Any(selected.Contains)
+            // ALL modunda: tüm ödemeler izin verilen listede ise hepsi taslak alır.
+            "ALL" => candidates.All(p => allowed.Contains(NormalizePaymentMethod(p.Method)))
+                     ? candidates
+                     : new List<(string, decimal)>(),
+            // ANY modunda: izin verilenler için ayrı ayrı taslak alır.
+            _ => candidates.Where(p => allowed.Contains(NormalizePaymentMethod(p.Method))).ToList()
         };
     }
 
@@ -364,9 +413,13 @@ public static class EInvoiceProfileSettingsCodec
             .Select(x =>
             {
                 var normalizedType = NormalizeWorkmanshipProductType(x.ProductType);
-                var pt = string.Equals(normalizedType, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase) ? "Z" : "C";
+                var pt = string.Equals(normalizedType, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase) ? "Z"
+                    : string.Equals(normalizedType, WorkmanshipProductTypeCollection, StringComparison.OrdinalIgnoreCase) ? "T"
+                    : "C";
                 var selector = NormalizeWorkmanshipSelector(normalizedType, x.Karat)
-                               ?? (string.Equals(normalizedType, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase) ? "CEYREK" : "22K");
+                               ?? (string.Equals(normalizedType, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase) ? "CEYREK"
+                                   : string.Equals(normalizedType, WorkmanshipProductTypeCollection, StringComparison.OrdinalIgnoreCase) ? WorkmanshipCollectionSelector
+                                   : "22K");
                 var min = x.MinTotal.ToString("0.##", CultureInfo.InvariantCulture);
                 var max = x.MaxTotal.ToString("0.##", CultureInfo.InvariantCulture);
                 var pct = x.Percentage.ToString("0.##", CultureInfo.InvariantCulture);
@@ -406,9 +459,16 @@ public static class EInvoiceProfileSettingsCodec
             if (parts.Length != 5)
                 return [];
             var pt = (parts[0] ?? string.Empty).Trim().ToUpperInvariant();
-            var productType = pt == "Z" ? WorkmanshipProductTypeZiynet : WorkmanshipProductTypeCrafted;
+            var productType = pt switch
+            {
+                "Z" => WorkmanshipProductTypeZiynet,
+                "T" => WorkmanshipProductTypeCollection,
+                _ => WorkmanshipProductTypeCrafted
+            };
             var selector = NormalizeWorkmanshipSelector(productType, parts[1])
-                           ?? (string.Equals(productType, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase) ? "CEYREK" : "22K");
+                           ?? (string.Equals(productType, WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase) ? "CEYREK"
+                               : string.Equals(productType, WorkmanshipProductTypeCollection, StringComparison.OrdinalIgnoreCase) ? WorkmanshipCollectionSelector
+                               : "22K");
             if (!decimal.TryParse(parts[2], NumberStyles.Number, CultureInfo.InvariantCulture, out var min))
                 return [];
             if (!decimal.TryParse(parts[3], NumberStyles.Number, CultureInfo.InvariantCulture, out var max))

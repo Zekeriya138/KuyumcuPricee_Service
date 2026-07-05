@@ -1,7 +1,9 @@
 using System.Security.Claims;
+using System.Globalization;
 using kuyumcu_application.Abstractions;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
+using KUYUMCU.Price_Service.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -148,7 +150,8 @@ public class PurchasesController : ControllerBase
         decimal TaxTotal,
         decimal GrandTotal,
         decimal TotalAmount,
-        List<PurchaseItemDto> Items
+        List<PurchaseItemDto> Items,
+        string? Kullanici = null
     );
 
     public sealed record PurchasePaymentDto(
@@ -412,6 +415,62 @@ public class PurchasesController : ControllerBase
                         Description = $"Veresiye alacak kaydı - alış (PurchaseId: {purchase.Id}, Birim: {unit}, Tutar: {unitAmount:0.####})",
                         TxDate = purchase.Date
                     });
+                }
+
+                var onlyCreditSelected = normalized.Count > 0 && normalized.All(x => x.PaymentType == PurchasePaymentType.Credit);
+                var ziynetItems = purchase.Items
+                    .Where(i => i.Kind == ItemKind.Ziynet && i.Quantity > 0)
+                    .ToList();
+                if (onlyCreditSelected && ziynetItems.Count > 0)
+                {
+                    foreach (var item in ziynetItems)
+                    {
+                        var adet = decimal.Round(item.Quantity, 3, MidpointRounding.AwayFromZero);
+                        if (adet <= 0m) continue;
+
+                        // Has altın ziynet kalemi: adet defterine değil, HAS döviz bakiyesine yaz.
+                        if (IsGramAltinHasZiynet(item))
+                        {
+                            supplierBalance.BalanceHAS += adet;
+                            _db.SupplierTransactions.Add(new SupplierTransaction
+                            {
+                                TenantId = tenantId,
+                                SupplierId = sid,
+                                BranchId = purchase.BranchId,
+                                TxType = "COLLECTION",
+                                SourceUnit = "HAS",
+                                SourceAmount = adet,
+                                TargetUnit = "HAS",
+                                TargetAmount = adet,
+                                IsConverted = false,
+                                SourceUnitTlRate = 1m,
+                                TargetUnitTlRate = 1m,
+                                Description = $"Veresiye alacak kaydı - ziynet has altın (PurchaseId: {purchase.Id}, Tutar: {adet:0.####} gr)",
+                                TxDate = purchase.Date
+                            });
+                            continue;
+                        }
+
+                        var ad = NormalizeZiynetAd(item.ProductName, item.Category, item.ProductCode);
+                        var tip = NormalizeZiynetFinanceTip(ad, "Yeni");
+
+                        _db.SupplierTransactions.Add(new SupplierTransaction
+                        {
+                            TenantId = tenantId,
+                            SupplierId = sid,
+                            BranchId = purchase.BranchId,
+                            TxType = "ZIYNET",
+                            SourceUnit = "ADET",
+                            SourceAmount = adet,
+                            TargetUnit = "ADET",
+                            TargetAmount = adet,
+                            IsConverted = false,
+                            SourceUnitTlRate = 1m,
+                            TargetUnitTlRate = 1m,
+                            Description = BuildSupplierZiynetDescription(ad, tip, adet, $"PURCHASE:{purchase.Id}"),
+                            TxDate = purchase.Date
+                        });
+                    }
                 }
                 supplierBalance.UpdatedAt = DateTime.UtcNow;
             }
@@ -1131,12 +1190,18 @@ public class PurchasesController : ControllerBase
                            .Take(pageSize)
                            .ToListAsync(ct);
 
+        var userNames = await UserDisplayNames.BuildUserNameMapAsync(
+            _db, tenantId, items.Select(x => x.UserId).ToList(), ct);
+
         return Ok(new
         {
             total,
             page,
             pageSize,
-            items = items.Select(ToDto)
+            items = items.Select(p => ToDto(p) with
+            {
+                Kullanici = userNames.TryGetValue(p.UserId, out var n) ? n : ""
+            })
         });
     }
 
@@ -1614,6 +1679,12 @@ public class PurchasesController : ControllerBase
         if (name == "GRAM ALTIN(KÜLÇE)" || name == "GRAM ALTIN(KULCE)")
             return "Yeni";
         return string.IsNullOrWhiteSpace(rawTip) ? "Yeni" : rawTip.Trim();
+    }
+
+    private static string BuildSupplierZiynetDescription(string ad, string tip, decimal adet, string reference)
+    {
+        static string Safe(string? raw) => (raw ?? "").Replace("|", "/").Replace(";", ",").Trim();
+        return $"[ZIYNET]|AD={Safe(ad)}|TIP={Safe(tip)}|ADET={adet.ToString("0.###", CultureInfo.InvariantCulture)}|REF={Safe(reference)}";
     }
 
     private static List<PurchasePayment> BuildHeaderPayments(Purchase purchase, CreatePurchaseReq req)

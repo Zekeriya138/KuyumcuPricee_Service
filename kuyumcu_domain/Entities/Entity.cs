@@ -40,6 +40,14 @@ public class User : Entity
     public bool CanSwitchBranches { get; set; }
     public bool CanUseEInvoice { get; set; }
     public bool CanUseEArchive { get; set; }
+    public bool CanUseExpenseSlip { get; set; }
+    public bool CanManageRates { get; set; }
+    public bool CanViewBalanceSheet { get; set; }
+    public bool CanAccessCustomers { get; set; }
+    public bool CanAccessSuppliers { get; set; }
+    public bool CanAccessPurchase { get; set; }
+    public bool CanAccessSales { get; set; }
+    public bool CanCreateIncomeExpense { get; set; }
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
     public Guid BranchId { get; set; }
     public Branch Branch { get; set; } = null!;
@@ -75,6 +83,9 @@ public class Sale : Entity
     /// <summary>Nakit, Kart, Iban, Takas, Veresiye</summary>
     public string PaymentType { get; set; } = "Nakit";
 
+    /// <summary>Teslimat tipi: "Teslim" (teslim edildi) veya "EMANET" (teslim edilmedi). Boş/null = teslim edildi.</summary>
+    public string? DeliveryType { get; set; }
+
     public User User { get; set; } = null!;
     public Branch Branch { get; set; } = null!;
     public Customer? Customer { get; set; }
@@ -86,15 +97,25 @@ public class Sale : Entity
 public class Invoice : Entity
 {
     public Guid TenantId { get; set; }
-    public Guid SaleId { get; set; }
+    public Guid? SaleId { get; set; }
     public Guid BranchId { get; set; }
     public Guid? CustomerId { get; set; }
     public DateTime InvoiceDate { get; set; } = DateTime.UtcNow;
     public decimal GrandTotal { get; set; }
     public string PaymentType { get; set; } = "IBAN";
+    /// <summary>
+    /// Çoklu ödeme bölünmesinde bu faturanın toplam satış tutarına oranı (0 &lt; ratio ≤ 1).
+    /// Tek ödeme / tam fatura için varsayılan değer 1.0'dır.
+    /// </summary>
+    public decimal PaymentSplitRatio { get; set; } = 1.0m;
     public bool IsExported { get; set; }
+    /// <summary>
+    /// Satışa bağlı olmayan (tahsilat kaynaklı) taslak faturalar için alıcı + has altın kalem bilgisi (JSON).
+    /// Doluysa fatura, satış kalemleri yerine bu meta üzerinden (has altın tek kalem) oluşturulur.
+    /// </summary>
+    public string? CollectionMetaJson { get; set; }
 
-    public Sale Sale { get; set; } = null!;
+    public Sale? Sale { get; set; }
     public Branch Branch { get; set; } = null!;
     public Customer? Customer { get; set; }
 }

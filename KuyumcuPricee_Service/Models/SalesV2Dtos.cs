@@ -11,7 +11,8 @@ public sealed record CreateSaleItemReq(
     decimal UnitPrice,
     decimal Discount,           // TL
     decimal TaxRate,            // 0.00..1.00
-    Guid? ProductItemId         // barkodlu tekil parça satılıyorsa (ProductItems.Id)
+    Guid? ProductItemId,        // barkodlu tekil parça satılıyorsa (ProductItems.Id)
+    string? Olcu = null         // ziynet tipi (Yeni/Eski) - katalog eşleşmesi olmayan satırlar için
 );
 
 public sealed record CreateSaleReqV2(

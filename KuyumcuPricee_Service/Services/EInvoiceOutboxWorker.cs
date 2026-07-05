@@ -33,6 +33,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
                 await PollQueuedStatusesAsync(stoppingToken);
                 await ProcessExpenseSlipBatchAsync(stoppingToken);
                 await PollExpenseSlipStatusesAsync(stoppingToken);
+                await SyncIncomingInvoicesAsync(stoppingToken);
             }
             catch (Exception ex)
             {
@@ -114,7 +115,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
                 var profile = await db.EInvoiceProfiles
                     .IgnoreQueryFilters()
                     .AsNoTracking()
-                    .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId && x.IsActive, ct);
+                    .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId, ct);
                 var providerCode = string.IsNullOrWhiteSpace(profile?.ProviderCode) ? "edm" : profile.ProviderCode;
                 var adapter = providerResolver.Resolve(providerCode);
 
@@ -215,7 +216,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
             var profile = await db.EInvoiceProfiles
                 .IgnoreQueryFilters()
                 .AsNoTracking()
-                .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId && x.IsActive, ct);
+                .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId, ct);
 
             var providerCode = string.IsNullOrWhiteSpace(profile?.ProviderCode) ? "edm" : profile.ProviderCode;
             var adapter = providerResolver.Resolve(providerCode);
@@ -306,6 +307,93 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
     private static bool IsFinalStatus(string status)
         => status is "Delivered" or "Rejected" or "Cancelled" or "Failed";
 
+    // Gelen e-Fatura senkronu için en son çekim zamanı (profil/şube bazlı, bellekte).
+    private static readonly ConcurrentDictionary<Guid, DateTime> IncomingSyncCache = new();
+
+    private async Task SyncIncomingInvoicesAsync(CancellationToken ct)
+    {
+        // Yapılandırılabilir aralık; varsayılan 15 dakikada bir.
+        var intervalMinutes = Math.Clamp(_cfg.GetValue<int?>("EInvoice:Incoming:SyncIntervalMinutes") ?? 15, 1, 24 * 60);
+        var lookbackDays = Math.Clamp(_cfg.GetValue<int?>("EInvoice:Incoming:LookbackDays") ?? 365, 1, 3650);
+
+        using var scope = _scopeFactory.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var providerResolver = scope.ServiceProvider.GetRequiredService<IEInvoiceProviderResolver>();
+        var now = DateTime.UtcNow;
+
+        var profiles = await db.EInvoiceProfiles
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .Where(x => !x.IsDeleted && x.IsActive)
+            .ToListAsync(ct);
+
+        foreach (var profile in profiles)
+        {
+            if (IncomingSyncCache.TryGetValue(profile.BranchId, out var last) &&
+                (now - last).TotalMinutes < intervalMinutes)
+                continue;
+            IncomingSyncCache[profile.BranchId] = now;
+
+            try
+            {
+                var adapter = providerResolver.Resolve(string.IsNullOrWhiteSpace(profile.ProviderCode) ? "edm" : profile.ProviderCode);
+                var end = DateTime.UtcNow;
+                var start = end.AddDays(-lookbackDays);
+                var result = await adapter.GetIncomingInvoicesAsync(
+                    new EInvoiceIncomingRequest(profile.TenantId, profile.BranchId, start, end, 5000, profile.IntegratorUsername, profile.IntegratorSecretRef), ct);
+                if (!result.IsSuccess || result.Items.Count == 0)
+                    continue;
+
+                foreach (var item in result.Items)
+                {
+                    if (string.IsNullOrWhiteSpace(item.Uuid)) continue;
+                    var existing = await db.IncomingEInvoices
+                        .IgnoreQueryFilters()
+                        .FirstOrDefaultAsync(x => x.TenantId == profile.TenantId && x.Uuid == item.Uuid, ct);
+                    if (existing is null)
+                    {
+                        db.IncomingEInvoices.Add(new IncomingEInvoice
+                        {
+                            TenantId = profile.TenantId,
+                            BranchId = profile.BranchId,
+                            Uuid = item.Uuid,
+                            InvoiceNumber = item.InvoiceNumber ?? "",
+                            SenderName = Clamp(item.SenderName, 400),
+                            SenderTaxNumber = Clamp(item.SenderTaxNumber, 16),
+                            DocumentType = string.IsNullOrWhiteSpace(item.DocumentType) ? "EFatura" : item.DocumentType,
+                            Status = Clamp(item.Status, 64),
+                            StatusDescription = Clamp(item.StatusDescription, 400),
+                            PayableAmount = item.PayableAmount,
+                            Currency = string.IsNullOrWhiteSpace(item.Currency) ? "TRY" : item.Currency,
+                            IssueDate = item.IssueDate,
+                            EnvelopeIdentifier = Clamp(item.EnvelopeIdentifier, 128),
+                            RawContent = item.RawContent,
+                            FetchedAt = DateTime.UtcNow
+                        });
+                    }
+                    else
+                    {
+                        existing.Status = Clamp(item.Status, 64);
+                        existing.StatusDescription = Clamp(item.StatusDescription, 400);
+                        existing.PayableAmount = item.PayableAmount;
+                        existing.FetchedAt = DateTime.UtcNow;
+                    }
+                }
+                await db.SaveChangesAsync(ct);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Incoming e-invoice sync failed for branch {BranchId}.", profile.BranchId);
+            }
+        }
+    }
+
+    private static string Clamp(string? value, int maxLen)
+    {
+        var v = (value ?? string.Empty).Trim();
+        return v.Length <= maxLen ? v : v[..maxLen];
+    }
+
     private async Task ProcessExpenseSlipBatchAsync(CancellationToken ct)
     {
         using var scope = _scopeFactory.CreateScope();
@@ -361,7 +449,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
                 var profile = await db.EInvoiceProfiles
                     .IgnoreQueryFilters()
                     .AsNoTracking()
-                    .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId && x.IsActive, ct);
+                    .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId, ct);
                 var providerCode = string.IsNullOrWhiteSpace(profile?.ProviderCode) ? "edm" : profile.ProviderCode;
                 var adapter = providerResolver.Resolve(providerCode);
 
@@ -460,7 +548,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
             var profile = await db.EInvoiceProfiles
                 .IgnoreQueryFilters()
                 .AsNoTracking()
-                .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId && x.IsActive, ct);
+                .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId, ct);
             var branch = await db.Branches
                 .IgnoreQueryFilters()
                 .AsNoTracking()

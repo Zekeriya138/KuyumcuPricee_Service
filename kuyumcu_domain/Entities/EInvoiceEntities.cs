@@ -64,6 +64,30 @@ public class EInvoiceOutbox : Entity, ITenantScoped
     public DateTime? ProcessedAt { get; set; }
 }
 
+/// <summary>EDM gelen kutusundan (DIRECTION=IN) çekilen e-Fatura/e-Arşiv başlık kaydı. Salt-okunur görüntüleme içindir.</summary>
+public class IncomingEInvoice : Entity, ITenantScoped
+{
+    public Guid TenantId { get; set; }
+    public Guid BranchId { get; set; }
+    public string Uuid { get; set; } = "";
+    public string InvoiceNumber { get; set; } = "";
+    public string SenderName { get; set; } = "";
+    public string SenderTaxNumber { get; set; } = "";
+    public string DocumentType { get; set; } = "EFatura";
+    public string Status { get; set; } = "";
+    public string StatusDescription { get; set; } = "";
+    public decimal PayableAmount { get; set; }
+    public string Currency { get; set; } = "TRY";
+    public DateTime? IssueDate { get; set; }
+    public string? EnvelopeIdentifier { get; set; }
+    public string? ReceiverName { get; set; }
+    public string? ReceiverTaxNumber { get; set; }
+    public string? GibStatusDescription { get; set; }
+    public string? ProfileId { get; set; }
+    public string? RawContent { get; set; }
+    public DateTime FetchedAt { get; set; } = DateTime.UtcNow;
+}
+
 public class EInvoiceWebhookLog : Entity, ITenantScoped
 {
     public Guid TenantId { get; set; }

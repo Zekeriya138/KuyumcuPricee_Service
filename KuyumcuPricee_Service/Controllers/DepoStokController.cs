@@ -428,4 +428,115 @@ public class DepoStokController : ControllerBase
             throw;
         }
     }
+
+    public record DepoGumusLotDto(
+        Guid Id,
+        Guid BranchId,
+        Guid? SupplierId,
+        string SupplierName,
+        string ProductCode,
+        string ProductName,
+        decimal Gram,
+        decimal UnitCostTl,
+        string? Note,
+        DateTime EntryDate);
+
+    public record DepoAddGumusLotItemReq(string ProductCode, decimal Gram, decimal UnitCostTl);
+
+    public record DepoAddGumusLotsReq(
+        Guid BranchId,
+        Guid? SupplierId,
+        string? SupplierName,
+        string? Note,
+        List<DepoAddGumusLotItemReq> Items);
+
+    /// <summary>Stok/Depo gümüş sekmesi — manuel stok lotları (alış/kasa hariç).</summary>
+    [HttpGet("gumus-lots")]
+    public async Task<IActionResult> GetGumusLots([FromQuery] Guid branchId, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (branchId == Guid.Empty)
+            return BadRequest(new { error = "branchId zorunludur." });
+
+        var rows = await _db.DepoGumusLots.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted)
+            .OrderByDescending(x => x.EntryDate)
+            .Select(x => new DepoGumusLotDto(
+                x.Id,
+                x.BranchId,
+                x.SupplierId,
+                x.SupplierName,
+                x.ProductCode,
+                x.ProductName,
+                x.Gram,
+                x.UnitCostTl,
+                x.Note,
+                x.EntryDate))
+            .ToListAsync(ct);
+
+        return Ok(rows);
+    }
+
+    /// <summary>Stok/Depo gümüş sekmesinden manuel stok girişi — Purchase veya kasa hareketi oluşturmaz.</summary>
+    [HttpPost("add-gumus-lots")]
+    public async Task<IActionResult> AddGumusLots([FromBody] DepoAddGumusLotsReq req, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (req.BranchId == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+        if (req.Items is null || req.Items.Count == 0)
+            return BadRequest(new { error = "En az bir lot girilmelidir." });
+
+        var branch = await _db.Branches.AsNoTracking()
+            .FirstOrDefaultAsync(b => b.Id == req.BranchId && b.TenantId == tenantId, ct);
+        if (branch is null)
+            return BadRequest(new { error = "Geçersiz BranchId veya branch bu tenant'a ait değil." });
+
+        var supplierName = string.IsNullOrWhiteSpace(req.SupplierName)
+            ? "Nihai Tedarikçi"
+            : req.SupplierName.Trim();
+
+        var created = new List<DepoGumusLotDto>();
+        var now = DateTime.UtcNow;
+
+        foreach (var item in req.Items)
+        {
+            if (item.Gram <= 0)
+                return BadRequest(new { error = "Gram 0'dan büyük olmalı." });
+            if (item.UnitCostTl <= 0)
+                return BadRequest(new { error = "Birim fiyat 0'dan büyük olmalı." });
+            var code = (item.ProductCode ?? "").Trim();
+            if (string.IsNullOrWhiteSpace(code))
+                return BadRequest(new { error = "Ürün kodu zorunludur." });
+
+            var lot = new DepoGumusLot
+            {
+                TenantId = tenantId,
+                BranchId = req.BranchId,
+                SupplierId = req.SupplierId,
+                SupplierName = supplierName,
+                ProductCode = code.ToUpperInvariant(),
+                ProductName = "Gümüş Külçe",
+                Gram = Math.Round(item.Gram, 4, MidpointRounding.AwayFromZero),
+                UnitCostTl = Math.Round(item.UnitCostTl, 2, MidpointRounding.AwayFromZero),
+                Note = string.IsNullOrWhiteSpace(req.Note) ? null : req.Note.Trim(),
+                EntryDate = now
+            };
+            _db.DepoGumusLots.Add(lot);
+            created.Add(new DepoGumusLotDto(
+                lot.Id,
+                lot.BranchId,
+                lot.SupplierId,
+                lot.SupplierName,
+                lot.ProductCode,
+                lot.ProductName,
+                lot.Gram,
+                lot.UnitCostTl,
+                lot.Note,
+                lot.EntryDate));
+        }
+
+        await _db.SaveChangesAsync(ct);
+        return Ok(created);
+    }
 }

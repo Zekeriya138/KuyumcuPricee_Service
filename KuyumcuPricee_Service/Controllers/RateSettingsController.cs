@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -53,7 +54,18 @@ public sealed class RateSettingsController : ControllerBase
     public async Task<IActionResult> List(CancellationToken ct)
     {
         if (!TryGetRequiredBranchId(out var branchId, out var branchErr)) return branchErr!;
-        var rates = await _goldPriceService.LatestOrRefreshIfOlderThanAsync(maxAgeSeconds: 8, ct);
+        IReadOnlyList<QuoteDto> rates;
+        try
+        {
+            // Kur Ayarları ekranında kullanıcı "anlık" değer beklediği için
+            // her istekte kaynaktan tazeleme deniyoruz.
+            rates = await _goldPriceService.RefreshAsync(ct);
+        }
+        catch
+        {
+            // Dış kaynak geçici hata verirse ekran boş kalmasın; son önbelleği göster.
+            rates = await _goldPriceService.LatestOrRefreshIfOlderThanAsync(maxAgeSeconds: 8, ct);
+        }
 
         var savedList = await _db.RateDisplaySettings
             .AsNoTracking()
@@ -89,6 +101,8 @@ public sealed class RateSettingsController : ControllerBase
     [HttpPut]
     public async Task<IActionResult> Save([FromBody] List<SaveRateSettingReq>? req, CancellationToken ct)
     {
+        if (!CanManageRates())
+            return Forbid();
         if (!TryGetRequiredBranchId(out var branchId, out var branchErr)) return branchErr!;
         req ??= new List<SaveRateSettingReq>();
         var codes = req
@@ -173,5 +187,20 @@ public sealed class RateSettingsController : ControllerBase
     {
         var cleaned = (value ?? "").Trim();
         return cleaned.Length == 0 ? null : cleaned;
+    }
+
+    private bool CanManageRates()
+    {
+        var role = User.FindFirstValue(ClaimTypes.Role) ?? "";
+        if (string.Equals(role, "Owner", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return HasPermissionClaim("perm_manage_rates");
+    }
+
+    private bool HasPermissionClaim(string claimType)
+    {
+        var raw = User.FindFirstValue(claimType);
+        return string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase);
     }
 }

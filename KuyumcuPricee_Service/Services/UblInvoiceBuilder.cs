@@ -49,11 +49,13 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         string documentType,
         CancellationToken ct)
     {
-        var saleItems = await _db.SaleItems
-            .AsNoTracking()
-            .Where(x => x.TenantId == invoice.TenantId && x.SaleId == invoice.SaleId)
-            .OrderBy(x => x.LineNo)
-            .ToListAsync(ct);
+        var saleItems = invoice.SaleId.HasValue
+            ? await _db.SaleItems
+                .AsNoTracking()
+                .Where(x => x.TenantId == invoice.TenantId && x.SaleId == invoice.SaleId.Value)
+                .OrderBy(x => x.LineNo)
+                .ToListAsync(ct)
+            : new List<SaleItem>();
 
         // SQL Server eski compatibility level ortamlarında list.Contains(...)
         // ifadesi OPENJSON ... WITH üretebilir ve sözdizimi hatasına düşebilir.
@@ -350,7 +352,7 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
 
         return $@"  <cac:InvoiceLine>
     <cbc:ID>{line.LineNo}</cbc:ID>
-    <cbc:InvoicedQuantity unitCode=""NIU"">{Fmt(line.Quantity)}</cbc:InvoicedQuantity>
+    <cbc:InvoicedQuantity unitCode=""{Xml(line.UnitCode)}"">{Fmt(line.Quantity)}</cbc:InvoicedQuantity>
     <cbc:LineExtensionAmount currencyID=""{Xml(line.Currency)}"">{Fmt(line.LineExtensionAmount)}</cbc:LineExtensionAmount>
     <cac:TaxTotal>
       <cbc:TaxAmount currencyID=""{Xml(line.Currency)}"">{Fmt(line.TaxAmount)}</cbc:TaxAmount>
@@ -445,7 +447,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                 0m,
                 0m,
                 0m,
-                0m));
+                0m,
+                "C62"));
             return lines;
         }
 
@@ -539,7 +542,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                     specialPayable,
                     0m,
                     0m,
-                    0m));
+                    0m,
+                    "C62"));
                 continue;
             }
 
@@ -628,7 +632,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                     firstTotal,
                     0m,
                     0m,
-                    ziynetUnitGram * karatMilyem * quantity));
+                    ziynetUnitGram * karatMilyem * quantity,
+                    "C62"));
 
                 lines.Add(new UblLine(
                     lines.Count + 1,
@@ -647,7 +652,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                     secondGross,
                     0m,
                     0m,
-                    0m));
+                    0m,
+                    "C62"));
                 continue;
             }
 
@@ -736,7 +742,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                     special.AltinBedeli,
                     0m,
                     0m,
-                    special.SafHasGram));
+                    special.SafHasGram,
+                    "GRM"));
 
                 var specialWithholdingTax = Math.Round(configuredCraftedTax * tax.WithholdingRate, 2, MidpointRounding.AwayFromZero);
                 lines.Add(new UblLine(
@@ -756,7 +763,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                     configuredCraftedTotal,
                     tax.WithholdingRate,
                     specialWithholdingTax,
-                    0m));
+                    0m,
+                    "GRM"));
                 continue;
             }
 
@@ -798,7 +806,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                 payable,
                 tax.WithholdingRate,
                 withholdingTaxAmount,
-                hasEquivalent));
+                hasEquivalent,
+                "GRM"));
         }
 
         return lines;
@@ -864,7 +873,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                 payable,
                 0m,
                 0m,
-                line.HasGoldEquivalent ?? 0m));
+                line.HasGoldEquivalent ?? 0m,
+                "GRM"));
         }
 
         if (lines.Count == 0)
@@ -886,7 +896,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
                 0m,
                 0m,
                 0m,
-                0m));
+                0m,
+                "C62"));
         }
         return lines;
     }
@@ -1280,7 +1291,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         decimal PayableAmount,
         decimal WithholdingRate,
         decimal WithholdingTaxAmount,
-        decimal HasEquivalentAmount
+        decimal HasEquivalentAmount,
+        string UnitCode = "C62"
     )
     {
         public decimal TaxExclusiveAmount => LineExtensionAmount;

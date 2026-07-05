@@ -122,7 +122,8 @@ END", ct);
         {
             var productType = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipProductType(rule.ProductType);
             if (productType != EInvoiceProfileSettingsCodec.WorkmanshipProductTypeCrafted &&
-                productType != EInvoiceProfileSettingsCodec.WorkmanshipProductTypeZiynet)
+                productType != EInvoiceProfileSettingsCodec.WorkmanshipProductTypeZiynet &&
+                productType != EInvoiceProfileSettingsCodec.WorkmanshipProductTypeCollection)
                 return BadRequest(new { error = "İşçilik kuralı ürün tipi geçersiz." });
             if (rule.MinTotal < 0m)
                 return BadRequest(new { error = "İşçilik kuralı alt limit 0'dan küçük olamaz." });
@@ -137,12 +138,14 @@ END", ct);
             {
                 var msg = string.Equals(productType, EInvoiceProfileSettingsCodec.WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase)
                     ? "Ziynet ürün seçimi geçersiz."
-                    : "Ayar seçimi geçersiz. Sadece 24K, 22K, 18K, 14K, 8K desteklenir.";
+                    : string.Equals(productType, EInvoiceProfileSettingsCodec.WorkmanshipProductTypeCollection, StringComparison.OrdinalIgnoreCase)
+                        ? "Tahsilat kuralı geçersiz."
+                        : "Ayar seçimi geçersiz. Sadece 24K, 22K, 18K, 14K, 8K desteklenir.";
                 return BadRequest(new { error = msg });
             }
         }
         var overlapGroup = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipRules(normalizedWorkmanshipRules)
-            .GroupBy(x => $"{EInvoiceProfileSettingsCodec.NormalizeWorkmanshipProductType(x.ProductType)}|{EInvoiceProfileSettingsCodec.NormalizeWorkmanshipKarat(x.Karat)}",
+            .GroupBy(x => $"{EInvoiceProfileSettingsCodec.NormalizeWorkmanshipProductType(x.ProductType)}|{EInvoiceProfileSettingsCodec.NormalizeWorkmanshipSelector(x.ProductType, x.Karat)}",
                 StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault(g =>
             {
@@ -158,6 +161,7 @@ END", ct);
             return BadRequest(new { error = "İşçilik kurallarında çakışan tutar aralıkları var. Aynı ürün tipi ve ayar için aralıklar üst üste gelemez." });
 
         var profile = await _db.EInvoiceProfiles.FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == req.BranchId, ct);
+        var isNewProfile = profile is null;
         if (profile is null)
         {
             profile = new kuyumcu_domain.Entities.EInvoiceProfile
@@ -166,6 +170,19 @@ END", ct);
                 BranchId = req.BranchId
             };
             _db.EInvoiceProfiles.Add(profile);
+        }
+
+        var usernameChanged = !string.Equals(
+            profile.IntegratorUsername?.Trim(),
+            req.IntegratorUsername?.Trim(),
+            StringComparison.OrdinalIgnoreCase);
+        var hasStoredPassword = !string.IsNullOrWhiteSpace(profile.IntegratorSecretRef);
+        if (string.IsNullOrWhiteSpace(req.IntegratorPassword) && (isNewProfile || !hasStoredPassword || usernameChanged))
+        {
+            return BadRequest(new
+            {
+                error = "EDM şifresi zorunludur. Kullanıcı adı değiştiyse veya ilk kayıtsa şifreyi tekrar girin."
+            });
         }
 
         profile.ProviderCode = string.IsNullOrWhiteSpace(req.ProviderCode) ? "edm" : req.ProviderCode.Trim().ToLowerInvariant();
@@ -205,17 +222,137 @@ END", ct);
             return Forbid();
         var providerCode = string.IsNullOrWhiteSpace(req.ProviderCode) ? "edm" : req.ProviderCode.Trim().ToLowerInvariant();
         var adapter = _providerResolver.Resolve(providerCode);
+
+        // Test, gönderimle AYNI kimlik bilgilerini kullanmalı. Alanlar boşsa kayıtlı profil değerlerine düşülür;
+        // böylece "test başarılı" mesajı, gönderimde kullanılacak gerçek kimlik bilgisini doğrular.
+        var savedProfile = req.BranchId != Guid.Empty
+            ? await _db.EInvoiceProfiles.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.TenantId == _tenant.TenantId && x.BranchId == req.BranchId, ct)
+            : null;
+        var effectiveUsername = !string.IsNullOrWhiteSpace(req.IntegratorUsername)
+            ? req.IntegratorUsername.Trim()
+            : savedProfile?.IntegratorUsername;
+        var effectivePassword = !string.IsNullOrWhiteSpace(req.IntegratorPassword)
+            ? req.IntegratorPassword.Trim()
+            : savedProfile?.IntegratorSecretRef;
+
+        if (!string.IsNullOrWhiteSpace(effectiveUsername)
+            && string.IsNullOrWhiteSpace(effectivePassword))
+        {
+            return Ok(new kuyumcu_application.Abstractions.EInvoiceConnectionTestResult(
+                false,
+                "EDM şifresi girilmedi. Kullanıcı adı değiştiyse veya ilk kayıtsa şifreyi tekrar girin."));
+        }
+
+        if (!string.IsNullOrWhiteSpace(req.IntegratorUsername)
+            && string.IsNullOrWhiteSpace(req.IntegratorPassword)
+            && savedProfile is not null
+            && !string.Equals(req.IntegratorUsername.Trim(), savedProfile.IntegratorUsername, StringComparison.OrdinalIgnoreCase))
+        {
+            return Ok(new kuyumcu_application.Abstractions.EInvoiceConnectionTestResult(
+                false,
+                "Kullanıcı adı değiştirildi. EDM şifresini girin; kayıtlı şifre eski kullanıcı adına aittir."));
+        }
+
         var res = await adapter.TestConnectionAsync(new kuyumcu_application.Abstractions.EInvoiceConnectionTestRequest(
             _tenant.TenantId,
             req.BranchId,
             providerCode,
-            req.IntegratorUsername?.Trim(),
-            req.IntegratorPassword?.Trim(),
+            effectiveUsername,
+            effectivePassword,
             req.TaxNumber?.Trim() ?? "",
             req.TaxOffice?.Trim() ?? "",
             req.CompanyAddress?.Trim() ?? ""), ct);
         // WPF tarafında başarısız testin detay mesajını gösterebilmek için her durumda 200 döndürüyoruz.
         return Ok(res);
+    }
+
+    public sealed class CreateCollectionDraftReq
+    {
+        public Guid? BranchId { get; set; }
+        public Guid? CustomerId { get; set; }
+        public Guid? SupplierId { get; set; }
+        public decimal AmountTl { get; set; }
+        public string? Description { get; set; }
+        public DateTime? TxDate { get; set; }
+    }
+
+    /// <summary>
+    /// Tahsilat kaynaklı (satışsız) has altın taslak faturası oluşturur. Alıcı bilgileri
+    /// müşteri/tedarikçi kaydından çözülür. Ödeme yöntemi Banka/Havale olan tahsilatlarda kullanılır.
+    /// </summary>
+    [HttpPost("collection-draft")]
+    public async Task<IActionResult> CreateCollectionDraft([FromBody] CreateCollectionDraftReq req, CancellationToken ct)
+    {
+        if (req is null) return BadRequest(new { error = "İstek boş olamaz." });
+        var tid = _tenant.TenantId;
+        var bid = req.BranchId ?? _tenant.BranchId ?? Guid.Empty;
+        if (bid == Guid.Empty) return BadRequest(new { error = "BranchId zorunludur." });
+        if (_tenant.BranchId.HasValue && _tenant.BranchId.Value != Guid.Empty && bid != _tenant.BranchId.Value)
+            return BadRequest(new { error = "İşlem şubesi, oturum şubesi ile aynı olmalıdır." });
+        if (req.AmountTl <= 0m) return BadRequest(new { error = "Tutar 0'dan büyük olmalıdır." });
+
+        string buyerName = "";
+        string? buyerTax = null, buyerAddress = null, buyerCity = null, buyerDistrict = null, buyerEmail = null;
+        Guid? customerId = null;
+
+        if (req.CustomerId.HasValue && req.CustomerId.Value != Guid.Empty)
+        {
+            var c = await _db.Customers.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == req.CustomerId.Value && x.TenantId == tid && !x.IsDeleted, ct);
+            if (c is null) return BadRequest(new { error = "Müşteri bulunamadı." });
+            customerId = c.Id;
+            buyerName = c.FullName;
+            buyerTax = c.NationalId;
+            buyerAddress = c.Address;
+            buyerCity = c.City;
+            buyerDistrict = c.District;
+            buyerEmail = c.Email;
+        }
+        else if (req.SupplierId.HasValue && req.SupplierId.Value != Guid.Empty)
+        {
+            var s = await _db.Suppliers.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == req.SupplierId.Value && x.TenantId == tid && !x.IsDeleted, ct);
+            if (s is null) return BadRequest(new { error = "Tedarikçi bulunamadı." });
+            buyerName = string.IsNullOrWhiteSpace(s.CompanyName) ? (s.ContactName ?? "") : s.CompanyName;
+            buyerTax = s.TaxNumber;
+            buyerAddress = s.Address;
+            buyerCity = s.City;
+            buyerDistrict = s.District;
+            buyerEmail = s.Email;
+        }
+        else
+        {
+            return BadRequest(new { error = "Müşteri veya tedarikçi belirtilmelidir." });
+        }
+
+        try
+        {
+            var (invoiceId, documentId) = await _workflow.CreateCollectionDraftAsync(new CollectionDraftInput(
+                tid,
+                bid,
+                customerId,
+                buyerName,
+                buyerTax,
+                buyerAddress,
+                buyerCity,
+                buyerDistrict,
+                buyerEmail,
+                req.AmountTl,
+                req.Description,
+                (req.TxDate ?? DateTime.UtcNow).ToUniversalTime(),
+                null), ct);
+            return Ok(new { invoiceId, documentId });
+        }
+        catch (DbUpdateException ex)
+        {
+            var detail = ex.InnerException?.Message ?? ex.Message;
+            return BadRequest(new { error = detail });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
     }
 
     [HttpGet("outgoing")]
@@ -277,6 +414,237 @@ END", ct);
             pageSize,
             items = docs
         });
+    }
+
+    [HttpGet("incoming")]
+    public async Task<IActionResult> ListIncoming(
+        [FromQuery] Guid? branchId,
+        [FromQuery] DateTime? from,
+        [FromQuery] DateTime? to,
+        [FromQuery, Range(1, 1000)] int page = 1,
+        [FromQuery, Range(1, 500)] int pageSize = 50,
+        CancellationToken ct = default)
+    {
+        if (!CanUseEInvoice())
+            return Forbid();
+        var tid = _tenant.TenantId;
+        var q = _db.IncomingEInvoices.AsNoTracking().Where(x => x.TenantId == tid);
+
+        if (branchId.HasValue && branchId.Value != Guid.Empty)
+            q = q.Where(x => x.BranchId == branchId.Value);
+        if (from.HasValue)
+            q = q.Where(x => (x.IssueDate ?? x.FetchedAt) >= from.Value.Date);
+        if (to.HasValue)
+        {
+            var toExclusive = to.Value.Date.AddDays(1);
+            q = q.Where(x => (x.IssueDate ?? x.FetchedAt) < toExclusive);
+        }
+
+        var total = await q.CountAsync(ct);
+        var items = await q
+            .OrderByDescending(x => x.IssueDate ?? x.FetchedAt)
+            .Skip((page - 1) * pageSize)
+            .Take(pageSize)
+            .Select(x => new
+            {
+                x.Id,
+                x.Uuid,
+                x.InvoiceNumber,
+                x.SenderName,
+                x.SenderTaxNumber,
+                x.DocumentType,
+                x.Status,
+                x.StatusDescription,
+                x.PayableAmount,
+                x.Currency,
+                x.IssueDate,
+                x.FetchedAt,
+                x.ReceiverName,
+                x.ReceiverTaxNumber,
+                x.GibStatusDescription,
+                x.ProfileId
+            })
+            .ToListAsync(ct);
+
+        return Ok(new { total, page, pageSize, items });
+    }
+
+    [HttpGet("incoming/{id:guid}")]
+    public async Task<IActionResult> GetIncoming(Guid id, CancellationToken ct)
+    {
+        if (!CanUseEInvoice())
+            return Forbid();
+        var tid = _tenant.TenantId;
+        var doc = await _db.IncomingEInvoices.AsNoTracking().FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
+        if (doc is null) return NotFound();
+        return Ok(doc);
+    }
+
+    [HttpPost("incoming/sync")]
+    public async Task<IActionResult> SyncIncoming(
+        [FromQuery] Guid? branchId,
+        [FromQuery] int days = 365,
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null,
+        CancellationToken ct = default)
+    {
+        if (!CanUseEInvoice())
+            return Forbid();
+        var tid = _tenant.TenantId;
+        var bid = branchId ?? _tenant.BranchId;
+        if (!bid.HasValue || bid.Value == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+
+        var profile = await _db.EInvoiceProfiles
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == bid.Value && !x.IsDeleted, ct);
+        if (profile is null)
+            return BadRequest(new { error = "Bu şube için e-fatura entegrasyon profili bulunamadı. Önce ayarları kaydedin." });
+        if (string.IsNullOrWhiteSpace(profile.IntegratorUsername))
+            return BadRequest(new { error = "EDM kullanıcı adı zorunludur." });
+        if (string.IsNullOrWhiteSpace(profile.IntegratorSecretRef))
+            return BadRequest(new { error = "EDM şifresi zorunludur." });
+
+        var adapter = _providerResolver.Resolve(string.IsNullOrWhiteSpace(profile.ProviderCode) ? "edm" : profile.ProviderCode);
+        var endDate = (to ?? DateTime.Now).Date;
+        var clampedDays = Math.Clamp(days, 1, 3650);
+        var startDate = from?.Date ?? endDate.AddDays(-clampedDays);
+        if (startDate > endDate)
+            (startDate, endDate) = (endDate, startDate);
+
+        var startUtc = DateTime.SpecifyKind(startDate, DateTimeKind.Local).ToUniversalTime();
+        var endUtc = DateTime.SpecifyKind(endDate.AddDays(1).AddTicks(-1), DateTimeKind.Local).ToUniversalTime();
+
+        var result = await adapter.GetIncomingInvoicesAsync(
+            new EInvoiceIncomingRequest(tid, bid.Value, startUtc, endUtc, 5000, profile.IntegratorUsername, profile.IntegratorSecretRef), ct);
+        if (!result.IsSuccess)
+        {
+            var errMsg = result.ErrorMessage ?? "Gelen faturalar alınamadı.";
+            // Raw EDM yanıtı varsa kısa önizlemeyi hata mesajına ekle
+            if (!string.IsNullOrWhiteSpace(result.RawResponse))
+            {
+                var preview = result.RawResponse.Length > 600 ? result.RawResponse[..600] + "…" : result.RawResponse;
+                errMsg += $" [EDM yanıtı: {preview}]";
+            }
+            return BadRequest(new { error = errMsg });
+        }
+
+        var added = 0;
+        var updated = 0;
+        foreach (var item in result.Items)
+        {
+            if (string.IsNullOrWhiteSpace(item.Uuid)) continue;
+            var existing = await _db.IncomingEInvoices.FirstOrDefaultAsync(x => x.TenantId == tid && x.Uuid == item.Uuid, ct);
+            if (existing is null)
+            {
+                _db.IncomingEInvoices.Add(NewIncomingEInvoice(tid, bid.Value, item));
+                added++;
+            }
+            else
+            {
+                existing.Status = Trunc(item.Status, 64);
+                existing.StatusDescription = Trunc(item.StatusDescription, 400);
+                existing.PayableAmount = item.PayableAmount;
+                existing.Currency = string.IsNullOrWhiteSpace(item.Currency) ? existing.Currency : item.Currency;
+                if (!string.IsNullOrWhiteSpace(item.SenderName)) existing.SenderName = Trunc(item.SenderName, 400);
+                if (!string.IsNullOrWhiteSpace(item.ReceiverName)) existing.ReceiverName = Trunc(item.ReceiverName, 400);
+                if (!string.IsNullOrWhiteSpace(item.ReceiverTaxNumber)) existing.ReceiverTaxNumber = Trunc(item.ReceiverTaxNumber, 16);
+                if (!string.IsNullOrWhiteSpace(item.GibStatusDescription)) existing.GibStatusDescription = Trunc(item.GibStatusDescription, 400);
+                if (!string.IsNullOrWhiteSpace(item.ProfileId)) existing.ProfileId = Trunc(item.ProfileId, 64);
+                existing.FetchedAt = DateTime.UtcNow;
+                updated++;
+            }
+        }
+        await _db.SaveChangesAsync(ct);
+
+        return Ok(new { added, updated, total = result.Items.Count });
+    }
+
+    /// <summary>
+    /// Şubeye ait gelen fatura (IncomingEInvoice) kayıtlarını temizler ve EDM'den taze senkronizasyon yapar.
+    /// </summary>
+    [HttpPost("incoming/clear-and-sync")]
+    public async Task<IActionResult> ClearAndSyncIncoming(
+        [FromQuery] Guid? branchId,
+        [FromQuery] int days = 365,
+        [FromQuery] DateTime? from = null,
+        [FromQuery] DateTime? to = null,
+        CancellationToken ct = default)
+    {
+        if (!CanUseEInvoice())
+            return Forbid();
+        var tid = _tenant.TenantId;
+        var bid = branchId ?? _tenant.BranchId;
+        if (!bid.HasValue || bid.Value == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+
+        // Mevcut kayıtları sil
+        var existing = await _db.IncomingEInvoices
+            .Where(x => x.TenantId == tid && x.BranchId == bid.Value)
+            .ToListAsync(ct);
+        _db.IncomingEInvoices.RemoveRange(existing);
+        await _db.SaveChangesAsync(ct);
+        var deleted = existing.Count;
+
+        var profile = await _db.EInvoiceProfiles
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == bid.Value && !x.IsDeleted, ct);
+        if (profile is null)
+            return BadRequest(new { error = "EDM profili bulunamadı." });
+        if (string.IsNullOrWhiteSpace(profile.IntegratorUsername) || string.IsNullOrWhiteSpace(profile.IntegratorSecretRef))
+            return BadRequest(new { error = "EDM kullanıcı adı/şifresi eksik." });
+
+        var adapter = _providerResolver.Resolve(string.IsNullOrWhiteSpace(profile.ProviderCode) ? "edm" : profile.ProviderCode);
+        var endDate = (to ?? DateTime.Now).Date;
+        var startDate = from?.Date ?? endDate.AddDays(-Math.Clamp(days, 1, 3650));
+        var startUtc = DateTime.SpecifyKind(startDate, DateTimeKind.Local).ToUniversalTime();
+        var endUtc = DateTime.SpecifyKind(endDate.AddDays(1).AddTicks(-1), DateTimeKind.Local).ToUniversalTime();
+
+        var result = await adapter.GetIncomingInvoicesAsync(
+            new EInvoiceIncomingRequest(tid, bid.Value, startUtc, endUtc, 5000, profile.IntegratorUsername, profile.IntegratorSecretRef), ct);
+        if (!result.IsSuccess)
+            return BadRequest(new { error = result.ErrorMessage ?? "EDM sorgu hatası.", deleted });
+
+        var added = 0;
+        foreach (var item in result.Items)
+        {
+            if (string.IsNullOrWhiteSpace(item.Uuid)) continue;
+            _db.IncomingEInvoices.Add(NewIncomingEInvoice(tid, bid.Value, item));
+            added++;
+        }
+        await _db.SaveChangesAsync(ct);
+        return Ok(new { deleted, added, total = result.Items.Count });
+    }
+
+    private IncomingEInvoice NewIncomingEInvoice(Guid tid, Guid bid, EInvoiceIncomingItem item) => new()
+    {
+        TenantId = tid,
+        BranchId = bid,
+        Uuid = item.Uuid,
+        InvoiceNumber = item.InvoiceNumber ?? "",
+        SenderName = Trunc(item.SenderName, 400),
+        SenderTaxNumber = Trunc(item.SenderTaxNumber, 16),
+        DocumentType = string.IsNullOrWhiteSpace(item.DocumentType) ? "EFatura" : item.DocumentType,
+        Status = Trunc(item.Status, 64),
+        StatusDescription = Trunc(item.StatusDescription, 400),
+        PayableAmount = item.PayableAmount,
+        Currency = string.IsNullOrWhiteSpace(item.Currency) ? "TRY" : item.Currency,
+        IssueDate = item.IssueDate,
+        EnvelopeIdentifier = Trunc(item.EnvelopeIdentifier, 128),
+        ReceiverName = Trunc(item.ReceiverName, 400),
+        ReceiverTaxNumber = Trunc(item.ReceiverTaxNumber, 16),
+        GibStatusDescription = Trunc(item.GibStatusDescription, 400),
+        ProfileId = Trunc(item.ProfileId, 64),
+        RawContent = item.RawContent,
+        FetchedAt = DateTime.UtcNow
+    };
+
+    private static string Trunc(string? value, int maxLen)
+    {
+        var v = (value ?? string.Empty).Trim();
+        return v.Length <= maxLen ? v : v[..maxLen];
     }
 
     [HttpGet("outgoing/{id:guid}")]
@@ -353,9 +721,9 @@ END", ct);
             return BadRequest(new { error = "Seçili şube ile belge şubesi farklı. Lütfen belgeye ait şubeye geçin." });
 
         var profile = await _db.EInvoiceProfiles.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == doc.BranchId && x.IsActive, ct);
+            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == doc.BranchId, ct);
         if (profile is null)
-            return BadRequest(new { error = "Bu şube için aktif e-fatura entegrasyonu bulunamadı. Önce ayarları kaydedin." });
+            return BadRequest(new { error = "Bu şube için e-fatura entegrasyon profili bulunamadı. Önce ayarları kaydedin." });
         if (string.IsNullOrWhiteSpace(profile.IntegratorUsername))
             return BadRequest(new { error = "EDM kullanıcı adı zorunludur." });
         if (string.IsNullOrWhiteSpace(profile.IntegratorSecretRef))
@@ -390,7 +758,7 @@ END", ct);
             .Select(x => new { x.Name, x.Address })
             .FirstOrDefaultAsync(ct);
         var profile = await _db.EInvoiceProfiles.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == doc.BranchId && x.IsActive, ct);
+            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == doc.BranchId, ct);
 
         return Ok(new
         {
@@ -441,9 +809,9 @@ END", ct);
             return BadRequest(new { error = "Seçili şube ile belge şubesi farklı. Lütfen belgeye ait şubeye geçin." });
 
         var profile = await _db.EInvoiceProfiles.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == doc.BranchId && x.IsActive, ct);
+            .FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == doc.BranchId, ct);
         if (profile is null)
-            return BadRequest(new { error = "Bu şube için aktif e-fatura entegrasyonu bulunamadı. Önce ayarları kaydedin." });
+            return BadRequest(new { error = "Bu şube için e-fatura entegrasyon profili bulunamadı. Önce ayarları kaydedin." });
         if (string.IsNullOrWhiteSpace(profile.IntegratorUsername))
             return BadRequest(new { error = "EDM kullanıcı adı zorunludur." });
         if (string.IsNullOrWhiteSpace(profile.IntegratorSecretRef))
@@ -554,29 +922,11 @@ END", ct);
         if (profile is null)
             return BadRequest(new { error = "Bu şube için aktif e-fatura entegrasyonu bulunamadı." });
 
-        var title = (req.Title ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(title))
-        {
-            var branchCustomers = await _db.Customers
-                .AsNoTracking()
-                .Where(x => x.TenantId == _tenant.TenantId &&
-                            x.BranchId == branchId &&
-                            !x.IsDeleted &&
-                            x.NationalId != null)
-                .Select(x => new { x.FullName, x.NationalId })
-                .ToListAsync(ct);
-
-            title = branchCustomers
-                .Where(x => NormalizeDigits(x.NationalId) == taxNo)
-                .Select(x => x.FullName)
-                .FirstOrDefault() ?? string.Empty;
-
-            if (string.IsNullOrWhiteSpace(title))
-                title = taxNo.Length == 11 ? "NİHAİ TÜKETİCİ" : $"VKN {taxNo}";
-        }
+        var title = "";
+        string? receiverAlias = null;
         var documentType = taxNo.Length == 10 ? "EFatura" : "EArsiv";
         var source = "rule";
-        var message = "Mükellefiyet, TCKN/VKN kuralına göre belirlendi.";
+        var message = "Mükellefiyet, TCKN/VKN kuralına göre tahmin edildi.";
 
         try
         {
@@ -584,24 +934,32 @@ END", ct);
             if (adapter is EdmSoapEInvoiceProviderAdapter edmAdapter)
             {
                 var edmResult = await edmAdapter.QueryTaxpayerAsync(profile.IntegratorUsername, profile.IntegratorSecretRef, taxNo, ct);
-                if (edmResult.IsSuccess && edmResult.IsEInvoiceTaxpayer.HasValue)
+                if (edmResult.IsSuccess)
                 {
-                    documentType = edmResult.IsEInvoiceTaxpayer.Value ? "EFatura" : "EArsiv";
                     source = "edm";
-                    message = string.IsNullOrWhiteSpace(edmResult.Message)
-                        ? "Mükellefiyet EDM üzerinden sorgulandı."
-                        : edmResult.Message!;
+                    documentType = edmResult.IsEInvoiceTaxpayer == true ? "EFatura" : "EArsiv";
+                    title = edmResult.Title?.Trim() ?? "";
+                    receiverAlias = edmResult.ReceiverAlias?.Trim();
+                    message = edmResult.Message ?? "EDM sorgusu tamamlandı.";
                 }
-                else if (!string.IsNullOrWhiteSpace(edmResult.Message))
+                else
                 {
-                    source = "rule-fallback";
-                    message = $"EDM sorgusu tamamlanamadı, kural tabanlı sonuç kullanıldı: {edmResult.Message}";
+                    source = "edm-error";
+                    title = "";
+                    receiverAlias = null;
+                    documentType = taxNo.Length == 10 ? "EFatura" : "EArsiv";
+                    message = string.IsNullOrWhiteSpace(edmResult.Message)
+                        ? "EDM sorgusu başarısız oldu. Ünvan ve alıcı etiketi EDM'den alınamadı."
+                        : $"EDM sorgusu başarısız: {edmResult.Message} Ünvan ve alıcı etiketi EDM'den alınamadı.";
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // fallback: rule based result is still returned
+            source = "edm-error";
+            title = "";
+            receiverAlias = null;
+            message = $"EDM sorgusu başarısız: {ex.Message} Ünvan ve alıcı etiketi EDM'den alınamadı.";
         }
 
         return Ok(new ManualTaxpayerQueryResponse
@@ -611,6 +969,9 @@ END", ct);
             DocumentType = documentType,
             LiabilityType = documentType == "EFatura" ? "E-Fatura Mükellefi" : "E-Arşiv",
             IsEInvoiceTaxpayer = documentType == "EFatura",
+            ReceiverAlias = receiverAlias ?? "",
+            TitleFromEdm = source == "edm" && !string.IsNullOrWhiteSpace(title),
+            ReceiverAliasFromEdm = source == "edm" && !string.IsNullOrWhiteSpace(receiverAlias),
             Source = source,
             Message = message
         });
@@ -639,10 +1000,12 @@ END", ct);
         if (req.Draft.Lines is null || req.Draft.Lines.Count == 0)
             return BadRequest(new { error = "En az bir fatura satırı zorunludur." });
 
-        var profile = await _db.EInvoiceProfiles.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == _tenant.TenantId && x.BranchId == branchId && x.IsActive, ct);
+        var profile = await _db.EInvoiceProfiles
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == _tenant.TenantId && x.BranchId == branchId && !x.IsDeleted, ct);
         if (profile is null)
-            return BadRequest(new { error = "Bu şube için aktif e-fatura entegrasyonu bulunamadı. Önce ayarları kaydedin." });
+            return BadRequest(new { error = "Bu şube için e-fatura entegrasyon profili bulunamadı. Önce ayarları kaydedin." });
         if (string.IsNullOrWhiteSpace(profile.IntegratorUsername))
             return BadRequest(new { error = "EDM kullanıcı adı zorunludur." });
         if (string.IsNullOrWhiteSpace(profile.IntegratorSecretRef))
@@ -776,7 +1139,10 @@ END", ct);
             queuedDoc.DocumentType,
             queuedDoc.InvoiceNumber,
             queuedDoc.RetryCount,
-            message = "Manuel fatura oluşturuldu ve gönderim kuyruğuna alındı."
+            queuedDoc.LastError,
+            message = string.Equals(queuedDoc.Status, "Failed", StringComparison.OrdinalIgnoreCase)
+                ? "Manuel fatura oluşturuldu fakat EDM gönderimi başarısız oldu."
+                : "Manuel fatura oluşturuldu ve gönderim kuyruğuna alındı."
         });
     }
 
@@ -888,6 +1254,7 @@ END", ct);
         public string TaxOffice { get; set; } = "";
         public string? SenderLabel { get; set; }
         public string? IntegratorUsername { get; set; }
+        public bool HasIntegratorPassword { get; set; }
         public string DefaultInvoicePrefix { get; set; } = "AUR";
         public string DefaultArchivePrefix { get; set; } = "ARS";
         public decimal SpecialMatrahCraftedVatRatePercent { get; set; } = 20m;
@@ -929,6 +1296,9 @@ END", ct);
         public string DocumentType { get; set; } = "EArsiv";
         public string LiabilityType { get; set; } = "E-Arşiv";
         public bool IsEInvoiceTaxpayer { get; set; }
+        public string ReceiverAlias { get; set; } = "";
+        public bool TitleFromEdm { get; set; }
+        public bool ReceiverAliasFromEdm { get; set; }
         public string Source { get; set; } = "rule";
         public string Message { get; set; } = "";
     }
@@ -961,6 +1331,7 @@ END", ct);
             TaxOffice = p.TaxOffice,
             SenderLabel = p.SenderLabel,
             IntegratorUsername = p.IntegratorUsername,
+            HasIntegratorPassword = !string.IsNullOrWhiteSpace(p.IntegratorSecretRef),
             DefaultInvoicePrefix = p.DefaultInvoicePrefix,
             DefaultArchivePrefix = p.DefaultArchivePrefix,
             SpecialMatrahCraftedVatRatePercent = settings.SpecialMatrahCraftedVatRatePercent,

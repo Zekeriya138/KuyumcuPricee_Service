@@ -56,7 +56,7 @@ public sealed class BranchSubscriptionMiddleware
             return;
         }
 
-        var path = ctx.Request.Path.Value ?? string.Empty;
+        var path = (ctx.Request.Path.Value ?? string.Empty).TrimEnd('/');
         if (path.StartsWith("/api/einvoice", StringComparison.OrdinalIgnoreCase) && !access.IncludesEInvoice)
         {
             ctx.Response.StatusCode = StatusCodes.Status403Forbidden;
@@ -88,7 +88,7 @@ public sealed class BranchSubscriptionMiddleware
     {
         if (HttpMethods.IsOptions(ctx.Request.Method))
             return false;
-        var path = ctx.Request.Path.Value ?? string.Empty;
+        var path = (ctx.Request.Path.Value ?? string.Empty).TrimEnd('/');
         if (path.StartsWith("/swagger", StringComparison.OrdinalIgnoreCase))
             return false;
         if (path.Equals("/ping", StringComparison.OrdinalIgnoreCase))

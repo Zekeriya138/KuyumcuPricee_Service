@@ -25,5 +25,10 @@ public class SupplierTransaction : Entity, ITenantScoped
     public string? Description { get; set; }
     public DateTime TxDate { get; set; } = DateTime.UtcNow;
 
+    /// <summary>İşlemi yapan kullanıcı (JWT'den).</summary>
+    public Guid? UserId { get; set; }
+    /// <summary>İşlem anındaki kullanıcı görünen adı (Ad Soyad ya da kullanıcı adı).</summary>
+    public string? KullaniciAdi { get; set; }
+
     public Supplier Supplier { get; set; } = null!;
 }

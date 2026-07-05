@@ -26,7 +26,10 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
     {
         try
         {
-            var session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct);
+            // Bağlantı testi DAİMA taze login yapar; önbellekteki bayat oturumu döndürüp
+            // yanlış "başarılı" raporlamaması için forceFresh=true. Böylece test, gönderimde
+            // kullanılacak gerçek kimlik bilgilerini EDM'ye karşı doğrular.
+            var session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
             if (string.IsNullOrWhiteSpace(session))
                 return new EInvoiceConnectionTestResult(false, "EDM login başarısız: SESSION_ID alınamadı.");
 
@@ -81,10 +84,10 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
                 content = Convert.ToBase64String(Encoding.UTF8.GetBytes(request.PayloadJson ?? "{}"));
             }
 
-            var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+            string BuildBody(string sess) => $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
     <s:Body>
         <SendInvoiceRequest xmlns=""http://tempuri.org/"">
-            {BuildRequestHeaderXml(session)}
+            {BuildRequestHeaderXml(sess)}
             <RECEIVER vkn=""{XmlEscape(receiverVkn)}"" alias=""{XmlEscape(receiverAlias)}"" xmlns="""" />
             <INVOICE TRXID=""0"" xmlns="""">
                 <HEADER>
@@ -103,7 +106,14 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
     </s:Body>
 </s:Envelope>";
 
-            var xml = await SendSoapAsync("SendInvoice", body, ct);
+            var xml = await SendSoapAsync("SendInvoice", BuildBody(session), ct);
+            // Bayat/expire olmuş oturum nedeniyle EDM "Kullanıcı Bulunamadı / oturum" hatası dönerse
+            // önbelleği yok sayıp taze login ile bir kez daha gönder.
+            if (IsSessionFault(xml))
+            {
+                session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
+                xml = await SendSoapAsync("SendInvoice", BuildBody(session), ct);
+            }
             EnsureSoapFault(xml);
 
             var returnCode = GetXmlValue(xml, "RETURN_CODE");
@@ -138,16 +148,21 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
         {
             var session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct);
             var uuid = request.Uuid ?? request.IntegratorDocumentId;
-            var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+            string BuildBody(string sess) => $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
     <s:Body>
         <GetInvoiceStatusRequest xmlns=""http://tempuri.org/"">
-            {BuildRequestHeaderXml(session)}
+            {BuildRequestHeaderXml(sess)}
             <INVOICE TRXID=""0"" UUID=""{XmlEscape(uuid)}"" xmlns="""" />
         </GetInvoiceStatusRequest>
     </s:Body>
 </s:Envelope>";
 
-            var xml = await SendSoapAsync("GetInvoiceStatus", body, ct);
+            var xml = await SendSoapAsync("GetInvoiceStatus", BuildBody(session), ct);
+            if (IsSessionFault(xml))
+            {
+                session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
+                xml = await SendSoapAsync("GetInvoiceStatus", BuildBody(session), ct);
+            }
             EnsureSoapFault(xml);
             var status = GetXmlValue(xml, "STATUS");
             return new EInvoiceStatusResult(true, NormalizeEdmStatus(status), DateTime.UtcNow, xml, null);
@@ -164,16 +179,21 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
         {
             var session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct);
             var uuid = string.IsNullOrWhiteSpace(request.Uuid) ? request.IntegratorDocumentId : request.Uuid;
-            var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+            string BuildBody(string sess) => $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
     <s:Body>
         <CancelInvoiceRequest xmlns=""http://tempuri.org/"">
-            {BuildRequestHeaderXml(session, request.Reason)}
+            {BuildRequestHeaderXml(sess, request.Reason)}
             <INVOICE TRXID=""0"" UUID=""{XmlEscape(uuid)}"" xmlns="""" />
         </CancelInvoiceRequest>
     </s:Body>
 </s:Envelope>";
 
-            var xml = await SendSoapAsync("CancelInvoice", body, ct);
+            var xml = await SendSoapAsync("CancelInvoice", BuildBody(session), ct);
+            if (IsSessionFault(xml))
+            {
+                session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
+                xml = await SendSoapAsync("CancelInvoice", BuildBody(session), ct);
+            }
             EnsureSoapFault(xml);
             var returnCode = GetXmlValue(xml, "RETURN_CODE");
             if (!string.Equals(returnCode, "0", StringComparison.OrdinalIgnoreCase))
@@ -471,41 +491,349 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
     {
         var normalizedTaxNo = new string((taxNumber ?? string.Empty).Where(char.IsDigit).ToArray());
         if (normalizedTaxNo.Length != 10 && normalizedTaxNo.Length != 11)
-            return new EdmTaxpayerQueryResult(false, null, null, null, "TCKN/VKN 10 veya 11 hane olmalıdır.");
+            return new EdmTaxpayerQueryResult(false, null, null, null, null, "TCKN/VKN 10 veya 11 hane olmalıdır.");
 
         try
         {
-            var session = await LoginAsync(username, password, ct);
+            var session = await LoginAsync(username, password, ct, forceFresh: true);
             if (string.IsNullOrWhiteSpace(session))
-                return new EdmTaxpayerQueryResult(false, null, null, null, "EDM oturumu açılamadı.");
+                return new EdmTaxpayerQueryResult(false, null, null, null, null, "EDM oturumu açılamadı.");
 
-            // EDM dokümantasyonundaki mükellef sorgu endpointleri tenant bazında farklılaşabildiği için
-            // burada güvenli fallback olarak VKN/TCKN kuralını uyguluyoruz.
-            // İleride kurumunuzdaki CheckUser/GetUserList SOAP aksiyonu netleştiğinde bu bölüm doğrudan EDM sorgusuna çevrilebilir.
-            var isEInvoice = normalizedTaxNo.Length == 10;
+            var xml = await ExecuteCheckUserSoapAsync(session, normalizedTaxNo, ct);
+            if (IsSessionFault(xml) || IsAuthFault(xml))
+            {
+                session = await LoginAsync(username, password, ct, forceFresh: true);
+                xml = await ExecuteCheckUserSoapAsync(session, normalizedTaxNo, ct);
+            }
+
+            if (HasSoapFault(xml))
+            {
+                var shortErr = GetXmlValue(xml, "ERROR_SHORT_DES") ?? GetXmlValue(xml, "faultstring") ?? "EDM SOAP fault.";
+                return new EdmTaxpayerQueryResult(false, null, null, null, xml, shortErr);
+            }
+
+            var users = ParseGibUsers(xml);
+            var pkUser = users.FirstOrDefault(u => string.Equals(u.Unit, "PK", StringComparison.OrdinalIgnoreCase))
+                         ?? users.FirstOrDefault(u => !string.IsNullOrWhiteSpace(u.Alias));
+            var titleUser = users.FirstOrDefault(u => !string.IsNullOrWhiteSpace(u.Title)) ?? pkUser ?? users.FirstOrDefault();
+            var title = titleUser?.Title?.Trim();
+            var isEInvoice = pkUser is not null;
+            var receiverAlias = pkUser?.Alias?.Trim();
+            string message;
+            if (users.Count == 0)
+            {
+                message = "EDM'de bu VKN/TCKN için kayıt bulunamadı.";
+            }
+            else if (!isEInvoice)
+            {
+                message = "EDM kaydı bulundu ancak e-Fatura alıcı etiketi (PK) boş döndü.";
+            }
+            else if (string.IsNullOrWhiteSpace(title) && string.IsNullOrWhiteSpace(receiverAlias))
+            {
+                message = "EDM sorgusu tamamlandı; ünvan ve alıcı etiketi EDM'de boş döndü.";
+            }
+            else if (string.IsNullOrWhiteSpace(title))
+            {
+                message = "EDM sorgusu tamamlandı; ünvan EDM'de boş döndü, alıcı etiketi alındı.";
+            }
+            else if (string.IsNullOrWhiteSpace(receiverAlias))
+            {
+                message = "EDM sorgusu tamamlandı; alıcı etiketi EDM'de boş döndü, ünvan alındı.";
+            }
+            else
+            {
+                message = "EDM üzerinden mükellef bilgileri alındı.";
+            }
+
             return new EdmTaxpayerQueryResult(
                 true,
                 isEInvoice,
-                null,
-                null,
-                "EDM oturumu doğrulandı; mükellefiyet VKN/TCKN kuralı ile belirlendi.");
+                title,
+                receiverAlias,
+                xml,
+                message);
         }
         catch (Exception ex)
         {
-            return new EdmTaxpayerQueryResult(false, null, null, null, NormalizeEdmErrorMessage(ex.Message));
+            return new EdmTaxpayerQueryResult(false, null, null, null, null, NormalizeEdmErrorMessage(ex.Message));
         }
     }
 
-    private async Task<string> LoginAsync(string? username, string? password, CancellationToken ct)
+    private async Task<string> ExecuteCheckUserSoapAsync(string session, string normalizedTaxNo, CancellationToken ct)
+    {
+        var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+    <s:Body>
+        <CheckUserRequest xmlns=""http://tempuri.org/"">
+            {BuildRequestHeaderXml(session, "Mükellef sorgu")}
+            <USER xmlns="""">
+                <IDENTIFIER>{XmlEscape(normalizedTaxNo)}</IDENTIFIER>
+            </USER>
+        </CheckUserRequest>
+    </s:Body>
+</s:Envelope>";
+
+        return await SendSoapAsync("CheckUser", body, ct);
+    }
+
+    private static bool IsAuthFault(string? xml)
+    {
+        if (string.IsNullOrWhiteSpace(xml))
+            return false;
+        return xml.Contains("not authenticated", StringComparison.OrdinalIgnoreCase)
+               || xml.Contains("caller was not authenticated", StringComparison.OrdinalIgnoreCase)
+               || xml.Contains("aktif session", StringComparison.OrdinalIgnoreCase)
+               || xml.Contains("session bulunamad", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private sealed record GibUserRow(string? Identifier, string? Alias, string? Title, string? Unit);
+
+    private static List<GibUserRow> ParseGibUsers(string xml)
+    {
+        var result = new List<GibUserRow>();
+        if (string.IsNullOrWhiteSpace(xml))
+            return result;
+
+        var x = XDocument.Parse(xml);
+        foreach (var user in x.Descendants().Where(e => e.Name.LocalName == "USER"))
+        {
+            string? Local(string name) => user.Elements().FirstOrDefault(e => e.Name.LocalName == name)?.Value;
+            var identifier = Local("IDENTIFIER");
+            var alias = Local("ALIAS");
+            var title = Local("TITLE");
+            var unit = Local("UNIT");
+            if (string.IsNullOrWhiteSpace(identifier) &&
+                string.IsNullOrWhiteSpace(alias) &&
+                string.IsNullOrWhiteSpace(title))
+                continue;
+            result.Add(new GibUserRow(identifier, alias, title, unit));
+        }
+
+        return result;
+    }
+
+    // START_DATE/END_DATE fatura tarihi bazlı filtredir (xs:date = sadece yyyy-MM-dd).
+    // CR_START/END_DATE ise EDM'deki kayıt oluşturma tarihi bazlıdır ve HEADER_ONLY=Y ile 4 aylık kısıt var.
+    // Fatura tarihine göre filtrelemek için START_DATE/END_DATE kullanmak doğrudur.
+    // Güvenli sayfalama için 90 günlük parçalara bölüyoruz.
+    private const int EdmMaxChunkDays = 90;
+
+    public async Task<EInvoiceIncomingResult> GetIncomingInvoicesAsync(EInvoiceIncomingRequest request, CancellationToken ct)
+    {
+        try
+        {
+            var session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct);
+            if (string.IsNullOrWhiteSpace(session))
+                return new EInvoiceIncomingResult(false, new List<EInvoiceIncomingItem>(), null, "EDM oturumu açılamadı.");
+
+            var maxItems = request.Limit <= 0 ? 500 : Math.Min(request.Limit, 5000);
+            var pageLimit = Math.Min(100, maxItems);
+            var startDate = request.StartDateUtc.ToLocalTime().Date;
+            var endDate = request.EndDateUtc.ToLocalTime().Date;
+            if (endDate < startDate) (startDate, endDate) = (endDate, startDate);
+
+            var merged = new List<EInvoiceIncomingItem>();
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            string? lastRaw = null;
+
+            // START_DATE/END_DATE ile fatura tarihi bazlı 90 günlük parçalar halinde sorgula.
+            // Her parça içinde OFFSET ile sayfalama yap.
+            var chunkStart = startDate;
+            while (chunkStart <= endDate && merged.Count < maxItems)
+            {
+                var chunkEnd = chunkStart.AddDays(EdmMaxChunkDays - 1);
+                if (chunkEnd > endDate) chunkEnd = endDate;
+
+                int offset = 0;
+                while (merged.Count < maxItems)
+                {
+                    var body = BuildGetIncomingInvoiceBody(session, chunkStart, chunkEnd, pageLimit, offset);
+                    var xml = await SendSoapWithActionFallbackAsync("GetInvoice", body, ct);
+                    if (IsSessionFault(xml))
+                    {
+                        session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
+                        body = BuildGetIncomingInvoiceBody(session, chunkStart, chunkEnd, pageLimit, offset);
+                        xml = await SendSoapWithActionFallbackAsync("GetInvoice", body, ct);
+                    }
+                    EnsureSoapFault(xml);
+                    lastRaw = xml;
+
+                    var returnCode = GetXmlValue(xml, "RETURN_CODE");
+                    if (!string.IsNullOrWhiteSpace(returnCode) &&
+                        !string.Equals(returnCode, "0", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var err = GetXmlValue(xml, "ERROR_SHORT_DES") ?? returnCode;
+                        // Tarih kısıtı hatası → bu parçayı atla, devam et
+                        if (xml.Contains("tarih") || xml.Contains("CR_START") || xml.Contains("4 ay"))
+                            break;
+                        return new EInvoiceIncomingResult(false, merged, lastRaw, $"EDM GetInvoice RETURN_CODE={returnCode}: {err}");
+                    }
+
+                    var page = ParseIncomingInvoices(xml);
+                    if (page.Count == 0) break;
+
+                    var addedInPage = 0;
+                    foreach (var item in page)
+                    {
+                        var key = !string.IsNullOrWhiteSpace(item.Uuid) ? item.Uuid : item.InvoiceNumber;
+                        if (string.IsNullOrWhiteSpace(key) || !seen.Add(key)) continue;
+                        merged.Add(item);
+                        addedInPage++;
+                        if (merged.Count >= maxItems) break;
+                    }
+
+                    // Son sayfa ya da hiç yeni kayıt gelmediyse dur
+                    if (page.Count < pageLimit || addedInPage == 0 || merged.Count >= maxItems) break;
+                    offset += page.Count;
+                }
+
+                chunkStart = chunkEnd.AddDays(1);
+            }
+
+            return new EInvoiceIncomingResult(true, merged, lastRaw, null);
+        }
+        catch (Exception ex)
+        {
+            return new EInvoiceIncomingResult(false, new List<EInvoiceIncomingItem>(), null, $"EDM gelen fatura sorgu hatası: {NormalizeEdmErrorMessage(ex.Message)}");
+        }
+    }
+
+    private static string BuildGetIncomingInvoiceBody(string session, DateTime startDate, DateTime endDate, int limit, int offset)
+    {
+        // START_DATE/END_DATE xs:date formatı (yyyy-MM-dd) — fatura düzenlenme tarihine göre filtreler.
+        // ISARCHIVED kaldırıldı: hem arşivlenmiş hem arşivlenmemiş faturalar gelsin.
+        // CR_START/END_DATE kaldırıldı: CDATE bazlı değil, fatura tarihi bazlı filtreleme yeterli.
+        var offsetXml = offset > 0 ? $"\n                <OFFSET>{offset}</OFFSET>" : string.Empty;
+        return $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+    <s:Body>
+        <GetInvoiceRequest xmlns=""http://tempuri.org/"">
+            {BuildRequestHeaderXml(session, "Gelen fatura sorgu")}
+            <INVOICE_SEARCH_KEY xmlns="""">
+                <LIMIT>{limit}</LIMIT>{offsetXml}
+                <START_DATE>{startDate:yyyy-MM-dd}</START_DATE>
+                <END_DATE>{endDate:yyyy-MM-dd}</END_DATE>
+                <READ_INCLUDED>true</READ_INCLUDED>
+                <DIRECTION>IN</DIRECTION>
+            </INVOICE_SEARCH_KEY>
+            <HEADER_ONLY xmlns="""">Y</HEADER_ONLY>
+            <INVOICE_CONTENT_TYPE xmlns="""">XML</INVOICE_CONTENT_TYPE>
+        </GetInvoiceRequest>
+    </s:Body>
+</s:Envelope>";
+    }
+
+    private static List<EInvoiceIncomingItem> ParseIncomingInvoices(string xml)
+    {
+        var result = new List<EInvoiceIncomingItem>();
+        if (string.IsNullOrWhiteSpace(xml)) return result;
+
+        XDocument doc;
+        try { doc = XDocument.Parse(xml); }
+        catch { return result; }
+
+        var invoiceNodes = doc.Descendants().Where(e => string.Equals(e.Name.LocalName, "INVOICE", StringComparison.OrdinalIgnoreCase));
+        foreach (var inv in invoiceNodes)
+        {
+            string Attr(string name) => inv.Attributes().FirstOrDefault(a => string.Equals(a.Name.LocalName, name, StringComparison.OrdinalIgnoreCase))?.Value ?? "";
+            var header = inv.Elements().FirstOrDefault(e => string.Equals(e.Name.LocalName, "HEADER", StringComparison.OrdinalIgnoreCase))
+                           ?? inv.Descendants().FirstOrDefault(e => string.Equals(e.Name.LocalName, "HEADER", StringComparison.OrdinalIgnoreCase));
+            string HeaderChild(string name) =>
+                header?.Elements().FirstOrDefault(e => string.Equals(e.Name.LocalName, name, StringComparison.OrdinalIgnoreCase))?.Value
+                ?? inv.Descendants().FirstOrDefault(e => string.Equals(e.Name.LocalName, name, StringComparison.OrdinalIgnoreCase))?.Value
+                ?? "";
+
+            var uuid = Attr("UUID");
+            if (string.IsNullOrWhiteSpace(uuid))
+                uuid = HeaderChild("UUID");
+            var idAttr = Attr("ID");
+            if (string.IsNullOrWhiteSpace(idAttr))
+                idAttr = HeaderChild("ID");
+            if (string.IsNullOrWhiteSpace(uuid) && string.IsNullOrWhiteSpace(idAttr))
+                continue;
+
+            var senderTax = HeaderChild("SENDER");
+            var receiverTax = HeaderChild("RECEIVER");
+            var supplier = HeaderChild("SUPPLIER");
+            var customer = HeaderChild("CUSTOMER");
+            var senderName = !string.IsNullOrWhiteSpace(supplier) ? supplier
+                : !string.IsNullOrWhiteSpace(customer) ? customer
+                : senderTax;
+            var receiverName = !string.IsNullOrWhiteSpace(customer) && !string.IsNullOrWhiteSpace(supplier)
+                ? customer : null;
+            var gibStatusDesc = HeaderChild("GIB_STATUS_DESCRIPTION");
+
+            var payableRaw = HeaderChild("PAYABLE_AMOUNT");
+            decimal.TryParse((payableRaw ?? "").Replace(",", "."), System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var payable);
+
+            var payableEl = header?.Elements().FirstOrDefault(e => string.Equals(e.Name.LocalName, "PAYABLE_AMOUNT", StringComparison.OrdinalIgnoreCase))
+                            ?? inv.Descendants().FirstOrDefault(e => string.Equals(e.Name.LocalName, "PAYABLE_AMOUNT", StringComparison.OrdinalIgnoreCase));
+            var currency = payableEl?.Attributes().FirstOrDefault(a =>
+                string.Equals(a.Name.LocalName, "currencyID", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(a.Name.LocalName, "CURRENCY", StringComparison.OrdinalIgnoreCase))?.Value;
+            if (string.IsNullOrWhiteSpace(currency)) currency = "TRY";
+
+            var issueRaw = HeaderChild("ISSUE_DATE");
+            DateTime? issue = null;
+            if (DateTime.TryParse(issueRaw, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeLocal, out var parsedIssue))
+                issue = parsedIssue;
+
+            var cdateRaw = HeaderChild("CDATE");
+            DateTime? createdAt = null;
+            if (DateTime.TryParse(cdateRaw, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AssumeLocal, out var parsedCreated))
+                createdAt = parsedCreated;
+
+            var status = HeaderChild("STATUS");
+            var statusDesc = HeaderChild("STATUS_DESCRIPTION");
+            if (string.IsNullOrWhiteSpace(statusDesc))
+                statusDesc = HeaderChild("RESPONSE_DESCRIPTION");
+            if (string.IsNullOrWhiteSpace(statusDesc))
+                statusDesc = HeaderChild("GIB_STATUS_DESCRIPTION");
+
+            var earchiveRaw = HeaderChild("EARCHIVE");
+            var profileId = HeaderChild("PROFILEID");
+            var isEArchive = string.Equals(earchiveRaw, "true", StringComparison.OrdinalIgnoreCase) || earchiveRaw == "1"
+                || string.Equals(profileId, "EARSIVFATURA", StringComparison.OrdinalIgnoreCase);
+
+            result.Add(new EInvoiceIncomingItem(
+                Uuid: string.IsNullOrWhiteSpace(uuid) ? idAttr : uuid,
+                InvoiceNumber: string.IsNullOrWhiteSpace(idAttr) ? HeaderChild("ID") : idAttr,
+                SenderName: senderName,
+                SenderTaxNumber: senderTax,
+                DocumentType: isEArchive ? "EArsiv" : "EFatura",
+                Status: status,
+                StatusDescription: statusDesc,
+                PayableAmount: payable,
+                Currency: currency!,
+                IssueDate: issue,
+                EnvelopeIdentifier: HeaderChild("ENVELOPE_IDENTIFIER"),
+                RawContent: HeaderChild("CONTENT"),
+                CreatedAt: createdAt,
+                ReceiverName: receiverName,
+                ReceiverTaxNumber: receiverTax,
+                GibStatusDescription: gibStatusDesc,
+                ProfileId: profileId));
+        }
+
+        return result;
+    }
+
+    private async Task<string> LoginAsync(string? username, string? password, CancellationToken ct, bool forceFresh = false)
     {
         var user = !string.IsNullOrWhiteSpace(username) ? username : _cfg["EInvoice:Edm:Username"];
         var pass = !string.IsNullOrWhiteSpace(password) ? password : _cfg["EInvoice:Edm:Password"];
         if (string.IsNullOrWhiteSpace(user) || string.IsNullOrWhiteSpace(pass))
             throw new InvalidOperationException("EDM kullanıcı adı/şifre tanımlı değil.");
 
-        var cacheKey = $"{_http.BaseAddress}|{user}";
-        if (SessionCache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAtUtc > DateTime.UtcNow)
+        // Önbellek anahtarı kimlik bilgilerini (kullanıcı adı + şifre) de içerir.
+        // Böylece kullanıcı şifresini/kullanıcı adını değiştirdiğinde eski (bayat) oturum dönmez;
+        // aksi halde "bağlantı testi" eski oturumu döndürüp yanlış "başarılı" raporlayabilirdi.
+        var credHash = Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(Encoding.UTF8.GetBytes(user.Trim() + "\n" + pass)));
+        var cacheKey = $"{_http.BaseAddress}|{credHash}";
+        if (!forceFresh && SessionCache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAtUtc > DateTime.UtcNow)
             return cached.SessionId;
+
+        // Taze login isteniyorsa (veya yeniden deneme) önce mevcut oturumu düşür.
+        SessionCache.TryRemove(cacheKey, out _);
 
         var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
     <s:Body>
@@ -518,13 +846,43 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
 </s:Envelope>";
 
         var xml = await SendSoapAsync("Login", body, ct);
-        EnsureSoapFault(xml);
+
+        // Teşhis: login reddedilirse, gönderimin GERÇEKTE kullandığı kimlik bilgisini (maskeli) hata mesajına ekliyoruz.
+        // Böylece "bağlantı testi geçti ama gönderim şifre hatası veriyor" durumunda, saklanan kullanıcı adı/şifrenin
+        // yazdığınızla aynı olup olmadığı doğrudan "Son Hata" ekranında görünür.
+        var credHint = $"[gönderimde denenen kullanıcı: '{user}', şifre uzunluğu: {(pass?.Length ?? 0)} karakter]";
+        if (HasSoapFault(xml))
+        {
+            var shortErr = GetXmlValue(xml, "ERROR_SHORT_DES") ?? GetXmlValue(xml, "faultstring") ?? "EDM SOAP fault.";
+            var longErr = GetXmlValue(xml, "ERROR_LONG_DES");
+            var detail = string.IsNullOrWhiteSpace(longErr) ? shortErr : $"{shortErr} {longErr}";
+            throw new InvalidOperationException($"EDM Login reddedildi: {detail} {credHint}\n---SOAP-FAULT-XML---\n{xml}");
+        }
         var sessionId = GetXmlValue(xml, "SESSION_ID");
         if (string.IsNullOrWhiteSpace(sessionId))
-            throw new InvalidOperationException("EDM Login response içinde SESSION_ID yok.");
+            throw new InvalidOperationException($"EDM Login yanıtında SESSION_ID yok. {credHint}\n---SOAP-FAULT-XML---\n{xml}");
 
-        SessionCache[cacheKey] = (sessionId, DateTime.UtcNow.AddMinutes(20));
+        // EDM oturumları sunucu tarafında kısa sürede düşebildiği için TTL'yi kısa tutuyoruz;
+        // ayrıca gönderim/sorgu akışları oturum hatasında taze login ile yeniden dener.
+        SessionCache[cacheKey] = (sessionId, DateTime.UtcNow.AddMinutes(10));
         return sessionId;
+    }
+
+    // EDM yanıtının oturum/kimlik hatası olup olmadığını anlar (bayat SESSION_ID, süresi dolmuş oturum vb.).
+    // Bu durumlarda taze login ile bir kez daha denenir.
+    private static bool IsSessionFault(string? xml)
+    {
+        if (string.IsNullOrWhiteSpace(xml)) return false;
+        var t = xml.ToUpperInvariant();
+        // Sadece gerçek SOAP fault yanıtlarında değerlendir (başarılı yanıtta gereksiz yeniden deneme yapmamak için).
+        var isFault = t.Contains("FAULT");
+        if (!isFault) return false;
+        return t.Contains("KULLANICI BULUNAMADI")
+            || t.Contains("KULLANICI VEYA")
+            || t.Contains("ŞIFRE HATALI")
+            || t.Contains("SIFRE HATALI")
+            || t.Contains("OTURUM")
+            || t.Contains("SESSION");
     }
 
     private async Task<string> SendSoapAsync(string operation, string envelopeXml, CancellationToken ct, string? soapActionOverride = null)
@@ -541,6 +899,13 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
                 : (xml.Length > 600 ? xml[..600] + "..." : xml);
             throw new InvalidOperationException($"EDM SOAP HTTP {(int)res.StatusCode}: {res.ReasonPhrase}. {bodyPreview}".Trim());
         }
+        // Boş gövde geçerli bir SOAP yanıtı değildir; XDocument.Parse "Root element is missing" hatası fırlatır.
+        // Bunu kriptik bir XML hatası yerine anlaşılır/yeniden denenebilir bir mesaja çeviriyoruz.
+        if (string.IsNullOrWhiteSpace(xml))
+            throw new InvalidOperationException(
+                $"EDM SOAP boş yanıt döndürdü (HTTP {(int)res.StatusCode} {res.ReasonPhrase}). İşlem: {operation}. " +
+                "Bu genelde geçici bir EDM hatasından veya uç nokta/SOAPAction uyuşmazlığından kaynaklanır. " +
+                "Lütfen biraz sonra tekrar gönderin.");
         return xml;
     }
 
@@ -999,6 +1364,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
 
     private static string? GetXmlValue(string xml, string localName)
     {
+        if (string.IsNullOrWhiteSpace(xml)) return null;
         var x = XDocument.Parse(xml);
         return x.Descendants().FirstOrDefault(e => e.Name.LocalName == localName)?.Value;
     }
@@ -1014,6 +1380,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
 
     private static string? GetInvoiceAttribute(string xml, string attr)
     {
+        if (string.IsNullOrWhiteSpace(xml)) return null;
         var x = XDocument.Parse(xml);
         var inv = x.Descendants().FirstOrDefault(e => e.Name.LocalName == "INVOICE");
         if (inv is null) return null;
@@ -1041,6 +1408,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
 public sealed record EdmTaxpayerQueryResult(
     bool IsSuccess,
     bool? IsEInvoiceTaxpayer,
+    string? Title,
     string? ReceiverAlias,
     string? RawResponse,
     string? Message

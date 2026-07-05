@@ -141,7 +141,15 @@ public class AuthController : ControllerBase
             canManageBranches = isOwner || HasPermissionClaim("perm_manage_branches"),
             canSwitchBranches = isOwner || HasPermissionClaim("perm_switch_branches"),
             canUseEInvoice = isOwner || HasPermissionClaim("perm_einvoice"),
-            canUseEArchive = isOwner || HasPermissionClaim("perm_earchive")
+            canUseEArchive = isOwner || HasPermissionClaim("perm_earchive"),
+            canUseExpenseSlip = isOwner || HasPermissionClaim("perm_expense_slip"),
+            canManageRates = isOwner || HasPermissionClaim("perm_manage_rates"),
+            canViewBalanceSheet = isOwner || HasPermissionClaim("perm_view_balance_sheet"),
+            canAccessCustomers = isOwner || HasPermissionClaim("perm_access_customers"),
+            canAccessSuppliers = isOwner || HasPermissionClaim("perm_access_suppliers"),
+            canAccessPurchase = isOwner || HasPermissionClaim("perm_access_purchase"),
+            canAccessSales = isOwner || HasPermissionClaim("perm_access_sales"),
+            canCreateIncomeExpense = isOwner || HasPermissionClaim("perm_create_income_expense")
         });
     }
 
@@ -221,6 +229,9 @@ public class AuthController : ControllerBase
             CanSwitchBranches = true,
             CanUseEInvoice = true,
             CanUseEArchive = true,
+            CanUseExpenseSlip = true,
+            CanManageRates = true,
+            CanViewBalanceSheet = true,
             IsActive = true,
             CreatedAt = DateTime.UtcNow
         };
@@ -338,6 +349,9 @@ public class AuthController : ControllerBase
             CanSwitchBranches = defaultPerms.canSwitchBranches,
             CanUseEInvoice = defaultPerms.canUseEInvoice,
             CanUseEArchive = defaultPerms.canUseEArchive,
+            CanUseExpenseSlip = defaultPerms.canUseExpenseSlip,
+            CanManageRates = defaultPerms.canManageRates,
+            CanViewBalanceSheet = defaultPerms.canViewBalanceSheet,
             CreatedAt = DateTime.UtcNow
         };
 
@@ -394,6 +408,93 @@ public class AuthController : ControllerBase
         return Ok(new { token, user = new { user.Id, user.Username, user.Role, BranchId = req.BranchId } });
     }
 
+    /// <summary>Süresi dolmuş JWT ile yeni oturum token'ı üretir (masaüstü uzun süre açık kalma senaryosu).</summary>
+    [HttpPost("refresh-token")]
+    [AllowAnonymous]
+    public async Task<IActionResult> RefreshToken(
+        [FromHeader(Name = "X-Tenant-Id")] Guid tenantId,
+        [FromServices] AppDbContext db,
+        CancellationToken ct)
+    {
+        if (tenantId == Guid.Empty)
+            return BadRequest(new { error = "X-Tenant-Id header zorunludur." });
+
+        var authHeader = Request.Headers.Authorization.ToString();
+        if (string.IsNullOrWhiteSpace(authHeader)
+            || !authHeader.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            return Unauthorized(new { error = "Bearer token gerekli." });
+
+        var token = authHeader["Bearer ".Length..].Trim();
+        var principal = ValidateExpiredToken(token, out var expiredAtUtc);
+        if (principal is null)
+            return Unauthorized(new { error = "Geçersiz oturum." });
+
+        if (expiredAtUtc.HasValue)
+        {
+            var graceHours = _cfg.GetValue("Jwt:RefreshGraceHours", 24);
+            if (DateTime.UtcNow > expiredAtUtc.Value.AddHours(graceHours))
+                return Unauthorized(new { error = "Oturum süresi doldu. Lütfen tekrar giriş yapın." });
+        }
+
+        var userIdStr = principal.FindFirstValue(ClaimTypes.NameIdentifier);
+        if (string.IsNullOrEmpty(userIdStr) || !Guid.TryParse(userIdStr, out var userId))
+            return Unauthorized(new { error = "Geçersiz oturum." });
+
+        var branchIdStr = principal.FindFirstValue("branch_id");
+        if (string.IsNullOrEmpty(branchIdStr) || !Guid.TryParse(branchIdStr, out var branchId))
+            return Unauthorized(new { error = "Geçersiz oturum." });
+
+        var user = await db.Users
+            .AsNoTracking()
+            .FirstOrDefaultAsync(u => u.Id == userId && u.TenantId == tenantId && !u.IsDeleted, ct);
+
+        if (user is null)
+            return Unauthorized(new { error = "Kullanıcı bulunamadı." });
+
+        if (!CanSwitchBranches(user) && user.BranchId != branchId)
+            return StatusCode(403, new { error = "Bu kullanıcı sadece atanmış olduğu şubeye giriş yapabilir." });
+
+        var branchOk = await db.Branches
+            .AsNoTracking()
+            .AnyAsync(b => b.Id == branchId && b.TenantId == tenantId && b.IsActive, ct);
+
+        if (!branchOk)
+            return BadRequest(new { error = "Geçersiz veya pasif şube." });
+
+        var newToken = CreateJwt(user, branchId);
+        return Ok(new { token = newToken, user = new { user.Id, user.Username, user.Role, BranchId = branchId } });
+    }
+
+    private ClaimsPrincipal? ValidateExpiredToken(string token, out DateTime? expiredAtUtc)
+    {
+        expiredAtUtc = null;
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_cfg["Jwt:Key"]!));
+        var validation = new TokenValidationParameters
+        {
+            ValidateIssuer = true,
+            ValidateAudience = true,
+            ValidateIssuerSigningKey = true,
+            ValidateLifetime = false,
+            ValidIssuer = _cfg["Jwt:Issuer"],
+            ValidAudience = _cfg["Jwt:Audience"],
+            IssuerSigningKey = key,
+            ClockSkew = TimeSpan.Zero
+        };
+
+        try
+        {
+            var handler = new JwtSecurityTokenHandler();
+            var principal = handler.ValidateToken(token, validation, out var validatedToken);
+            if (validatedToken is JwtSecurityToken jwt)
+                expiredAtUtc = jwt.ValidTo;
+            return principal;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private string CreateJwt(User user, Guid? branchIdOverride = null)
     {
         var branchId = branchIdOverride ?? user.BranchId;
@@ -404,12 +505,21 @@ public class AuthController : ControllerBase
         {
         new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
         new Claim(ClaimTypes.Name, user.Username),
+        new Claim("full_name", string.IsNullOrWhiteSpace(user.FullName) ? user.Username : user.FullName!),
         new Claim(ClaimTypes.Role, user.Role ?? "User"),
         new Claim("perm_manage_users", EffectivePermission(user.CanManageUsers, user.Role).ToString()),
         new Claim("perm_manage_branches", EffectivePermission(user.CanManageBranches, user.Role).ToString()),
         new Claim("perm_switch_branches", EffectivePermission(user.CanSwitchBranches, user.Role).ToString()),
         new Claim("perm_einvoice", EffectivePermission(user.CanUseEInvoice, user.Role).ToString()),
         new Claim("perm_earchive", EffectivePermission(user.CanUseEArchive, user.Role).ToString()),
+        new Claim("perm_expense_slip", EffectivePermission(user.CanUseExpenseSlip, user.Role).ToString()),
+        new Claim("perm_manage_rates", EffectivePermission(user.CanManageRates, user.Role).ToString()),
+        new Claim("perm_view_balance_sheet", EffectivePermission(user.CanViewBalanceSheet, user.Role).ToString()),
+        new Claim("perm_access_customers", EffectivePermission(user.CanAccessCustomers, user.Role).ToString()),
+        new Claim("perm_access_suppliers", EffectivePermission(user.CanAccessSuppliers, user.Role).ToString()),
+        new Claim("perm_access_purchase", EffectivePermission(user.CanAccessPurchase, user.Role).ToString()),
+        new Claim("perm_access_sales", EffectivePermission(user.CanAccessSales, user.Role).ToString()),
+        new Claim("perm_create_income_expense", EffectivePermission(user.CanCreateIncomeExpense, user.Role).ToString()),
         // 🔽 tenant claim’i eklendi
         new Claim("tenant_id", user.TenantId.ToString()),
         new Claim("branch_id", branchId.ToString())
@@ -490,14 +600,14 @@ public class AuthController : ControllerBase
         return "User";
     }
 
-    private static (bool canManageUsers, bool canManageBranches, bool canSwitchBranches, bool canUseEInvoice, bool canUseEArchive)
+    private static (bool canManageUsers, bool canManageBranches, bool canSwitchBranches, bool canUseEInvoice, bool canUseEArchive, bool canUseExpenseSlip, bool canManageRates, bool canViewBalanceSheet)
         BuildDefaultPermissions(string role)
     {
         if (string.Equals(role, "Owner", StringComparison.OrdinalIgnoreCase))
-            return (true, true, true, true, true);
+            return (true, true, true, true, true, true, true, true);
         if (string.Equals(role, "Admin", StringComparison.OrdinalIgnoreCase))
-            return (false, true, false, true, true);
-        return (false, false, false, false, false);
+            return (false, true, false, true, true, true, true, false);
+        return (false, false, false, false, false, false, false, false);
     }
 
 }

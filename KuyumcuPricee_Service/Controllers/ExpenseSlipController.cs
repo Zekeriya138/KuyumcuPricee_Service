@@ -29,7 +29,6 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpGet]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> List(
         [FromQuery] Guid? branchId,
         [FromQuery] string? status,
@@ -37,6 +36,9 @@ public sealed class ExpenseSlipController : ControllerBase
         [FromQuery, Range(1, 500)] int pageSize = 50,
         CancellationToken ct = default)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         var tid = _tenant.TenantId;
         var q = _db.ExpenseSlipDocuments.AsNoTracking().Where(x => x.TenantId == tid);
         if (branchId.HasValue && branchId.Value != Guid.Empty)
@@ -77,9 +79,11 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpGet("{id:guid}")]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> GetById(Guid id, CancellationToken ct)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
@@ -88,9 +92,11 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpGet("{id:guid}/audit")]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> GetAudit(Guid id, CancellationToken ct)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         var tid = _tenant.TenantId;
         var exists = await _db.ExpenseSlipDocuments.AsNoTracking().AnyAsync(x => x.TenantId == tid && x.Id == id, ct);
         if (!exists) return NotFound(new { error = "Belge bulunamadı." });
@@ -115,9 +121,11 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpPost("draft")]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> CreateDraft([FromBody] CreateExpenseSlipDraftReq req, CancellationToken ct)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         if (req.BranchId == Guid.Empty)
             return BadRequest(new { error = "BranchId zorunludur." });
         if (string.IsNullOrWhiteSpace(req.BuyerName))
@@ -193,9 +201,11 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpPost("{id:guid}/queue")]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> Queue(Guid id, CancellationToken ct)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
         if (row is null) return NotFound(new { error = "Belge bulunamadı." });
@@ -242,9 +252,11 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpPost("{id:guid}/cancel")]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> Cancel(Guid id, [FromBody] CancelExpenseSlipReq? req, CancellationToken ct)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
         if (row is null) return NotFound(new { error = "Belge bulunamadı." });
@@ -306,9 +318,11 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpPut("{id:guid}/draft")]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> UpdateDraft(Guid id, [FromBody] UpdateExpenseSlipDraftReq req, CancellationToken ct)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
         if (row is null) return NotFound(new { error = "Belge bulunamadı." });
@@ -369,9 +383,11 @@ public sealed class ExpenseSlipController : ControllerBase
     }
 
     [HttpPost("delete-selected")]
-    [Authorize(Roles = "Owner,Admin,Manager")]
     public async Task<IActionResult> DeleteSelected([FromBody] DeleteSelectedExpenseSlipReq req, CancellationToken ct)
     {
+        var denied = RequireExpenseSlipPermission();
+        if (denied != null) return denied;
+
         var tid = _tenant.TenantId;
         var ids = (req.DocumentIds ?? [])
             .Where(x => x != Guid.Empty)
@@ -412,6 +428,27 @@ public sealed class ExpenseSlipController : ControllerBase
             .Where(x => x.TenantId == tenantId && x.BranchId == branchId && x.DocumentNo.StartsWith(prefix))
             .CountAsync(ct);
         return $"{prefix}{(countToday + 1):0000}";
+    }
+
+    private IActionResult? RequireExpenseSlipPermission()
+    {
+        if (CanUseExpenseSlip()) return null;
+        return Forbid();
+    }
+
+    private bool CanUseExpenseSlip()
+    {
+        var role = User.FindFirstValue(ClaimTypes.Role) ?? "";
+        if (string.Equals(role, "Owner", StringComparison.OrdinalIgnoreCase))
+            return true;
+        return HasPermissionClaim("perm_expense_slip");
+    }
+
+    private bool HasPermissionClaim(string claimType)
+    {
+        var raw = User.FindFirstValue(claimType);
+        return string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizeDigits(string? value)

@@ -20,7 +20,9 @@ namespace KUYUMCU.Price_Service.Models
         decimal? BirimSatisIscilikHas = null,
         decimal? DepoBirimMaliyet = null,
         /// <summary>Tekil ürün: depo hareketi ürün kaydı ile aynı transaction’da; null ise depo ayrı çağrıdan.</summary>
-        Guid? DepoBranchId = null
+        Guid? DepoBranchId = null,
+        /// <summary>Opsiyonel ürün fotoğrafı (base64 JPEG).</summary>
+        string? ImageBase64 = null
     );
 
     public record UpdateProductDto(
@@ -39,7 +41,9 @@ namespace KUYUMCU.Price_Service.Models
         string? DepoTedarikciFirma = null,
         decimal? BelirlenenSatisFiyatiHas = null,
         decimal? BirimSatisIscilikHas = null,
-        decimal? DepoBirimMaliyet = null
+        decimal? DepoBirimMaliyet = null,
+        /// <summary>Opsiyonel ürün fotoğrafı (base64 JPEG). null gönderilirse mevcut görsel korunur, boş string ("") gönderilirse silinir.</summary>
+        string? ImageBase64 = null
     );
 
     public record ProductDto(
@@ -61,6 +65,8 @@ namespace KUYUMCU.Price_Service.Models
         string? DepoTedarikciFirma = null,
         decimal? BelirlenenSatisFiyatiHas = null,
         decimal? BirimSatisIscilikHas = null,
-        decimal? DepoBirimMaliyet = null
+        decimal? DepoBirimMaliyet = null,
+        /// <summary>Opsiyonel ürün fotoğrafı (base64 JPEG). Liste uçlarında performans için null bırakılır; tekil getirmede dolu döner.</summary>
+        string? ImageBase64 = null
     );
 }

@@ -1,3 +1,4 @@
+using System.Globalization;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
 using KUYUMCU.Price_Service.Services;
@@ -29,12 +30,17 @@ public sealed class SupplierTransactionsController : ControllerBase
         decimal SourceAmount,
         string TargetUnit,
         bool IsConvertEnabled,
+        List<ZiynetSettlementReq>? ZiynetItems,
         List<OpeningBalanceReq>? OpeningBalances,
         decimal? NakitAmount,
         decimal? HavaleAmount,
         string? Description,
-        DateTime? TxDate);
+        DateTime? TxDate,
+        decimal? SourceUnitTlRate = null,
+        decimal? TargetUnitTlRate = null,
+        decimal? TargetAmount = null);
     public sealed record OpeningBalanceReq(string Unit, decimal Amount);
+    public sealed record ZiynetSettlementReq(string Ad, string Tip, decimal Adet, string? CariDurum);
 
     public sealed record SupplierTransactionDto(
         Guid Id,
@@ -69,7 +75,8 @@ public sealed class SupplierTransactionsController : ControllerBase
         if (txType is null)
             return BadRequest(new { error = "TxType PAYMENT/COLLECTION/OPENING_BALANCE/BALANCE_CONVERSION olmalıdır." });
 
-        if (txType != "OPENING_BALANCE" && req.SourceAmount <= 0)
+        var hasZiynetSettlement = txType == "PAYMENT" && req.ZiynetItems is { Count: > 0 };
+        if (txType != "OPENING_BALANCE" && req.SourceAmount <= 0 && !hasZiynetSettlement)
             return BadRequest(new { error = "Miktar 0'dan büyük olmalıdır." });
 
         var sourceUnit = NormalizeUnit(req.SourceUnit);
@@ -113,19 +120,23 @@ public sealed class SupplierTransactionsController : ControllerBase
             }
 
             var txDate = req.TxDate?.ToUniversalTime() ?? DateTime.UtcNow;
-            SupplierTransaction entity;
+            SupplierTransaction? lastEntity = null;
+            var lastEntityAdded = false;
             if (txType == "OPENING_BALANCE")
             {
                 var opening = req.OpeningBalances ?? new List<OpeningBalanceReq>();
-                if (opening.Count == 0 || !opening.Any(x => x.Amount != 0m))
-                    return BadRequest(new { error = "Açılış bakiyesi için en az bir birim değeri girilmelidir." });
-                entity = null!;
+                var ziynetItems = req.ZiynetItems ?? new List<ZiynetSettlementReq>();
+                var hasOpening = opening.Any(x => x.Amount != 0m);
+                var hasZiynet = ziynetItems.Any(z => z is not null && z.Adet > 0m && !string.IsNullOrWhiteSpace(z.Ad));
+                if (!hasOpening && !hasZiynet)
+                    return BadRequest(new { error = "Açılış bakiyesi için en az bir bakiye veya ziynet satırı girilmelidir." });
+
                 foreach (var row in opening.Where(x => x.Amount != 0m))
                 {
                     var unit = NormalizeUnit(row.Unit);
                     var amount = decimal.Round(row.Amount, 6, MidpointRounding.AwayFromZero);
                     ApplyBalanceDelta(bal, unit, amount);
-                    entity = new SupplierTransaction
+                    lastEntity = new SupplierTransaction
                     {
                         TenantId = tenantId,
                         SupplierId = supplier.Id,
@@ -141,62 +152,112 @@ public sealed class SupplierTransactionsController : ControllerBase
                         Description = string.IsNullOrWhiteSpace(req.Description) ? "Açılış bakiye girişi" : req.Description.Trim(),
                         TxDate = txDate
                     };
-                    _db.SupplierTransactions.Add(entity);
+                    _db.SupplierTransactions.Add(lastEntity);
+                }
+
+                foreach (var ziynet in ziynetItems
+                             .Where(z => z is not null && z.Adet > 0m && !string.IsNullOrWhiteSpace(z.Ad)))
+                {
+                    var adet = decimal.Round(Math.Abs(ziynet.Adet), 3, MidpointRounding.AwayFromZero);
+                    var ad = (ziynet.Ad ?? "").Trim();
+                    var tip = NormalizeOpeningZiynetTip(ad, ziynet.Tip);
+                    if (adet <= 0m || string.IsNullOrWhiteSpace(ad))
+                        continue;
+
+                    // Alacaklı → +adet (alacak sütunu); Borçlu → -adet (borç sütunu) — müşteri açılış bakiyesi ile aynı mantık
+                    var signed = NormalizeCariDurum(ziynet.CariDurum) == "BORCLU" ? -adet : adet;
+                    if (IsHasAltinZiynetAd(ad))
+                    {
+                        ApplyBalanceDelta(bal, "HAS", signed);
+                        lastEntity = new SupplierTransaction
+                        {
+                            TenantId = tenantId,
+                            SupplierId = supplier.Id,
+                            BranchId = branchId,
+                            TxType = txType,
+                            SourceUnit = "HAS",
+                            SourceAmount = adet,
+                            TargetUnit = "HAS",
+                            TargetAmount = signed,
+                            IsConverted = false,
+                            SourceUnitTlRate = 1m,
+                            TargetUnitTlRate = 1m,
+                            Description = string.IsNullOrWhiteSpace(req.Description) ? "Açılış bakiye girişi (HAS)" : req.Description.Trim(),
+                            TxDate = txDate
+                        };
+                        _db.SupplierTransactions.Add(lastEntity);
+                        continue;
+                    }
+
+                    lastEntity = new SupplierTransaction
+                    {
+                        TenantId = tenantId,
+                        SupplierId = supplier.Id,
+                        BranchId = branchId,
+                        TxType = "ZIYNET",
+                        SourceUnit = "ADET",
+                        SourceAmount = adet,
+                        TargetUnit = "ADET",
+                        TargetAmount = signed,
+                        IsConverted = false,
+                        SourceUnitTlRate = 1m,
+                        TargetUnitTlRate = 1m,
+                        Description = BuildSupplierZiynetDescription(ad, tip, signed, "OPENING_BALANCE"),
+                        TxDate = txDate
+                    };
+                    _db.SupplierTransactions.Add(lastEntity);
                 }
             }
             else if (txType == "BALANCE_CONVERSION")
             {
-                if (sourceUnit == targetUnit)
+                if (!BalanceConversionZiynetHelper.TryParseUnit(req.SourceUnit, out var srcU))
+                    return BadRequest(new { error = "Kaynak birim geçersiz." });
+                if (!BalanceConversionZiynetHelper.TryParseUnit(req.TargetUnit, out var tgtU))
+                    return BadRequest(new { error = "Hedef birim geçersiz." });
+                if (BalanceConversionZiynetHelper.UnitsEqual(srcU, tgtU))
                     return BadRequest(new { error = "Dönüşüm için kaynak ve hedef birim farklı olmalıdır." });
 
-                var sourceBalance = GetBalanceByUnit(bal, sourceUnit);
-                var conversionRates = sourceBalance >= 0m
-                    ? _rates.GetUnitToTlBuyRates()
-                    : _rates.GetUnitToTlSellRates();
-                var sourceRates = conversionRates;
-                var targetRates = conversionRates;
-                if (!sourceRates.TryGetValue(sourceUnit, out sourceTlRate) || sourceTlRate <= 0)
-                    return BadRequest(new { error = $"Kaynak birim kuru bulunamadı: {sourceUnit}" });
-                if (!targetRates.TryGetValue(targetUnit, out targetTlRate) || targetTlRate <= 0)
-                    return BadRequest(new { error = $"Hedef birim kuru bulunamadı: {targetUnit}" });
+                // Kaynak→TL ve TL→hedef için ayrı alış/satış yönü (tedarikçi mantığı).
+                var sourceBalance = srcU.IsZiynet
+                    ? await GetSupplierZiynetNetAsync(tenantId, supplier.Id, branchId, srcU.ZiynetAd, srcU.ZiynetTip, ct)
+                    : GetBalanceByUnit(bal, srcU.CurrencyUnit);
+                var (useBuySrc, useBuyTgt) = BalanceConversionZiynetHelper.ResolveRateSides(isSupplier: true, sourceBalance);
 
-                sourceAmount = decimal.Round(req.SourceAmount, 6, MidpointRounding.AwayFromZero);
-                targetAmount = decimal.Round((sourceAmount * sourceTlRate) / targetTlRate, 6, MidpointRounding.AwayFromZero);
-                if (TryConvertHasByKgRateForBalanceConversion(sourceUnit, targetUnit, sourceBalance, sourceAmount, out var kgConverted))
-                    targetAmount = kgConverted;
+                var srcRate = req.SourceUnitTlRate is > 0m
+                    ? req.SourceUnitTlRate.Value
+                    : BalanceConversionZiynetHelper.ResolveUnitTlRate(_rates, srcU, useBuySrc);
+                var tgtRate = req.TargetUnitTlRate is > 0m
+                    ? req.TargetUnitTlRate.Value
+                    : BalanceConversionZiynetHelper.ResolveUnitTlRate(_rates, tgtU, useBuyTgt);
+                if (srcRate <= 0m)
+                    return BadRequest(new { error = $"Kaynak birim kuru bulunamadı: {BalanceConversionZiynetHelper.FormatUnitLabel(srcU)}" });
+                if (tgtRate <= 0m)
+                    return BadRequest(new { error = $"Hedef birim kuru bulunamadı: {BalanceConversionZiynetHelper.FormatUnitLabel(tgtU)}" });
+
+                var srcAmt = decimal.Round(req.SourceAmount, 6, MidpointRounding.AwayFromZero);
+                if (srcAmt <= 0m)
+                    return BadRequest(new { error = "Dönüştürülecek miktar 0'dan büyük olmalıdır." });
+                var tgtAmt = req.TargetAmount is > 0m
+                    ? decimal.Round(req.TargetAmount.Value, 6, MidpointRounding.AwayFromZero)
+                    : decimal.Round((srcAmt * srcRate) / tgtRate, 6, MidpointRounding.AwayFromZero);
 
                 // Bakiye dönüşümünde yön birim-1 (kaynak) işaretine göre belirlenir.
-                // kaynak eksi ise: kaynak (+), hedef (-)
-                // kaynak artı/0 ise: kaynak (-), hedef (+)
+                // kaynak eksi ise: kaynak (+), hedef (-); kaynak artı/0 ise: kaynak (-), hedef (+)
                 var sourceIsNegative = sourceBalance < 0m;
-                var sourceDelta = sourceIsNegative ? +sourceAmount : -sourceAmount;
-                var targetDelta = sourceIsNegative ? -targetAmount : +targetAmount;
-                ApplyBalanceDelta(bal, sourceUnit, sourceDelta);
-                ApplyBalanceDelta(bal, targetUnit, targetDelta);
+                var srcDelta = sourceIsNegative ? +srcAmt : -srcAmt;
+                var tgtDelta = sourceIsNegative ? -tgtAmt : +tgtAmt;
+                var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
 
-                entity = new SupplierTransaction
-                {
-                    TenantId = tenantId,
-                    SupplierId = supplier.Id,
-                    BranchId = branchId,
-                    TxType = txType,
-                    SourceUnit = sourceUnit,
-                    SourceAmount = sourceAmount,
-                    TargetUnit = targetUnit,
-                    TargetAmount = targetAmount,
-                    IsConverted = true,
-                    SourceUnitTlRate = sourceTlRate,
-                    TargetUnitTlRate = targetTlRate,
-                    Description = string.IsNullOrWhiteSpace(req.Description) ? "Bakiye dönüştürme" : req.Description.Trim(),
-                    TxDate = txDate
-                };
+                ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate);
+                lastEntity = ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate);
+                lastEntityAdded = true;
             }
             else
             {
                 var signed = txType == "PAYMENT" ? -targetAmount : targetAmount;
                 ApplyBalanceDelta(bal, targetUnit, signed);
 
-                entity = new SupplierTransaction
+                lastEntity = new SupplierTransaction
                 {
                     TenantId = tenantId,
                     SupplierId = supplier.Id,
@@ -212,28 +273,84 @@ public sealed class SupplierTransactionsController : ControllerBase
                     Description = string.IsNullOrWhiteSpace(req.Description) ? null : req.Description.Trim(),
                     TxDate = txDate
                 };
-                await ApplyCashMovementAsync(req, tenantId, branchId, txType, sourceUnit, entity.TxDate, supplier.Id, ct);
+                await ApplyCashMovementAsync(req, tenantId, branchId, txType, sourceUnit, lastEntity.TxDate, supplier.Id, ct);
+
+                if (txType == "PAYMENT" && req.ZiynetItems is { Count: > 0 })
+                {
+                    foreach (var ziynet in req.ZiynetItems
+                                 .Where(z => z is not null && z.Adet > 0m && !string.IsNullOrWhiteSpace(z.Ad)))
+                    {
+                        var adet = decimal.Round(ziynet.Adet, 3, MidpointRounding.AwayFromZero);
+                        var ad = (ziynet.Ad ?? "").Trim();
+                        var tip = NormalizeZiynetTip(ziynet.Tip);
+                        if (adet <= 0m || string.IsNullOrWhiteSpace(ad))
+                            continue;
+
+                        // Has altın: adet defteri yerine HAS döviz bakiyesinden düş.
+                        if (IsHasAltinZiynetAd(ad))
+                        {
+                            ApplyBalanceDelta(bal, "HAS", -adet);
+                            _db.SupplierTransactions.Add(new SupplierTransaction
+                            {
+                                TenantId = tenantId,
+                                SupplierId = supplier.Id,
+                                BranchId = branchId,
+                                TxType = "PAYMENT",
+                                SourceUnit = "HAS",
+                                SourceAmount = adet,
+                                TargetUnit = "HAS",
+                                TargetAmount = -adet,
+                                IsConverted = false,
+                                SourceUnitTlRate = 1m,
+                                TargetUnitTlRate = 1m,
+                                Description = $"Has altın ödemesi (SUPPLIER_PAYMENT:{supplier.Id}, Tutar: {adet.ToString("0.###", CultureInfo.InvariantCulture)} gr)",
+                                TxDate = txDate
+                            });
+                            continue;
+                        }
+
+                        _db.SupplierTransactions.Add(new SupplierTransaction
+                        {
+                            TenantId = tenantId,
+                            SupplierId = supplier.Id,
+                            BranchId = branchId,
+                            TxType = "ZIYNET",
+                            SourceUnit = "ADET",
+                            SourceAmount = adet,
+                            TargetUnit = "ADET",
+                            TargetAmount = -adet,
+                            IsConverted = false,
+                            SourceUnitTlRate = 1m,
+                            TargetUnitTlRate = 1m,
+                            Description = BuildSupplierZiynetDescription(ad, tip, -adet, $"SUPPLIER_PAYMENT:{supplier.Id}"),
+                            TxDate = txDate
+                        });
+                    }
+                }
             }
 
             bal.UpdatedAt = DateTime.UtcNow;
-            if (txType != "OPENING_BALANCE")
-                _db.SupplierTransactions.Add(entity);
+            if (txType != "OPENING_BALANCE" && !lastEntityAdded && lastEntity is not null)
+                _db.SupplierTransactions.Add(lastEntity);
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
 
+            if (lastEntity is null)
+                return Ok(new { ok = true });
+
             return Ok(new SupplierTransactionDto(
-                entity.Id,
-                entity.SupplierId,
-                entity.TxType,
-                entity.SourceUnit,
-                entity.SourceAmount,
-                entity.TargetUnit,
-                entity.TargetAmount,
-                entity.IsConverted,
-                entity.SourceUnitTlRate,
-                entity.TargetUnitTlRate,
-                entity.Description,
-                entity.TxDate));
+                lastEntity.Id,
+                lastEntity.SupplierId,
+                lastEntity.TxType,
+                lastEntity.SourceUnit,
+                lastEntity.SourceAmount,
+                lastEntity.TargetUnit,
+                lastEntity.TargetAmount,
+                lastEntity.IsConverted,
+                lastEntity.SourceUnitTlRate,
+                lastEntity.TargetUnitTlRate,
+                lastEntity.Description,
+                lastEntity.TxDate));
         }
         catch
         {
@@ -331,6 +448,16 @@ public sealed class SupplierTransactionsController : ControllerBase
                 ? $"Tedarikçi tahsilat ({paymentMethod.ToLowerInvariant()})"
                 : $"Tedarikçi ödeme ({paymentMethod.ToLowerInvariant()})"
         });
+    }
+
+    /// <summary>Has altın ziynet kalemi mi? (Külçe ve 22 ayar gram ziynet hariç) → DOVIZ/HAS bakiyesine yazılır.</summary>
+    private static bool IsHasAltinZiynetAd(string? ad)
+    {
+        var s = (ad ?? "").Trim().ToUpperInvariant();
+        if (string.IsNullOrEmpty(s)) return false;
+        if (s.Contains("KÜLÇE") || s.Contains("KULCE") || s.Contains("22 AYAR") || s.Contains("22AYAR"))
+            return false;
+        return s.Contains("HAS ALTIN") || s.Contains("HASALTIN") || s.Contains("HAS ALTİN") || s == "HAS";
     }
 
     private static void ApplyBalanceDelta(SupplierBalance b, string unit, decimal delta)
@@ -435,6 +562,126 @@ public sealed class SupplierTransactionsController : ControllerBase
             "SILVER" => "GUMUS",
             _ => "TL"
         };
+    }
+
+    private static string NormalizeZiynetTip(string? raw)
+        => string.IsNullOrWhiteSpace(raw) ? "Yeni" : raw.Trim();
+
+    private static string NormalizeOpeningZiynetTip(string ad, string? raw)
+    {
+        if (IsOpeningZiynetTipless(ad)) return "";
+        return NormalizeZiynetTip(raw);
+    }
+
+    private static bool IsOpeningZiynetTipless(string? ad)
+    {
+        var s = (ad ?? "").Trim().ToUpperInvariant();
+        if (string.IsNullOrEmpty(s)) return false;
+        if (s.Contains("KÜLÇE") || s.Contains("KULCE") || s.Contains("22 AYAR") || s.Contains("22AYAR"))
+            return true;
+        return s.Contains("GRAM") && s.Contains("HAS");
+    }
+
+    private static string NormalizeCariDurum(string? raw)
+    {
+        var txt = (raw ?? "").Trim().ToUpperInvariant();
+        if (txt.Contains("EMANET")) return "EMANET";
+        if (txt.Contains("BOR")) return "BORCLU";
+        return "ALACAKLI";
+    }
+
+    private static string BuildSupplierZiynetDescription(string ad, string tip, decimal adet, string reference)
+    {
+        static string Safe(string? raw) => (raw ?? "").Replace("|", "/").Replace(";", ",").Trim();
+        return $"[ZIYNET]|AD={Safe(ad)}|TIP={Safe(tip)}|ADET={adet.ToString("0.###", CultureInfo.InvariantCulture)}|REF={Safe(reference)}";
+    }
+
+    private SupplierTransaction ApplySupplierConversionSide(
+        SupplierBalance bal, Guid tenantId, Guid supplierId, Guid branchId,
+        BalanceConversionZiynetHelper.ConversionUnit unit,
+        decimal amount, decimal delta, decimal rate, string note, DateTime txDate)
+    {
+        SupplierTransaction entity;
+        if (unit.IsZiynet)
+        {
+            var tip = NormalizeOpeningZiynetTip(unit.ZiynetAd, unit.ZiynetTip);
+            entity = new SupplierTransaction
+            {
+                TenantId = tenantId,
+                SupplierId = supplierId,
+                BranchId = branchId,
+                TxType = "ZIYNET",
+                SourceUnit = "ADET",
+                SourceAmount = amount,
+                TargetUnit = "ADET",
+                TargetAmount = delta,
+                IsConverted = false,
+                SourceUnitTlRate = 1m,
+                TargetUnitTlRate = 1m,
+                Description = BuildSupplierZiynetDescription(unit.ZiynetAd, tip, delta, "BALANCE_CONVERSION"),
+                TxDate = txDate
+            };
+        }
+        else
+        {
+            ApplyBalanceDelta(bal, unit.CurrencyUnit, delta);
+            entity = new SupplierTransaction
+            {
+                TenantId = tenantId,
+                SupplierId = supplierId,
+                BranchId = branchId,
+                TxType = "BALANCE_CONVERSION",
+                SourceUnit = unit.CurrencyUnit,
+                SourceAmount = amount,
+                TargetUnit = unit.CurrencyUnit,
+                TargetAmount = delta,
+                IsConverted = true,
+                SourceUnitTlRate = rate,
+                TargetUnitTlRate = rate,
+                Description = note,
+                TxDate = txDate
+            };
+        }
+        _db.SupplierTransactions.Add(entity);
+        return entity;
+    }
+
+    private async Task<decimal> GetSupplierZiynetNetAsync(
+        Guid tenantId, Guid supplierId, Guid branchId, string ad, string? tip, CancellationToken ct)
+    {
+        var targetCode = BalanceConversionZiynetHelper.ZiynetRateCode(ad, tip);
+        if (string.IsNullOrEmpty(targetCode)) return 0m;
+
+        var rows = await _db.SupplierTransactions
+            .Where(x => x.TenantId == tenantId && x.SupplierId == supplierId && x.BranchId == branchId
+                        && !x.IsDeleted && x.TxType == "ZIYNET")
+            .Select(x => new { x.Description, x.TargetAmount })
+            .ToListAsync(ct);
+
+        decimal net = 0m;
+        foreach (var r in rows)
+        {
+            if (!TryGetZiynetAdTipFromDescription(r.Description, out var rad, out var rtip)) continue;
+            var code = BalanceConversionZiynetHelper.ZiynetRateCode(rad, rtip);
+            if (!string.Equals(code, targetCode, StringComparison.OrdinalIgnoreCase)) continue;
+            net += r.TargetAmount;
+        }
+        return net;
+    }
+
+    private static bool TryGetZiynetAdTipFromDescription(string? desc, out string ad, out string tip)
+    {
+        ad = "";
+        tip = "";
+        var d = (desc ?? "").Trim();
+        if (!d.Contains("[ZIYNET]|", StringComparison.OrdinalIgnoreCase)) return false;
+        foreach (var rawPart in d.Split('|', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var p = rawPart.Trim();
+            if (p.StartsWith("AD=", StringComparison.OrdinalIgnoreCase)) ad = p.Substring(3).Trim();
+            else if (p.StartsWith("TIP=", StringComparison.OrdinalIgnoreCase)) tip = p.Substring(4).Trim();
+        }
+        return !string.IsNullOrWhiteSpace(ad);
     }
 
     private Guid GetTenantId()

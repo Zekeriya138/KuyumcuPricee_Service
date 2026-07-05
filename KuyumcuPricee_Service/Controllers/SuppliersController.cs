@@ -1,10 +1,12 @@
 using System;
+using System.Globalization;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using kuyumcu_domain.Entities;
 using kuyumcu_domain.Enums;
 using kuyumcu_infrastructure.Persistence;
+using KUYUMCU.Price_Service.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -122,12 +124,20 @@ public class SuppliersController : ControllerBase
         string Kalem,
         string Deger,
         string CariDurum,
-        string Aciklama
+        string Aciklama,
+        string Kullanici
+    );
+
+    public sealed record SupplierZiynetRowDto(
+        string Ad,
+        string Tip,
+        decimal Adet
     );
 
     public sealed record SupplierFinanceDto(
         SupplierBalanceRowDto Doviz,
-        List<SupplierRecentTxRowDto> SonIslemler
+        List<SupplierRecentTxRowDto> SonIslemler,
+        List<SupplierZiynetRowDto> Ziynet
     );
 
     public record CreateSupplierDto(
@@ -290,7 +300,8 @@ public class SuppliersController : ControllerBase
                     kalem,
                     FormatSupplierRecentValue(x),
                     ResolveSupplierCariDurum(x),
-                    x.Description ?? ""
+                    x.Description ?? "",
+                    x.KullaniciAdi ?? ""
                 );
             })
             .ToList();
@@ -307,10 +318,13 @@ public class SuppliersController : ControllerBase
                 x.BranchId == branchId &&
                 x.SupplierId == id &&
                 !x.IsDeleted)
-            .Select(x => new { x.Id, x.Date, x.PaymentMethod, x.GrandTotal })
+            .Select(x => new { x.Id, x.Date, x.PaymentMethod, x.GrandTotal, x.UserId })
             .OrderByDescending(x => x.Date)
             .Take(300)
             .ToListAsync(ct);
+
+        var userNames = await UserDisplayNames.BuildUserNameMapAsync(
+            _db, tenantId, purchaseDocs.Select(x => x.UserId).ToList(), ct);
 
         foreach (var purchase in purchaseDocs)
         {
@@ -324,7 +338,8 @@ public class SuppliersController : ControllerBase
                 "Alış İşlemi",
                 $"{Math.Abs(purchase.GrandTotal):N2} TL",
                 "İşlem",
-                $"Alış belgesi (PURCHASE {purchase.Id}, Ödeme: {purchase.PaymentMethod})"));
+                $"Alış belgesi (PURCHASE {purchase.Id}, Ödeme: {purchase.PaymentMethod})",
+                userNames.TryGetValue(purchase.UserId, out var pn) ? pn : ""));
         }
 
         sonIslemler = sonIslemler
@@ -332,7 +347,25 @@ public class SuppliersController : ControllerBase
             .Take(300)
             .ToList();
 
-        return Ok(new SupplierFinanceDto(doviz, sonIslemler));
+        var ziynet = tx
+            .Select(TryParseZiynetMove)
+            .Where(x => x is not null)
+            .Select(x => x!)
+            .GroupBy(x => $"{(x.Ad ?? "").Trim().ToUpperInvariant()}|{(x.Tip ?? "").Trim().ToUpperInvariant()}")
+            .Select(g =>
+            {
+                var first = g.First();
+                return new SupplierZiynetRowDto(
+                    first.Ad,
+                    string.IsNullOrWhiteSpace(first.Tip) ? "Yeni" : first.Tip.Trim(),
+                    decimal.Round(g.Sum(v => v.Adet), 3, MidpointRounding.AwayFromZero));
+            })
+            .Where(x => x.Adet != 0m)
+            .OrderBy(x => x.Ad)
+            .ThenBy(x => x.Tip)
+            .ToList();
+
+        return Ok(new SupplierFinanceDto(doviz, sonIslemler, ziynet));
     }
 
     [HttpPost]
@@ -546,6 +579,13 @@ public class SuppliersController : ControllerBase
         if (txType == "BALANCE_CONVERSION")
             return $"{x.SourceAmount:N4} {srcU} => {x.TargetAmount:N4} {tgtU}";
 
+        if (txType == "ZIYNET")
+        {
+            var ziynetAmt = x.TargetAmount;
+            var ziynetSign = ziynetAmt >= 0m ? "+" : "-";
+            return $"{ziynetSign}{Math.Abs(ziynetAmt):N4} {tgtU}";
+        }
+
         var sign = txType == "PAYMENT" ? "-" : "+";
         if (x.IsConverted && !string.Equals(srcU, tgtU, StringComparison.OrdinalIgnoreCase))
         {
@@ -571,6 +611,38 @@ public class SuppliersController : ControllerBase
         if (txType == "BALANCE_CONVERSION") return "Bakiye Dönüştürme";
         if (txType == "PAYMENT") return "Ödeme";
         if (txType == "COLLECTION") return "Tahsilat";
+        if (txType == "ZIYNET") return "Ziynet";
         return "Finans";
+    }
+
+    private sealed record SupplierZiynetMove(string Ad, string Tip, decimal Adet);
+
+    private static SupplierZiynetMove? TryParseZiynetMove(SupplierTransaction tx)
+    {
+        var desc = (tx.Description ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(desc)) return null;
+        if (!desc.Contains("[ZIYNET]|", StringComparison.OrdinalIgnoreCase)) return null;
+
+        string ad = "";
+        string tip = "Yeni";
+        decimal adet = 0m;
+        var parts = desc.Split('|', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var rawPart in parts)
+        {
+            var part = rawPart.Trim();
+            if (part.StartsWith("AD=", StringComparison.OrdinalIgnoreCase))
+                ad = part.Substring(3).Trim();
+            else if (part.StartsWith("TIP=", StringComparison.OrdinalIgnoreCase))
+                tip = part.Substring(4).Trim();
+            else if (part.StartsWith("ADET=", StringComparison.OrdinalIgnoreCase))
+                decimal.TryParse(part.Substring(5).Trim().Replace(",", "."), NumberStyles.Any, CultureInfo.InvariantCulture, out adet);
+        }
+
+        if (adet == 0m)
+            adet = tx.TargetAmount;
+
+        if (string.IsNullOrWhiteSpace(ad) || adet == 0m)
+            return null;
+        return new SupplierZiynetMove(ad, string.IsNullOrWhiteSpace(tip) ? "Yeni" : tip, adet);
     }
 }

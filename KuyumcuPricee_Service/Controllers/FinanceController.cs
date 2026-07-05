@@ -4,6 +4,7 @@ using System.Text;
 using kuyumcu_domain.Entities;
 using kuyumcu_domain.Enums;
 using kuyumcu_infrastructure.Persistence;
+using KUYUMCU.Price_Service.Persistence;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -215,7 +216,7 @@ public sealed class FinanceController : ControllerBase
                 Has = g.Sum(x => x.Balance.BalanceHAS)
             })
             .FirstOrDefaultAsync(ct);
-        var customerBal = await BuildCustomerCompositeBalanceAsync(
+        var customerBalComposite = await BuildCustomerCompositeBalanceAsync(
             tenantId,
             branchId,
             customerBalRaw?.Tl ?? 0m,
@@ -241,13 +242,54 @@ public sealed class FinanceController : ControllerBase
             .Where(x =>
                 !branchId.HasValue || branchId == Guid.Empty ||
                 x.BranchId == branchId.Value)
-            .Select(x => new { x.GroupCode, x.ItemName, x.Direction, x.Quantity })
+            .Select(x => new
+            {
+                x.GroupCode,
+                x.ItemName,
+                x.ItemType,
+                x.Direction,
+                x.Quantity,
+                x.HasEquivalent,
+                x.CariDurum
+            })
             .ToListAsync(ct);
         var customerGumus = customerGumusRows
             .Where(x =>
                 string.Equals((x.GroupCode ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase) &&
                 string.Equals((x.ItemName ?? "").Trim(), "GUMUS", StringComparison.OrdinalIgnoreCase))
             .Sum(x => x.Direction >= 0 ? x.Quantity : -x.Quantity);
+
+        var customerTxSlices = customerGumusRows
+            .Select(x => new CustomerPanelFinanceHelper.CustomerTxSlice(
+                x.GroupCode ?? "",
+                x.ItemName ?? "",
+                x.ItemType,
+                x.Quantity,
+                x.Direction,
+                x.HasEquivalent,
+                x.CariDurum))
+            .ToList();
+        var customerPanelHasGold = CustomerPanelFinanceHelper.ComputeAltinHasToplamBakiye(
+            customerBalRaw?.Has ?? 0m,
+            customerTxSlices);
+
+        var supplierZiynetRows = await _db.SupplierTransactions.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && !x.IsDeleted)
+            .Where(x =>
+                !branchId.HasValue || branchId == Guid.Empty ||
+                x.BranchId == branchId.Value)
+            .Where(x => x.TxType == "ZIYNET" ||
+                        (x.Description != null && x.Description.Contains("[ZIYNET]|")))
+            .Select(x => new { x.Description, x.TargetAmount })
+            .ToListAsync(ct);
+        var supplierZiynetSlices = supplierZiynetRows
+            .Select(x => SupplierPanelFinanceHelper.TryParseZiynetMove(x.Description, x.TargetAmount))
+            .Where(x => x is not null)
+            .Select(x => x!)
+            .ToList();
+        var supplierPanelHasGold = SupplierPanelFinanceHelper.ComputeAltinHasToplamBakiye(
+            supplierBal?.Has ?? 0m,
+            supplierZiynetSlices);
 
         // --- Altın HAS (fine gold): Stok/Depo ile aynı milyem; gümüş satırları/ürünleri bu toplamlara girmez. ---
         // Havuz hammadde: satır toplam gram × milyem (yalnızca altın; gümüş havuz satırları ayrı SilverInventoryGrams'ta).
@@ -303,28 +345,31 @@ public sealed class FinanceController : ControllerBase
         // "Toplam HAS Envanteri" paneli: yalnızca altın (ürün stoğu HAS + hurda altın HAS).
         var totalHasInventory = productHasTotal + scrapHas;
 
-        var customerTl = customerBal.Tl;
-        var customerUsd = customerBal.Usd;
-        var customerEur = customerBal.Eur;
+        var customerTlComposite = customerBalComposite.Tl;
+        var customerUsd = customerBalRaw?.Usd ?? 0m;
+        var customerEur = customerBalRaw?.Eur ?? 0m;
         var customerGbp = customerBalRaw?.Gbp ?? 0m;
         var customerGumusBal = customerGumus;
-        var customerHas = customerBal.Has;
+        var customerTlPanel = customerBalRaw?.Tl ?? 0m;
+        var customerHasPanel = customerPanelHasGold;
+        var customerHasForNet = customerBalComposite.Has;
 
-        var supplierTl = supplierBal?.Tl ?? 0m;
-        var supplierUsd = supplierBal?.Usd ?? 0m;
-        var supplierEur = supplierBal?.Eur ?? 0m;
-        var supplierGbp = supplierBal?.Gbp ?? 0m;
-        var supplierGumusBal = supplierBal?.Gumus ?? 0m;
-        var supplierHas = supplierBal?.Has ?? 0m;
+        var supplierTlPanel = supplierBal?.Tl ?? 0m;
+        var supplierUsdPanel = supplierBal?.Usd ?? 0m;
+        var supplierEurPanel = supplierBal?.Eur ?? 0m;
+        var supplierGbpPanel = supplierBal?.Gbp ?? 0m;
+        var supplierGumusPanel = supplierBal?.Gumus ?? 0m;
+        var supplierHasPanel = supplierPanelHasGold;
+        var supplierHasForNet = supplierBal?.Has ?? 0m;
 
-        var netTl = cashTl + customerTl + supplierTl;
-        var netUsd = cashUsd + customerUsd + supplierUsd;
-        var netEur = cashEur + customerEur + supplierEur;
-        var netGbp = cashGbp + customerGbp + supplierGbp;
-        var netGumus = cashGumus + customerGumusBal + supplierGumusBal;
+        var netTl = cashTl + customerTlComposite + supplierTlPanel;
+        var netUsd = cashUsd + customerUsd + supplierUsdPanel;
+        var netEur = cashEur + customerEur + supplierEurPanel;
+        var netGbp = cashGbp + customerGbp + supplierGbpPanel;
+        var netGumus = cashGumus + customerGumusBal + supplierGumusPanel;
         // Net HAS (altın): kasa HAS + yalnızca altın stok HAS (hammadde + ziynet + hurda; gümüş yok) + cari/tedarikçi HAS.
         // Gümüş envanter gramı ProductHas/NetHas'a karışmaz; SilverInventoryGrams altında ayrı.
-        var netHas = cashHas + altinHammaddeHasToplam + altinZiynetHas + scrapHas + customerHas + supplierHas;
+        var netHas = cashHas + altinHammaddeHasToplam + altinZiynetHas + scrapHas + customerHasForNet + supplierHasForNet;
 
         var dayEndQ = _db.DayEndReports.AsNoTracking()
             .Where(x => x.TenantId == tenantId && !x.IsDeleted);
@@ -381,8 +426,8 @@ public sealed class FinanceController : ControllerBase
             NetAssets = new
             {
                 Cash = new { Tl = cashTl, Usd = cashUsd, Eur = cashEur, Gbp = cashGbp, Has = cashHas, Gumus = cashGumus },
-                CustomerBalance = new { Tl = customerTl, Usd = customerUsd, Eur = customerEur, Gbp = customerGbp, Has = customerHas, Gumus = customerGumusBal },
-                SupplierBalance = new { Tl = supplierTl, Usd = supplierUsd, Eur = supplierEur, Gbp = supplierGbp, Has = supplierHas, Gumus = supplierGumusBal },
+                CustomerBalance = new { Tl = customerTlPanel, Usd = customerUsd, Eur = customerEur, Gbp = customerGbp, Has = customerHasPanel, Gumus = customerGumusBal },
+                SupplierBalance = new { Tl = supplierTlPanel, Usd = supplierUsdPanel, Eur = supplierEurPanel, Gbp = supplierGbpPanel, Has = supplierHasPanel, Gumus = supplierGumusPanel },
                 ProductHas = productHasTotal,
                 ScrapHas = scrapHas,
                 TotalHasInventory = totalHasInventory,
@@ -745,7 +790,8 @@ public sealed class FinanceController : ControllerBase
                     // Kasa ekranını kırmamak için liste endpoint'inde RefId materialize etmiyoruz.
                     RefId = null,
                     Description = x.Description,
-                    AccountName = x.CashAccount.Name
+                    AccountName = x.CashAccount.Name,
+                    Kullanici = x.KullaniciAdi
                 })
                 .ToListAsync(ct);
         }
@@ -967,6 +1013,7 @@ public sealed class FinanceController : ControllerBase
             merged = merged
                 .Where(x => !IsHasOrSilverCurrency(x.Currency))
                 .ToList();
+
         var total = merged.Count;
         var items = merged
             .Skip((page - 1) * pageSize)
@@ -1254,7 +1301,8 @@ public sealed class FinanceController : ControllerBase
                     RefType = tx.RefType,
                     RefId = null,
                     Description = tx.Description,
-                    AccountName = acc != null ? acc.Name : null
+                    AccountName = acc != null ? acc.Name : null,
+                    Kullanici = tx.KullaniciAdi
                 };
 
             var rows = await q
@@ -1795,6 +1843,10 @@ public sealed class FinanceController : ControllerBase
         public bool IsZiynet { get; set; }
         public bool IsForex { get; set; }
         public bool IsSilver { get; set; }
+        /// <summary>Teslim durumu: "Teslim edildi", "Teslim edilmedi" veya "" (alış vb. için boş).</summary>
+        public string Durum { get; set; } = "";
+        /// <summary>İşlemi yapan kullanıcı (Ad Soyad / kullanıcı adı).</summary>
+        public string Kullanici { get; set; } = "";
     }
 
     private static (DateTime StartInclusive, DateTime EndExclusive) NormalizeDateRangeInclusive(DateTime? from, DateTime? to)
@@ -1839,6 +1891,8 @@ public sealed class FinanceController : ControllerBase
                 i.SaleId,
                 i.LineNo,
                 s.PaymentType,
+                s.DeliveryType,
+                s.UserId,
                 CustomerName = s.Customer != null ? s.Customer.FullName : "",
                 i.ProductCode,
                 i.ProductName,
@@ -1857,7 +1911,6 @@ public sealed class FinanceController : ControllerBase
                         && x.TxDate < tExclusive
                         && (x.GroupCode ?? "").Trim().ToUpper() == "ZIYNET"
                         && (x.RefType ?? "").Trim().ToUpper() == "SALE"
-                        && (x.CariDurum ?? "").Trim().ToUpper() == "EMANET"
                         && x.RefId == null)
             .Where(x => !branchId.HasValue || branchId.Value == Guid.Empty || x.BranchId == branchId.Value)
             .Join(
@@ -1874,6 +1927,7 @@ public sealed class FinanceController : ControllerBase
                     tx.UnitPriceTl,
                     tx.TotalPriceTl,
                     tx.HasEquivalent,
+                    tx.KullaniciAdi,
                     CustomerName = c.FullName
                 })
             .ToListAsync(ct);
@@ -1954,9 +2008,18 @@ public sealed class FinanceController : ControllerBase
                 x.PartnerName,
                 x.GrandTotal,
                 x.PurchaseType,
-                x.PaymentMethod
+                x.PaymentMethod,
+                x.UserId
             })
             .ToListAsync(ct);
+
+        var splUserIds = lines.Select(l => l.UserId)
+            .Concat(purchases.Select(p => p.UserId))
+            .Where(g => g != Guid.Empty)
+            .Distinct()
+            .ToList();
+        var splUserNames = await UserDisplayNames.BuildUserNameMapAsync(_db, tenantId, splUserIds, ct);
+        string ResolveSplUser(Guid uid) => splUserNames.TryGetValue(uid, out var n) ? n : "";
 
         var purchaseItems = purchases.Count == 0
             ? new List<PurchaseItemReportRow>()
@@ -2078,12 +2141,16 @@ public sealed class FinanceController : ControllerBase
                 x.Category,
                 meta?.Olcu,
                 x.Karat);
+            var durum = string.Equals((x.DeliveryType ?? "").Trim(), "EMANET", StringComparison.OrdinalIgnoreCase)
+                ? "Teslim edilmedi"
+                : "Teslim edildi";
             return new SalesPurchaseReportRow
             {
                 Date = x.SaleDate,
                 Type = "Satis",
                 MovementKind = "Satış",
                 MovementSegment = movementSegment,
+                Durum = durum,
                 PaymentMethod = paymentMethod,
                 RefNo = x.SaleId.ToString(),
                 ProductCode = x.ProductCode ?? "",
@@ -2108,7 +2175,8 @@ public sealed class FinanceController : ControllerBase
                 IsSpecialProduct = isSpecial,
                 IsZiynet = isZiynet,
                 IsForex = isForex,
-                IsSilver = isSilver
+                IsSilver = isSilver,
+                Kullanici = ResolveSplUser(x.UserId)
             };
         }).ToList();
 
@@ -2141,6 +2209,7 @@ public sealed class FinanceController : ControllerBase
                     Type = "Satis",
                     MovementKind = "Satış",
                     MovementSegment = "Ziynet",
+                    Durum = "Teslim edilmedi",
                     PaymentMethod = "Emanet",
                     RefNo = x.Id.ToString(),
                     ProductCode = "ZIYNET-EMANET",
@@ -2165,7 +2234,8 @@ public sealed class FinanceController : ControllerBase
                     IsSpecialProduct = false,
                     IsZiynet = true,
                     IsForex = false,
-                    IsSilver = false
+                    IsSilver = false,
+                    Kullanici = x.KullaniciAdi ?? ""
                 };
             })
             .ToList();
@@ -2217,7 +2287,8 @@ public sealed class FinanceController : ControllerBase
                 IsSpecialProduct = false,
                 IsZiynet = false,
                 IsForex = false,
-                IsSilver = false
+                IsSilver = false,
+                Kullanici = ResolveSplUser(x.UserId)
             };
         }).ToList();
 
@@ -2227,6 +2298,7 @@ public sealed class FinanceController : ControllerBase
                 x.Type,
                 x.MovementKind,
                 x.MovementSegment,
+                x.Durum,
                 x.PaymentMethod,
                 x.RefNo,
                 x.ProductCode,
@@ -2560,6 +2632,31 @@ public sealed class FinanceController : ControllerBase
     }
 
     public sealed record CloseDayReq(Guid BranchId, DateTime? BusinessDate = null);
+
+    /// <summary>Seçili şube + iş günü için gün sonunun kapatılıp kapatılmadığını döndürür (kapanış bakiyeleriyle).</summary>
+    [HttpGet("dayend/status")]
+    public async Task<IActionResult> DayEndStatus([FromQuery] Guid branchId, [FromQuery] DateTime? businessDate, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (branchId == Guid.Empty) return BadRequest(new { error = "BranchId zorunludur." });
+        var day = (businessDate ?? DateTime.UtcNow).Date;
+
+        var row = await _db.DayEndReports.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && x.BusinessDate == day && !x.IsDeleted)
+            .OrderByDescending(x => x.CreatedAt)
+            .FirstOrDefaultAsync(ct);
+
+        return Ok(new
+        {
+            closed = row != null,
+            id = row?.Id,
+            businessDate = day,
+            closingTl = row?.ClosingTl ?? 0m,
+            closingUsd = row?.ClosingUsd ?? 0m,
+            closingEur = row?.ClosingEur ?? 0m,
+            closingHas = row?.ClosingHas ?? 0m
+        });
+    }
 
     [HttpPost("dayend/close")]
     public async Task<IActionResult> CloseDay([FromBody] CloseDayReq req, CancellationToken ct = default)
@@ -3382,6 +3479,7 @@ public sealed class FinanceController : ControllerBase
         public Guid? RefId { get; set; }
         public string? Description { get; set; }
         public string? AccountName { get; set; }
+        public string? Kullanici { get; set; }
     }
 }
 

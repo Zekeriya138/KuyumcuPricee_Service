@@ -44,5 +44,8 @@ namespace kuyumcu_domain.Entities
 
         /// <summary>Saat vb. özel ürün işareti. Bu ürünler satışta parça/adet bazında yönetilir.</summary>
         public bool IsSpecialProduct { get; set; }
+
+        /// <summary>Ürün fotoğrafı (opsiyonel, tek görsel). JPEG baytları olarak saklanır.</summary>
+        public byte[]? Image { get; set; }
     }
 }
