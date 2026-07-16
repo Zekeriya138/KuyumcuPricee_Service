@@ -59,7 +59,8 @@ public static class CustomerPanelFinanceHelper
     public static decimal SumZiynetNetHas(IEnumerable<CustomerTxSlice> transactions)
     {
         return transactions
-            .Where(x => string.Equals(x.GroupCode, "ZIYNET", StringComparison.OrdinalIgnoreCase))
+            .Where(x => string.Equals(x.GroupCode, "ZIYNET", StringComparison.OrdinalIgnoreCase)
+                        && !CustomerFinanceHelper.IsHasAltinZiynetAd(x.ItemName))
             .GroupBy(x => new
             {
                 ItemName = x.ItemName ?? "",

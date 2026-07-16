@@ -88,6 +88,55 @@ public sealed class ScrapService : IScrapService
         CancellationToken ct = default)
         => TrySubtractScrapAsync(tenantId, branchId, karatRaw, weightGram, ScrapLedgerType.ConvertToProductOut, purchaseId, note, ct);
 
+    public async Task EnsureScrapStockFromPurchaseItemAsync(
+        Guid tenantId,
+        Guid branchId,
+        PurchaseItem purchaseItem,
+        CancellationToken ct = default)
+    {
+        if (purchaseItem.Kind != ItemKind.Scrap || purchaseItem.Quantity <= 0m) return;
+
+        var karatKey = ScrapPureGoldCalculator.NormalizeKaratKey(purchaseItem.Karat);
+        if (string.IsNullOrEmpty(karatKey)) return;
+
+        var purchaseId = purchaseItem.PurchaseId;
+        if (purchaseId == Guid.Empty) return;
+
+        var hasLedger = await _db.ScrapLedgers.AsNoTracking()
+            .AnyAsync(x =>
+                x.TenantId == tenantId
+                && x.BranchId == branchId
+                && x.PurchaseId == purchaseId
+                && x.Karat == karatKey
+                && x.Kind == ScrapLedgerKind.PurchaseIn, ct);
+        if (hasLedger) return;
+
+        var pure = ScrapPureGoldCalculator.ComputePureGoldGrams(purchaseItem.Quantity, purchaseItem.Karat);
+        var amountTl = purchaseItem.LineTotal > 0m
+            ? Math.Round(purchaseItem.LineTotal, 2, MidpointRounding.AwayFromZero)
+            : (decimal?)null;
+
+        Guid? customerId = null;
+        if (purchaseItem.Purchase != null)
+            customerId = purchaseItem.Purchase.CustomerId;
+
+        await UpsertAddAsync(
+            tenantId,
+            branchId,
+            karatKey,
+            purchaseItem.Quantity,
+            pure,
+            ScrapLedgerType.CustomerPurchase,
+            customerId,
+            purchaseId,
+            amountTl,
+            null,
+            $"Hurda alis satir L{purchaseItem.LineNo} (gecikmeli stok)",
+            ct);
+
+        await _db.SaveChangesAsync(ct);
+    }
+
     public async Task<(bool ok, Guid? purchaseId, string? error)> RecordCustomerScrapPurchaseAsync(
         Guid tenantId,
         Guid branchId,

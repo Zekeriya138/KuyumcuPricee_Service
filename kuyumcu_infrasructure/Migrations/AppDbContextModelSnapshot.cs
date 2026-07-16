@@ -176,6 +176,13 @@ namespace kuyumcu_infrasructure.Migrations
                     b.Property<bool>("IsDeleted")
                         .HasColumnType("bit");
 
+                    b.Property<Guid?>("OwnerId")
+                        .HasColumnType("uniqueidentifier");
+
+                    b.Property<string>("OwnerType")
+                        .HasMaxLength(32)
+                        .HasColumnType("nvarchar(32)");
+
                     b.Property<Guid>("TenantId")
                         .HasColumnType("uniqueidentifier");
 
@@ -197,6 +204,8 @@ namespace kuyumcu_infrasructure.Migrations
                     b.HasIndex("UserId");
 
                     b.HasIndex("TenantId", "BranchId", "UpdatedAt");
+
+                    b.HasIndex("TenantId", "BranchId", "OwnerType", "OwnerId");
 
                     b.ToTable("BranchNotes", (string)null);
                 });
@@ -1321,7 +1330,7 @@ namespace kuyumcu_infrasructure.Migrations
                     b.HasIndex("TenantId", "BranchId", "ProductCode")
                         .IsUnique();
 
-                    b.ToTable("Products");
+                    b.ToTable("Products", (string)null);
                 });
 
             modelBuilder.Entity("kuyumcu_domain.Entities.ProductItem", b =>
@@ -1467,7 +1476,7 @@ namespace kuyumcu_infrasructure.Migrations
 
                     b.HasIndex("UserId");
 
-                    b.ToTable("Purchases");
+                    b.ToTable("Purchases", (string)null);
                 });
 
             modelBuilder.Entity("kuyumcu_domain.Entities.PurchaseItem", b =>
@@ -1539,7 +1548,7 @@ namespace kuyumcu_infrasructure.Migrations
                     b.HasIndex("PurchaseId", "LineNo")
                         .IsUnique();
 
-                    b.ToTable("PurchaseItems");
+                    b.ToTable("PurchaseItems", (string)null);
                 });
 
             modelBuilder.Entity("kuyumcu_domain.Entities.PurchasePayment", b =>
@@ -1772,7 +1781,7 @@ namespace kuyumcu_infrasructure.Migrations
                     b.HasIndex("SaleId", "LineNo")
                         .IsUnique();
 
-                    b.ToTable("SaleItems");
+                    b.ToTable("SaleItems", (string)null);
                 });
 
             modelBuilder.Entity("kuyumcu_domain.Entities.SalePayment", b =>

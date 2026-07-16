@@ -15,11 +15,13 @@ public sealed class SupplierTransactionsController : ControllerBase
 {
     private readonly AppDbContext _db;
     private readonly ExchangeRateService _rates;
+    private readonly TransactionReversalService _reversal;
 
-    public SupplierTransactionsController(AppDbContext db, ExchangeRateService rates)
+    public SupplierTransactionsController(AppDbContext db, ExchangeRateService rates, TransactionReversalService reversal)
     {
         _db = db;
         _rates = rates;
+        _reversal = reversal;
     }
 
     public sealed record CreateSupplierTransactionReq(
@@ -38,7 +40,9 @@ public sealed class SupplierTransactionsController : ControllerBase
         DateTime? TxDate,
         decimal? SourceUnitTlRate = null,
         decimal? TargetUnitTlRate = null,
-        decimal? TargetAmount = null);
+        decimal? TargetAmount = null,
+        List<ZiynetUrunStokReq>? ZiynetUrunStokItems = null,
+        string? SourceLedgerSide = null);
     public sealed record OpeningBalanceReq(string Unit, decimal Amount);
     public sealed record ZiynetSettlementReq(string Ad, string Tip, decimal Adet, string? CariDurum);
 
@@ -74,6 +78,11 @@ public sealed class SupplierTransactionsController : ControllerBase
         var txType = NormalizeTxType(req.TxType);
         if (txType is null)
             return BadRequest(new { error = "TxType PAYMENT/COLLECTION/OPENING_BALANCE/BALANCE_CONVERSION olmalıdır." });
+
+        var effectiveDescription = ZiynetUrunStokMarker.AppendDescription(
+            req.Description,
+            ZiynetUrunStokMarker.FromReqItems(req.ZiynetUrunStokItems));
+        req = req with { Description = effectiveDescription };
 
         var hasZiynetSettlement = txType == "PAYMENT" && req.ZiynetItems is { Count: > 0 };
         if (txType != "OPENING_BALANCE" && req.SourceAmount <= 0 && !hasZiynetSettlement)
@@ -120,6 +129,7 @@ public sealed class SupplierTransactionsController : ControllerBase
             }
 
             var txDate = req.TxDate?.ToUniversalTime() ?? DateTime.UtcNow;
+            var batchId = Guid.NewGuid();
             SupplierTransaction? lastEntity = null;
             var lastEntityAdded = false;
             if (txType == "OPENING_BALANCE")
@@ -150,7 +160,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                         SourceUnitTlRate = 1m,
                         TargetUnitTlRate = 1m,
                         Description = string.IsNullOrWhiteSpace(req.Description) ? "Açılış bakiye girişi" : req.Description.Trim(),
-                        TxDate = txDate
+                        TxDate = txDate,
+                        BatchId = batchId
                     };
                     _db.SupplierTransactions.Add(lastEntity);
                 }
@@ -183,7 +194,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                             SourceUnitTlRate = 1m,
                             TargetUnitTlRate = 1m,
                             Description = string.IsNullOrWhiteSpace(req.Description) ? "Açılış bakiye girişi (HAS)" : req.Description.Trim(),
-                            TxDate = txDate
+                            TxDate = txDate,
+                            BatchId = batchId
                         };
                         _db.SupplierTransactions.Add(lastEntity);
                         continue;
@@ -203,7 +215,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                         SourceUnitTlRate = 1m,
                         TargetUnitTlRate = 1m,
                         Description = BuildSupplierZiynetDescription(ad, tip, signed, "OPENING_BALANCE"),
-                        TxDate = txDate
+                        TxDate = txDate,
+                        BatchId = batchId
                     };
                     _db.SupplierTransactions.Add(lastEntity);
                 }
@@ -221,7 +234,12 @@ public sealed class SupplierTransactionsController : ControllerBase
                 var sourceBalance = srcU.IsZiynet
                     ? await GetSupplierZiynetNetAsync(tenantId, supplier.Id, branchId, srcU.ZiynetAd, srcU.ZiynetTip, ct)
                     : GetBalanceByUnit(bal, srcU.CurrencyUnit);
-                var (useBuySrc, useBuyTgt) = BalanceConversionZiynetHelper.ResolveRateSides(isSupplier: true, sourceBalance);
+                var ledgerSide = CustomerFinanceHelper.NormalizeLedgerSide(req.SourceLedgerSide);
+                if (string.IsNullOrEmpty(ledgerSide))
+                    ledgerSide = sourceBalance < 0m ? CustomerFinanceHelper.LedgerBorc : CustomerFinanceHelper.LedgerAlacak;
+                var (useBuySrc, useBuyTgt) = CustomerFinanceHelper.IsLedgerAlacak(ledgerSide)
+                    ? (true, false)
+                    : (false, true);
 
                 var srcRate = req.SourceUnitTlRate is > 0m
                     ? req.SourceUnitTlRate.Value
@@ -241,15 +259,12 @@ public sealed class SupplierTransactionsController : ControllerBase
                     ? decimal.Round(req.TargetAmount.Value, 6, MidpointRounding.AwayFromZero)
                     : decimal.Round((srcAmt * srcRate) / tgtRate, 6, MidpointRounding.AwayFromZero);
 
-                // Bakiye dönüşümünde yön birim-1 (kaynak) işaretine göre belirlenir.
-                // kaynak eksi ise: kaynak (+), hedef (-); kaynak artı/0 ise: kaynak (-), hedef (+)
-                var sourceIsNegative = sourceBalance < 0m;
-                var srcDelta = sourceIsNegative ? +srcAmt : -srcAmt;
-                var tgtDelta = sourceIsNegative ? -tgtAmt : +tgtAmt;
+                var srcDelta = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, srcAmt).BalanceDelta;
+                var tgtDelta = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, tgtAmt).BalanceDelta;
                 var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
 
-                ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate);
-                lastEntity = ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate);
+                ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate, batchId);
+                lastEntity = ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate, batchId);
                 lastEntityAdded = true;
             }
             else
@@ -271,9 +286,10 @@ public sealed class SupplierTransactionsController : ControllerBase
                     SourceUnitTlRate = sourceTlRate,
                     TargetUnitTlRate = targetTlRate,
                     Description = string.IsNullOrWhiteSpace(req.Description) ? null : req.Description.Trim(),
-                    TxDate = txDate
+                    TxDate = txDate,
+                    BatchId = batchId
                 };
-                await ApplyCashMovementAsync(req, tenantId, branchId, txType, sourceUnit, lastEntity.TxDate, supplier.Id, ct);
+                await ApplyCashMovementAsync(req, tenantId, branchId, txType, sourceUnit, lastEntity.TxDate, supplier.Id, batchId, ct);
 
                 if (txType == "PAYMENT" && req.ZiynetItems is { Count: > 0 })
                 {
@@ -304,7 +320,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                                 SourceUnitTlRate = 1m,
                                 TargetUnitTlRate = 1m,
                                 Description = $"Has altın ödemesi (SUPPLIER_PAYMENT:{supplier.Id}, Tutar: {adet.ToString("0.###", CultureInfo.InvariantCulture)} gr)",
-                                TxDate = txDate
+                                TxDate = txDate,
+                                BatchId = batchId
                             });
                             continue;
                         }
@@ -323,7 +340,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                             SourceUnitTlRate = 1m,
                             TargetUnitTlRate = 1m,
                             Description = BuildSupplierZiynetDescription(ad, tip, -adet, $"SUPPLIER_PAYMENT:{supplier.Id}"),
-                            TxDate = txDate
+                            TxDate = txDate,
+                            BatchId = batchId
                         });
                     }
                 }
@@ -336,9 +354,12 @@ public sealed class SupplierTransactionsController : ControllerBase
             await tx.CommitAsync(ct);
 
             if (lastEntity is null)
-                return Ok(new { ok = true });
+                return Ok(new { ok = true, batchId });
 
-            return Ok(new SupplierTransactionDto(
+            return Ok(new
+            {
+                batchId,
+                transaction = new SupplierTransactionDto(
                 lastEntity.Id,
                 lastEntity.SupplierId,
                 lastEntity.TxType,
@@ -350,7 +371,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                 lastEntity.SourceUnitTlRate,
                 lastEntity.TargetUnitTlRate,
                 lastEntity.Description,
-                lastEntity.TxDate));
+                lastEntity.TxDate)
+            });
         }
         catch
         {
@@ -367,6 +389,7 @@ public sealed class SupplierTransactionsController : ControllerBase
         string sourceUnit,
         DateTime txDate,
         Guid supplierId,
+        Guid batchId,
         CancellationToken ct)
     {
         var unit = NormalizeUnit(sourceUnit);
@@ -378,13 +401,13 @@ public sealed class SupplierTransactionsController : ControllerBase
         {
             await AddCashMovementAsync(
                 tenantId, branchId, unit, nakit, txType,
-                "Nakit", "TedarikciIslem", "SUPPLIER_SETTLEMENT", supplierId, txDate, ct);
+                "Nakit", "TedarikciIslem", "SUPPLIER_SETTLEMENT", supplierId, txDate, batchId, ct);
         }
         if (havale > 0m)
         {
             await AddCashMovementAsync(
                 tenantId, branchId, unit, havale, txType,
-                "Havale", "TedarikciIslem", "SUPPLIER_SETTLEMENT", supplierId, txDate, ct);
+                "Havale", "TedarikciIslem", "SUPPLIER_SETTLEMENT", supplierId, txDate, batchId, ct);
         }
     }
 
@@ -399,6 +422,7 @@ public sealed class SupplierTransactionsController : ControllerBase
         string refType,
         Guid refId,
         DateTime txDate,
+        Guid batchId,
         CancellationToken ct)
     {
         var currency = unit is "USD" or "EUR" or "GBP" or "HAS" or "GUMUS" ? unit : "TL";
@@ -446,7 +470,8 @@ public sealed class SupplierTransactionsController : ControllerBase
             RefId = refId,
             Description = isIncome
                 ? $"Tedarikçi tahsilat ({paymentMethod.ToLowerInvariant()})"
-                : $"Tedarikçi ödeme ({paymentMethod.ToLowerInvariant()})"
+                : $"Tedarikçi ödeme ({paymentMethod.ToLowerInvariant()})",
+            BatchId = batchId
         });
     }
 
@@ -599,7 +624,7 @@ public sealed class SupplierTransactionsController : ControllerBase
     private SupplierTransaction ApplySupplierConversionSide(
         SupplierBalance bal, Guid tenantId, Guid supplierId, Guid branchId,
         BalanceConversionZiynetHelper.ConversionUnit unit,
-        decimal amount, decimal delta, decimal rate, string note, DateTime txDate)
+        decimal amount, decimal delta, decimal rate, string note, DateTime txDate, Guid batchId)
     {
         SupplierTransaction entity;
         if (unit.IsZiynet)
@@ -619,7 +644,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                 SourceUnitTlRate = 1m,
                 TargetUnitTlRate = 1m,
                 Description = BuildSupplierZiynetDescription(unit.ZiynetAd, tip, delta, "BALANCE_CONVERSION"),
-                TxDate = txDate
+                TxDate = txDate,
+                BatchId = batchId
             };
         }
         else
@@ -639,7 +665,8 @@ public sealed class SupplierTransactionsController : ControllerBase
                 SourceUnitTlRate = rate,
                 TargetUnitTlRate = rate,
                 Description = note,
-                TxDate = txDate
+                TxDate = txDate,
+                BatchId = batchId
             };
         }
         _db.SupplierTransactions.Add(entity);
@@ -706,5 +733,44 @@ public sealed class SupplierTransactionsController : ControllerBase
             Guid.TryParse(hdr.ToString(), out var fromHdr))
             return fromHdr;
         throw new InvalidOperationException("BranchId missing (JWT veya X-Branch-Id).");
+    }
+
+    public sealed record ReverseReq(string Reason);
+
+    [HttpGet("{id:guid}")]
+    public async Task<IActionResult> GetDetail([FromRoute] Guid id, CancellationToken ct)
+    {
+        var tenantId = GetTenantId();
+        var tx = await _db.SupplierTransactions.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == id && x.TenantId == tenantId && !x.IsDeleted, ct);
+        if (tx is null) return NotFound();
+        var detail = await _reversal.GetSupplierDetailAsync(tenantId, tx.SupplierId, id, ct);
+        return detail is null ? NotFound() : Ok(detail);
+    }
+
+    [HttpPost("{id:guid}/reverse")]
+    public async Task<IActionResult> Reverse([FromRoute] Guid id, [FromBody] ReverseReq req, CancellationToken ct)
+    {
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+        var tx = await _db.SupplierTransactions.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == id && x.TenantId == tenantId && !x.IsDeleted, ct);
+        if (tx is null) return NotFound();
+        var (userId, userName) = ResolveUser();
+        var result = await _reversal.ReverseSupplierAsync(
+            tenantId, branchId, tx.SupplierId, id, req.Reason ?? "", userId, userName, ct);
+        if (!result.Ok) return BadRequest(new { error = result.Error });
+        return Ok(new { ok = true, reversalLogId = result.ReversalLogId, batchId = result.BatchId });
+    }
+
+    private (Guid? userId, string? userName) ResolveUser()
+    {
+        var claim = User?.Claims?.FirstOrDefault(c =>
+            c.Type.Equals(System.Security.Claims.ClaimTypes.NameIdentifier, StringComparison.OrdinalIgnoreCase) ||
+            c.Type.Equals("sub", StringComparison.OrdinalIgnoreCase))?.Value;
+        Guid? userId = Guid.TryParse(claim, out var g) ? g : null;
+        var name = User?.Claims?.FirstOrDefault(c => c.Type.Equals("full_name", StringComparison.OrdinalIgnoreCase))?.Value
+                   ?? User?.Identity?.Name;
+        return (userId, name);
     }
 }

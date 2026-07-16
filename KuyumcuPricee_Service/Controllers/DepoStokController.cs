@@ -65,7 +65,7 @@ public class DepoStokController : ControllerBase
 
         var tenantId = GetTenantId();
         var list = await _db.DepoStokHavuzlar.AsNoTracking()
-            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted)
+            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted && x.TotalGram > 0.0001m)
             .OrderBy(x => x.TedarikciFirmaNorm)
             .ThenBy(x => x.Ayar)
             .ThenBy(x => x.MalTanimNorm)
@@ -274,15 +274,11 @@ public class DepoStokController : ControllerBase
         if (string.IsNullOrEmpty(ay) || string.IsNullOrEmpty(malN) || string.IsNullOrEmpty(firmaN))
             return Ok(new DepoStokHavuzDto(Guid.Empty, ay ?? "", malN, firmaN, birim, 0, 0, 0));
 
-        var row = await _db.DepoStokHavuzlar.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
-                && x.Ayar == ay && x.MalTanimNorm == malN && x.TedarikciFirmaNorm == firmaN && x.BirimMaliyet == birim, ct);
+        var row = await DepoStokTripleHelper.FindHavuzRowAsync(_db, tenantId, branchId, ay, malN, firmaN, birim, ct);
         if (row is null)
         {
             await DepoStokTripleHelper.TryEnsureHavuzRowFromPurchasesAsync(_db, tenantId, branchId, ay, malN, firmaN, birim, ct);
-            row = await _db.DepoStokHavuzlar.AsNoTracking()
-                .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
-                    && x.Ayar == ay && x.MalTanimNorm == malN && x.TedarikciFirmaNorm == firmaN && x.BirimMaliyet == birim, ct);
+            row = await DepoStokTripleHelper.FindHavuzRowAsync(_db, tenantId, branchId, ay, malN, firmaN, birim, ct);
         }
         if (row is null)
             return Ok(new DepoStokHavuzDto(Guid.Empty, ay, malN, firmaN, birim, 0, 0, 0));
@@ -307,9 +303,8 @@ public class DepoStokController : ControllerBase
 
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         // Mevcut havuz satırını güncelle; barkodlama ile yeni DepoStokHavuz satırı eklenmez.
-        var havuz = await _db.DepoStokHavuzlar
-            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted
-                && x.Ayar == ay && x.MalTanimNorm == malN && x.TedarikciFirmaNorm == firmaN && x.BirimMaliyet == birim, ct);
+        var havuz = await DepoStokTripleHelper.FindHavuzRowAsync(
+            _db, tenantId, req.BranchId, ay, malN, firmaN, birim, ct, tracked: true);
 
         var depo = await _db.DepoStoklar
             .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == req.BranchId && x.Ayar == ay && !x.IsDeleted, ct);
@@ -538,5 +533,171 @@ public class DepoStokController : ControllerBase
 
         await _db.SaveChangesAsync(ct);
         return Ok(created);
+    }
+
+    public record DepoWithdrawHavuzReq(
+        Guid BranchId,
+        Guid? HavuzId,
+        string Ayar,
+        string MalTanim,
+        string TedarikciFirma,
+        decimal BirimMaliyet,
+        decimal Gram,
+        bool FromBarcoded,
+        string? Note);
+
+    /// <summary>Stok/Depo hammadde sekmesinden manuel çıkış — barkodlu veya barkodsuz havuzdan düşer.</summary>
+    [HttpPost("withdraw-havuz")]
+    public async Task<IActionResult> WithdrawHavuz([FromBody] DepoWithdrawHavuzReq req, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (req.BranchId == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+        if (req.Gram <= 0)
+            return BadRequest(new { error = "Gram 0'dan büyük olmalı." });
+
+        var ay = DepoStokTripleHelper.NormalizeAyarKarat(req.Ayar);
+        var malN = DepoStokTripleHelper.NormalizeMal(req.MalTanim);
+        var firmaN = DepoStokTripleHelper.NormalizeFirma(req.TedarikciFirma);
+        var birim = DepoStokTripleHelper.RoundBirimMaliyet(req.BirimMaliyet);
+        if (string.IsNullOrEmpty(ay) || string.IsNullOrEmpty(malN) || string.IsNullOrEmpty(firmaN))
+            return BadRequest(new { error = "Ayar, mal tanımı ve tedarikçi zorunludur." });
+
+        await using var tx = await _db.Database.BeginTransactionAsync(ct);
+
+        DepoStokHavuz? havuz = null;
+        if (req.HavuzId.HasValue && req.HavuzId.Value != Guid.Empty)
+        {
+            havuz = await _db.DepoStokHavuzlar
+                .FirstOrDefaultAsync(x => x.Id == req.HavuzId.Value && x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted, ct);
+        }
+
+        havuz ??= await _db.DepoStokHavuzlar
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted
+                && x.Ayar == ay && x.MalTanimNorm == malN && x.TedarikciFirmaNorm == firmaN && x.BirimMaliyet == birim, ct);
+        if (havuz is null)
+        {
+            await tx.RollbackAsync(ct);
+            return BadRequest(new { error = "Havuz satırı bulunamadı." });
+        }
+
+        var depo = await _db.DepoStoklar
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == req.BranchId && x.Ayar == ay && !x.IsDeleted, ct);
+        if (depo is null)
+        {
+            await tx.RollbackAsync(ct);
+            return BadRequest(new { error = "Ayar deposu bulunamadı." });
+        }
+
+        var gram = Math.Round(req.Gram, 4, MidpointRounding.AwayFromZero);
+        if (req.FromBarcoded)
+        {
+            if (havuz.BarcodedGram < gram - 0.0001m || depo.BarcodedGram < gram - 0.0001m)
+            {
+                await tx.RollbackAsync(ct);
+                return BadRequest(new { error = $"Yetersiz barkodlu gram. İstenen: {gram:0.###}, Barkodlu: {havuz.BarcodedGram:0.###} g" });
+            }
+            if (!havuz.OnBarcodedProductSold(gram) || !depo.OnBarcodedProductSold(gram))
+            {
+                await tx.RollbackAsync(ct);
+                return BadRequest(new { error = "Barkodlu çıkış işlemi tamamlanamadı." });
+            }
+        }
+        else
+        {
+            if (havuz.UnbarcodedGram < gram - 0.0001m || depo.UnbarcodedGram < gram - 0.0001m)
+            {
+                await tx.RollbackAsync(ct);
+                return BadRequest(new { error = $"Yetersiz barkodsuz gram. İstenen: {gram:0.###}, Barkodsuz: {havuz.UnbarcodedGram:0.###} g" });
+            }
+            if (!havuz.WithdrawUnbarcoded(gram) || !depo.WithdrawUnbarcoded(gram))
+            {
+                await tx.RollbackAsync(ct);
+                return BadRequest(new { error = "Barkodsuz çıkış işlemi tamamlanamadı." });
+            }
+        }
+
+        if (havuz.TotalGram <= 0.0001m)
+        {
+            havuz.TotalGram = 0;
+            havuz.BarcodedGram = 0;
+            havuz.UnbarcodedGram = 0;
+            havuz.IsDeleted = true;
+        }
+
+        await _db.SaveChangesAsync(ct);
+        await tx.CommitAsync(ct);
+
+        return Ok(new DepoStokHavuzDto(
+            havuz.Id,
+            havuz.Ayar,
+            havuz.MalTanimNorm,
+            havuz.TedarikciFirmaNorm,
+            havuz.BirimMaliyet,
+            havuz.TotalGram,
+            havuz.BarcodedGram,
+            havuz.UnbarcodedGram));
+    }
+
+    public record DepoWithdrawGumusReq(
+        Guid BranchId,
+        Guid? LotId,
+        Guid? PurchaseItemId,
+        decimal Gram,
+        bool FromBarcoded,
+        string? Note);
+
+    /// <summary>Stok/Depo gümüş sekmesinden manuel çıkış.</summary>
+    [HttpPost("withdraw-gumus")]
+    public async Task<IActionResult> WithdrawGumus([FromBody] DepoWithdrawGumusReq req, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (req.BranchId == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+        if (req.Gram <= 0)
+            return BadRequest(new { error = "Gram 0'dan büyük olmalı." });
+        if (req.FromBarcoded)
+            return BadRequest(new { error = "Gümüş lotlarında barkodlu çıkış desteklenmiyor; barkodsuz seçin." });
+
+        var gram = Math.Round(req.Gram, 4, MidpointRounding.AwayFromZero);
+
+        if (req.LotId.HasValue && req.LotId.Value != Guid.Empty)
+        {
+            var lot = await _db.DepoGumusLots
+                .FirstOrDefaultAsync(x => x.Id == req.LotId.Value && x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted, ct);
+            if (lot is null)
+                return BadRequest(new { error = "Gümüş lot kaydı bulunamadı." });
+            if (lot.Gram < gram - 0.0001m)
+                return BadRequest(new { error = $"Yetersiz gümüş gram. İstenen: {gram:0.###}, Kalan: {lot.Gram:0.###} g" });
+
+            lot.Gram = Math.Round(lot.Gram - gram, 4, MidpointRounding.AwayFromZero);
+            if (lot.Gram <= 0.0001m)
+            {
+                lot.Gram = 0;
+                lot.IsDeleted = true;
+            }
+            if (!string.IsNullOrWhiteSpace(req.Note))
+                lot.Note = string.IsNullOrWhiteSpace(lot.Note) ? req.Note.Trim() : lot.Note + " | " + req.Note.Trim();
+
+            await _db.SaveChangesAsync(ct);
+            return Ok(new { ok = true, remainingGram = lot.IsDeleted ? 0m : lot.Gram });
+        }
+
+        if (req.PurchaseItemId.HasValue && req.PurchaseItemId.Value != Guid.Empty)
+        {
+            var pi = await _db.PurchaseItems
+                .Include(x => x.Purchase)
+                .FirstOrDefaultAsync(x => x.Id == req.PurchaseItemId.Value && x.TenantId == tenantId && !x.IsDeleted, ct);
+            if (pi?.Purchase is null || pi.Purchase.BranchId != req.BranchId)
+                return BadRequest(new { error = "Alış satırı bulunamadı." });
+            if (pi.Quantity < gram - 0.0001m)
+                return BadRequest(new { error = $"Yetersiz gümüş gram. İstenen: {gram:0.###}, Kalan: {pi.Quantity:0.###} g" });
+
+            pi.Quantity = Math.Round(pi.Quantity - gram, 4, MidpointRounding.AwayFromZero);
+            await _db.SaveChangesAsync(ct);
+            return Ok(new { ok = true, remainingGram = pi.Quantity });
+        }
+
+        return BadRequest(new { error = "LotId veya PurchaseItemId zorunludur." });
     }
 }

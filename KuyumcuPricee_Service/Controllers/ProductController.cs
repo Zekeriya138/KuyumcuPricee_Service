@@ -224,14 +224,14 @@ WHERE p.TenantId = {0}
         return p is null ? NotFound() : Ok(ToDto(p));
     }
 
-    // CREATE — Özel ürün (IsSpecialProduct) tüm giriş yapanlar; diğer ürünler Owner/Admin.
+    // CREATE — Özel ürün (IsSpecialProduct) tüm giriş yapanlar; diğer ürünler Owner/Admin veya alış/satış izni.
     [HttpPost]
     [Authorize]
     public async Task<IActionResult> Create([FromBody] CreateProductDto dto, CancellationToken ct)
     {
-        var privileged = User.IsInRole("Owner") || User.IsInRole("Admin");
-        if (!privileged && !dto.IsSpecialProduct)
-            return StatusCode(403, new { error = "Ürün kartı oluşturmak için yönetici yetkisi gerekir." });
+        var privileged = IsPrivilegedProductAdmin();
+        if (!privileged && !dto.IsSpecialProduct && !HasProductOperationalPermission())
+            return StatusCode(403, new { error = "Ürün kartı oluşturmak için alış veya satış izni gerekir." });
 
         if (!privileged && dto.IsSpecialProduct)
         {
@@ -361,9 +361,8 @@ WHERE p.TenantId = {0}
                 }
 
                 // Barkodlama: mevcut DepoStokHavuz satırını güncelle (Mal+Tedarikçi+BirimMaliyet + ayar eşleşmesi); yeni havuz satırı oluşturulmaz.
-                var havuz = await _db.DepoStokHavuzlar
-                    .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
-                        && x.Ayar == ay && x.MalTanimNorm == malN && x.TedarikciFirmaNorm == firmaN && x.BirimMaliyet == birim, ct);
+                var havuz = await DepoStokTripleHelper.FindHavuzRowAsync(
+                    _db, tenantId, branchId, ay, malN, firmaN, birim, ct, tracked: true);
                 if (havuz is null)
                 {
                     await tx.RollbackAsync(ct);
@@ -436,14 +435,24 @@ WHERE p.TenantId = {0}
         return CreatedAtAction(nameof(GetById), new { id = savedP.Id }, ToDto(savedP));
     }
 
-    // UPDATE (Yalnızca Owner/Admin)
+    // UPDATE — Owner/Admin tam yetki; alış/satış izni tekil/özel tam güncelleme, ziynette sınırlı güncelleme.
     [HttpPut("{id:guid}")]
-    [Authorize(Roles = "Owner,Admin")]
+    [Authorize]
     public async Task<IActionResult> Update(Guid id, [FromBody] UpdateProductDto dto, CancellationToken ct)
     {
         if (!TryGetRequiredBranchId(out var branchId, out var branchErr)) return branchErr!;
         var p = await _db.Products.FirstOrDefaultAsync(x => x.Id == id && x.BranchId == branchId && !x.IsDeleted, ct);
         if (p is null) return NotFound();
+
+        var privileged = IsPrivilegedProductAdmin();
+        var isZiynet = (p.InventoryType ?? InventoryType.Tekil) == InventoryType.Ziynet;
+        if (!privileged)
+        {
+            if (!HasProductOperationalPermission())
+                return StatusCode(403, new { error = "Ürün kartı güncellemek için alış veya satış izni gerekir." });
+            if (isZiynet && !IsAllowedZiynetOperationalUpdate(p, dto))
+                return StatusCode(403, new { error = "Bu izinle yalnızca ziynet stok ve maliyet alanları güncellenebilir." });
+        }
 
         p.Name = string.IsNullOrWhiteSpace(dto.Name) ? p.Name : dto.Name.Trim();
         p.Category = string.IsNullOrWhiteSpace(dto.Category) ? null : dto.Category!.Trim();
@@ -476,12 +485,109 @@ WHERE p.TenantId = {0}
     public async Task<IActionResult> Delete(Guid id, CancellationToken ct)
     {
         if (!TryGetRequiredBranchId(out var branchId, out var branchErr)) return branchErr!;
+        var tenantId = _tenant.TenantId;
         var p = await _db.Products.FirstOrDefaultAsync(x => x.Id == id && x.BranchId == branchId && !x.IsDeleted, ct);
         if (p is null) return NotFound();
 
-        p.IsDeleted = true;
-        await _db.SaveChangesAsync(ct);
-        return NoContent();
+        await using var tx = await _db.Database.BeginTransactionAsync(ct);
+        try
+        {
+            var items = await _db.ProductItems
+                .Where(x => x.TenantId == tenantId && x.ProductId == p.Id && !x.IsDeleted)
+                .ToListAsync(ct);
+
+            // Hurda vitrin barkodu depo hammadde havuzuna girmez; geri alma yapılmaz.
+            var isHurdaSourced = items.Any(x => x.SourcePurchaseItemId.HasValue);
+
+            // Tekil hammadde barkodlaması: Barkodlu → Barkodsuz (TotalGram sabit).
+            var inv = p.InventoryType ?? InventoryType.Tekil;
+            var shouldReverseDepo = !isHurdaSourced
+                && inv == InventoryType.Tekil
+                && !p.IsSpecialProduct
+                && !string.IsNullOrWhiteSpace(p.MalTanim)
+                && !string.IsNullOrWhiteSpace(p.DepoTedarikciFirma)
+                && p.DepoBirimMaliyet.HasValue
+                && !string.IsNullOrWhiteSpace(p.Karat);
+
+            if (shouldReverseDepo)
+            {
+                // Satılmış (IsInStock=false) parçalar zaten OnBarcodedProductSold ile düşmüş; yalnızca stoktakileri geri al.
+                var reverseGram = items.Count > 0
+                    ? items.Where(x => x.IsInStock).Sum(x => x.Weight)
+                    : (p.WeightGr ?? 0m);
+
+                if (reverseGram > 0.0001m)
+                {
+                    var ay = DepoStokTripleHelper.NormalizeAyarKarat(p.Karat);
+                    var malN = DepoStokTripleHelper.NormalizeMal(p.MalTanim);
+                    var firmaN = DepoStokTripleHelper.NormalizeFirma(p.DepoTedarikciFirma);
+                    var birim = DepoStokTripleHelper.RoundBirimMaliyet(p.DepoBirimMaliyet!.Value);
+
+                    var havuz = await DepoStokTripleHelper.FindHavuzRowAsync(
+                        _db, tenantId, branchId, ay, malN, firmaN, birim, ct, tracked: true);
+                    var depo = await _db.DepoStoklar
+                        .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && x.Ayar == ay && !x.IsDeleted, ct);
+
+                    if (havuz != null && depo != null)
+                    {
+                        reverseGram = Math.Min(reverseGram, Math.Min(havuz.BarcodedGram, depo.BarcodedGram));
+                        if (reverseGram > 0.0001m)
+                        {
+                            if (!havuz.MoveToUnbarcoded(reverseGram) || !depo.MoveToUnbarcoded(reverseGram))
+                            {
+                                await tx.RollbackAsync(ct);
+                                return BadRequest(new { error = "Ürün silinemedi: depo barkodlu→barkodsuz geri alma başarısız." });
+                            }
+                        }
+                    }
+                }
+            }
+
+            foreach (var item in items)
+                item.IsDeleted = true;
+
+            p.IsDeleted = true;
+            await _db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+            return NoContent();
+        }
+        catch
+        {
+            await tx.RollbackAsync(ct);
+            throw;
+        }
+    }
+
+    private bool IsPrivilegedProductAdmin()
+        => User.IsInRole("Owner") || User.IsInRole("Admin");
+
+    private bool HasPermissionClaim(string claimType)
+    {
+        var raw = User.FindFirstValue(claimType);
+        return string.Equals(raw, "1", StringComparison.OrdinalIgnoreCase)
+               || string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool HasProductOperationalPermission()
+        => IsPrivilegedProductAdmin()
+           || HasPermissionClaim("perm_access_purchase")
+           || HasPermissionClaim("perm_access_sales");
+
+    private static bool IsAllowedZiynetOperationalUpdate(Product existing, UpdateProductDto dto)
+    {
+        if (dto.InventoryType.HasValue && dto.InventoryType.Value != (int)InventoryType.Ziynet)
+            return false;
+        if (dto.IsSpecialProduct == true && !existing.IsSpecialProduct)
+            return false;
+        if (!string.IsNullOrWhiteSpace(dto.MalTanim))
+            return false;
+        if (!string.IsNullOrWhiteSpace(dto.DepoTedarikciFirma))
+            return false;
+        if (dto.DepoBirimMaliyet.HasValue)
+            return false;
+        if (dto.ImageBase64 != null)
+            return false;
+        return true;
     }
 
     private static ProductDto ToDto(Product p) =>

@@ -95,9 +95,9 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == invoice.BranchId && x.TenantId == invoice.TenantId, ct);
 
-        var sellerName = profile?.CompanyName;
+        var sellerName = profile?.CompanyName?.Trim();
         if (string.IsNullOrWhiteSpace(sellerName))
-            sellerName = branch?.Name;
+            sellerName = branch?.Name?.Trim();
         if (string.IsNullOrWhiteSpace(sellerName))
             sellerName = "Firma";
 
@@ -148,9 +148,9 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == invoice.BranchId && x.TenantId == invoice.TenantId, ct);
 
-        var sellerName = profile?.CompanyName;
+        var sellerName = profile?.CompanyName?.Trim();
         if (string.IsNullOrWhiteSpace(sellerName))
-            sellerName = branch?.Name;
+            sellerName = branch?.Name?.Trim();
         if (string.IsNullOrWhiteSpace(sellerName))
             sellerName = "Firma";
 
@@ -251,7 +251,7 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
     <cac:Party>
       <cac:PartyIdentification><cbc:ID schemeID=""{Xml(ResolveTaxSchemeId(sellerTax))}"">{Xml(sellerTax)}</cbc:ID></cac:PartyIdentification>
       <cac:PartyName><cbc:Name>{Xml(sellerName)}</cbc:Name></cac:PartyName>
-      {BuildPostalAddressXml(profile?.CompanyAddress)}
+      {BuildSellerPostalAddressXml(profile)}
       <cac:PartyTaxScheme>
         <cbc:CompanyID schemeID=""{Xml(ResolveTaxSchemeId(sellerTax))}"">{Xml(sellerTax)}</cbc:CompanyID>
         <cac:TaxScheme><cbc:Name>{Xml(profile?.TaxOffice ?? "VERGI DAIRESI")}</cbc:Name></cac:TaxScheme>
@@ -1033,26 +1033,43 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         }
     }
 
+    private static string BuildSellerPostalAddressXml(EInvoiceProfile? profile)
+    {
+        var address = profile?.CompanyAddress;
+        var (city, district) = ParseCityDistrictFromAddress(address);
+        var postalCode = ResolvePostalCode(address, city, null);
+        return BuildPostalAddressXml(address, city, district, postalCode, useFallbackDefaults: false);
+    }
+
     private static string BuildPostalAddressXml(
         string? address,
         string? city = null,
         string? district = null,
-        string? postalCode = null)
+        string? postalCode = null,
+        bool useFallbackDefaults = true)
     {
         var street = string.IsNullOrWhiteSpace(address) ? "-" : address.Trim();
         var resolvedCity = string.IsNullOrWhiteSpace(city)
-            ? ResolveCityFromAddress(address) ?? "TRABZON"
+            ? ResolveCityFromAddress(address)
             : city.Trim().ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(resolvedCity) && useFallbackDefaults)
+            resolvedCity = "TRABZON";
+
         var resolvedDistrict = string.IsNullOrWhiteSpace(district)
-            ? "MERKEZ"
+            ? ResolveDistrictFromAddress(address, resolvedCity) ?? (useFallbackDefaults ? "MERKEZ" : null)
             : district.Trim().ToUpperInvariant();
-        var resolvedPostalCode = ResolvePostalCode(address, resolvedCity, postalCode) ?? "61000";
+        if (string.IsNullOrWhiteSpace(resolvedDistrict) && useFallbackDefaults)
+            resolvedDistrict = "MERKEZ";
+
+        var resolvedPostalCode = ResolvePostalCode(address, resolvedCity, postalCode);
+        if (string.IsNullOrWhiteSpace(resolvedPostalCode) && useFallbackDefaults)
+            resolvedPostalCode = "61000";
 
         return $@"<cac:PostalAddress>
       <cbc:StreetName>{Xml(street)}</cbc:StreetName>
-      <cbc:CitySubdivisionName>{Xml(resolvedDistrict)}</cbc:CitySubdivisionName>
-      <cbc:CityName>{Xml(resolvedCity)}</cbc:CityName>
-      <cbc:PostalZone>{Xml(resolvedPostalCode)}</cbc:PostalZone>
+      <cbc:CitySubdivisionName>{Xml(resolvedDistrict ?? "-")}</cbc:CitySubdivisionName>
+      <cbc:CityName>{Xml(resolvedCity ?? "-")}</cbc:CityName>
+      <cbc:PostalZone>{Xml(resolvedPostalCode ?? "-")}</cbc:PostalZone>
       <cac:Country>
         <cbc:IdentificationCode>TR</cbc:IdentificationCode>
         <cbc:Name>TURKEY</cbc:Name>
@@ -1069,7 +1086,7 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         if (inAddress.Length == 5) return inAddress;
 
         if (string.IsNullOrWhiteSpace(city)) return null;
-        if (!CityPlateCodes.TryGetValue(city.Trim().ToUpperInvariant(), out var plate)) return null;
+        if (!CityPlateCodes.TryGetValue(NormalizeCityForLookup(city), out var plate)) return null;
         return $"{plate:00}000";
     }
 
@@ -1080,11 +1097,71 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         return match.Success ? match.Value : null;
     }
 
+    private static (string? City, string? District) ParseCityDistrictFromAddress(string? address)
+    {
+        if (string.IsNullOrWhiteSpace(address))
+            return (null, null);
+
+        var text = address.Trim();
+        var slashMatch = Regex.Match(text, @"([^\s/]+)\s*/\s*([^\s/]+)\s*$", RegexOptions.IgnoreCase);
+        if (slashMatch.Success)
+        {
+            var district = slashMatch.Groups[1].Value.Trim();
+            var cityToken = slashMatch.Groups[2].Value.Trim();
+            var city = ResolveCityToken(cityToken) ?? NormalizeCityForLookup(cityToken);
+            return (city, district.ToUpperInvariant());
+        }
+
+        var resolvedCity = ResolveCityFromAddress(text);
+        return (resolvedCity, ResolveDistrictFromAddress(text, resolvedCity));
+    }
+
+    private static string? ResolveDistrictFromAddress(string? address, string? city)
+    {
+        if (string.IsNullOrWhiteSpace(address))
+            return null;
+
+        var slashMatch = Regex.Match(address.Trim(), @"([^\s/]+)\s*/\s*([^\s/]+)\s*$", RegexOptions.IgnoreCase);
+        if (slashMatch.Success)
+            return slashMatch.Groups[1].Value.Trim().ToUpperInvariant();
+
+        return null;
+    }
+
+    private static string? ResolveCityToken(string token)
+    {
+        var normalized = NormalizeCityForLookup(token);
+        if (CityPlateCodes.ContainsKey(normalized))
+            return normalized;
+        return ResolveCityFromAddress(token);
+    }
+
     private static string? ResolveCityFromAddress(string? address)
     {
-        if (string.IsNullOrWhiteSpace(address)) return null;
-        var upper = address.ToUpperInvariant();
-        return CityPlateCodes.Keys.FirstOrDefault(x => upper.Contains(x, StringComparison.OrdinalIgnoreCase));
+        if (string.IsNullOrWhiteSpace(address))
+            return null;
+
+        var normalizedAddress = NormalizeCityForLookup(address);
+        return CityPlateCodes.Keys
+            .OrderByDescending(x => x.Length)
+            .FirstOrDefault(city => normalizedAddress.Contains(NormalizeCityForLookup(city), StringComparison.Ordinal));
+    }
+
+    private static string NormalizeCityForLookup(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+
+        var text = value.Trim().ToUpperInvariant();
+        text = text
+            .Replace('İ', 'I')
+            .Replace('I', 'I')
+            .Replace('Ş', 'S')
+            .Replace('Ğ', 'G')
+            .Replace('Ü', 'U')
+            .Replace('Ö', 'O')
+            .Replace('Ç', 'C');
+        return text;
     }
 
     private static string BuildPersonXmlIfTckn(string? taxNo, string buyerName)

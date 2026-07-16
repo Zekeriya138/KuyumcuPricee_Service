@@ -37,5 +37,11 @@ public class CustomerTransaction : Entity, ITenantScoped
     /// <summary>İşlem anındaki kullanıcı görünen adı (Ad Soyad ya da kullanıcı adı).</summary>
     public string? KullaniciAdi { get; set; }
 
+    /// <summary>Aynı atomik işlemde oluşan satırları gruplar.</summary>
+    public Guid? BatchId { get; set; }
+    public bool IsReversed { get; set; }
+    public DateTime? ReversedAt { get; set; }
+    public Guid? ReversalLogId { get; set; }
+
     public Customer Customer { get; set; } = null!;
 }

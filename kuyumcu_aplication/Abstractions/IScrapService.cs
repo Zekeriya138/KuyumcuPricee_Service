@@ -71,4 +71,11 @@ public interface IScrapService
         Guid purchaseId,
         string? note,
         CancellationToken ct = default);
+
+    /// <summary>Complete akışında atlanmış hurda stoğunu alış satırından tamamlar (geriye dönük uyumluluk).</summary>
+    Task EnsureScrapStockFromPurchaseItemAsync(
+        Guid tenantId,
+        Guid branchId,
+        PurchaseItem purchaseItem,
+        CancellationToken ct = default);
 }

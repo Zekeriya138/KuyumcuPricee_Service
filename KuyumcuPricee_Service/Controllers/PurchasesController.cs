@@ -23,19 +23,22 @@ public class PurchasesController : ControllerBase
     private readonly IScrapService _scrap;
     private readonly IFinanceService _finance;
     private readonly IAccountingJournalService _accounting;
+    private readonly TransactionReversalService _reversal;
 
     public PurchasesController(
         AppDbContext db,
         IStockService stock,
         IScrapService scrap,
         IFinanceService finance,
-        IAccountingJournalService accounting)
+        IAccountingJournalService accounting,
+        TransactionReversalService reversal)
     {
         _db = db;
         _stock = stock;
         _scrap = scrap;
         _finance = finance;
         _accounting = accounting;
+        _reversal = reversal;
     }
 
     // ---------------- Tenant helper ----------------
@@ -166,7 +169,8 @@ public class PurchasesController : ControllerBase
         string? BankName = null,
         string? IBAN = null,
         DateTime? DueDate = null,
-        string? CashAccount = null
+        string? CashAccount = null,
+        string? LedgerSide = null
     );
 
     /// <summary>GET purchases/{id}/payments yanıt satırı.</summary>
@@ -308,6 +312,8 @@ public class PurchasesController : ControllerBase
             await _db.SaveChangesAsync(ct);
 
             await ApplyPurchaseStockAsync(purchase, isToptanci, tenantId, ct);
+            if (purchase.Items.Any(i => i.Kind == ItemKind.Scrap))
+                await _scrap.AddFromPurchaseItemsAsync(tenantId, purchase, ct);
             await ApplyCustomerFinanceForPurchaseAsync(
                 purchase,
                 isToptanci,
@@ -582,53 +588,23 @@ public class PurchasesController : ControllerBase
                     }
                     else
                     {
-                        // Genel veresiye akışı: seçili birim döviz paneline (+) yansır.
+                        var creditDtos = body.Payments.Where(x => x.PaymentType == 2).ToList();
+                        var creditIdx = 0;
                         foreach (var credit in creditRows)
                         {
                             var unit = NormalizeUnitCode(credit.UnitCode);
                             var unitAmount = credit.UnitAmount ?? 0m;
                             if (unitAmount <= 0) continue;
-                            switch (unit)
-                            {
-                                case "USD":
-                                    custBal.BalanceUSD += unitAmount;
-                                    break;
-                                case "EUR":
-                                    custBal.BalanceEUR += unitAmount;
-                                    break;
-                                case "GBP":
-                                    custBal.BalanceGBP += unitAmount;
-                                    break;
-                                case "HAS":
-                                    custBal.BalanceHAS += unitAmount;
-                                    break;
-                                default:
-                                    custBal.BalanceTL += unitAmount;
-                                    break;
-                            }
 
-                            await CustomerFinanceHelper.AddTransactionAsync(
-                                _db,
-                                tenantId,
-                                custId,
-                                purchase.BranchId,
-                                groupCode: "DOVIZ",
-                                itemName: unit,
-                                itemType: null,
-                                quantity: unitAmount,
-                                direction: +1,
-                                gram: null,
-                                ayar: null,
-                                milyem: null,
-                                hasEq: null,
-                                unitPriceTl: null,
-                                totalPriceTl: credit.Amount,
-                                refType: "PURCHASE",
-                                refId: purchase.Id,
-                                note: "Doviz alis veresiye",
-                                txDate: purchase.Date,
-                                ct,
-                                cariDurumOverride: "Alacakli");
+                            var ledgerSide = creditIdx < creditDtos.Count
+                                ? creditDtos[creditIdx].LedgerSide
+                                : null;
+                            creditIdx++;
+
+                            await CustomerFinanceHelper.ApplyPurchaseVeresiyeDovizAsync(
+                                _db, custBal, tenantId, custId, purchase.BranchId,
+                                unit, unitAmount, credit.Amount, purchase.Id, purchase.Date, ct,
+                                ledgerSide);
                         }
                     }
 
@@ -1318,6 +1294,34 @@ public class PurchasesController : ControllerBase
             .FirstAsync(x => x.Id == id && x.TenantId == tenantId, ct);
 
         return Ok(ToDto(fresh));
+    }
+
+    // ================== REVERSE ==================
+    [HttpPost("{id:guid}/reverse")]
+    public async Task<IActionResult> Reverse(Guid id, [FromBody] ReversePurchaseReq req, CancellationToken ct)
+    {
+        var tenantId = GetTenantId();
+        var purchase = await _db.Purchases.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == id && x.TenantId == tenantId && !x.IsDeleted, ct);
+        if (purchase is null) return NotFound();
+        var (userId, userName) = ResolveUser();
+        var result = await _reversal.ReversePurchaseAsync(
+            tenantId, id, purchase.CustomerId, purchase.SupplierId, req.Reason ?? "", userId, userName, ct);
+        if (!result.Ok) return BadRequest(new { error = result.Error });
+        return Ok(new { ok = true, reversalLogId = result.ReversalLogId, batchId = result.BatchId });
+    }
+
+    public sealed record ReversePurchaseReq(string Reason);
+
+    private (Guid? userId, string? userName) ResolveUser()
+    {
+        var claim = User?.Claims?.FirstOrDefault(c =>
+            c.Type.Equals(ClaimTypes.NameIdentifier, StringComparison.OrdinalIgnoreCase) ||
+            c.Type.Equals("sub", StringComparison.OrdinalIgnoreCase))?.Value;
+        Guid? userId = Guid.TryParse(claim, out var g) ? g : null;
+        var name = User?.Claims?.FirstOrDefault(c => c.Type.Equals("full_name", StringComparison.OrdinalIgnoreCase))?.Value
+                   ?? User?.Identity?.Name;
+        return (userId, name);
     }
 
     // ================== DELETE ==================

@@ -24,6 +24,10 @@ public class CashTransaction : Entity, ITenantScoped
     /// <summary>İşlem anındaki kullanıcı görünen adı (Ad Soyad ya da kullanıcı adı).</summary>
     public string? KullaniciAdi { get; set; }
 
+    public Guid? BatchId { get; set; }
+    public bool IsReversed { get; set; }
+    public DateTime? ReversedAt { get; set; }
+
     public CashAccount CashAccount { get; set; } = null!;
 }
 

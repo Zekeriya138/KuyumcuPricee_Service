@@ -179,7 +179,7 @@ public sealed class AccountingJournalService : IAccountingJournalService
             tx.TenantId,
             tx.BranchId,
             tx.TxDate,
-            $"REF:CASH:{tx.Id} Nakit işlem otomatik muhasebe kaydı",
+            $"REF:CASH:{tx.Id} REF:{(tx.SourceModule ?? "Manual").Trim().ToUpperInvariant()} {tx.Description ?? ""}".Trim(),
             lines,
             ct);
     }

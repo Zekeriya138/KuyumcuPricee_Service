@@ -531,6 +531,112 @@ public sealed class ScrapController : ControllerBase
         return Ok(result);
     }
 
+    public sealed record ScrapWithdrawLineReq(
+        Guid BranchId,
+        Guid PurchaseItemId,
+        decimal Gram,
+        bool FromBarcoded,
+        string? Note);
+
+    /// <summary>Stok/Depo hurda sekmesinden satır bazlı manuel çıkış (barkodlu veya barkodsuz).</summary>
+    [HttpPost("withdraw-purchase-line")]
+    public async Task<IActionResult> WithdrawPurchaseLine([FromBody] ScrapWithdrawLineReq req, CancellationToken ct)
+    {
+        if (req.BranchId == Guid.Empty || req.PurchaseItemId == Guid.Empty)
+            return BadRequest(new { error = "branchId ve purchaseItemId zorunludur." });
+        if (req.Gram <= 0)
+            return BadRequest(new { error = "Gram pozitif olmalıdır." });
+
+        var tid = TenantId;
+        var gram = Math.Round(req.Gram, 4, MidpointRounding.AwayFromZero);
+
+        var pi = await _db.PurchaseItems
+            .Include(x => x.Purchase)
+            .FirstOrDefaultAsync(x => x.Id == req.PurchaseItemId && x.TenantId == tid && !x.IsDeleted, ct);
+        if (pi?.Purchase is null)
+            return BadRequest(new { error = "Alış satırı bulunamadı." });
+        if (pi.Purchase.BranchId != req.BranchId)
+            return BadRequest(new { error = "Satır bu şubeye ait değil." });
+        if (pi.Kind != ItemKind.Scrap)
+            return BadRequest(new { error = "Bu satır hurda tipinde değil." });
+
+        var metrics = await HurdaPurchaseMetricsHelper.ComputeHurdaPurchaseLineMetricsAsync(
+            _db, tid, req.BranchId, new List<Guid> { pi.Id }, ct);
+        var metric = metrics.FirstOrDefault();
+        if (metric is null)
+            return BadRequest(new { error = "Hurda metrikleri hesaplanamadı." });
+
+        await using var tx = await _db.Database.BeginTransactionAsync(ct);
+        try
+        {
+            if (req.FromBarcoded)
+            {
+                if (metric.BarkodluGram < gram - 0.0001m)
+                {
+                    await tx.RollbackAsync(ct);
+                    return BadRequest(new { error = $"Yetersiz barkodlu hurda. İstenen: {gram:0.###}, Barkodlu: {metric.BarkodluGram:0.###} g" });
+                }
+
+                var items = await _db.ProductItems
+                    .Where(x => x.SourcePurchaseItemId == pi.Id && x.TenantId == tid && !x.IsDeleted && x.IsInStock)
+                    .OrderBy(x => x.CreatedAt)
+                    .ToListAsync(ct);
+
+                var remaining = gram;
+                foreach (var item in items)
+                {
+                    if (remaining <= 0.0001m) break;
+                    var w = Math.Round(item.Weight, 4, MidpointRounding.AwayFromZero);
+                    if (w <= remaining + 0.0001m)
+                    {
+                        item.IsInStock = false;
+                        item.UpdatedAt = DateTime.UtcNow;
+                        remaining -= w;
+                    }
+                    else
+                    {
+                        item.Weight = Math.Round(w - remaining, 4, MidpointRounding.AwayFromZero);
+                        item.UpdatedAt = DateTime.UtcNow;
+                        remaining = 0;
+                    }
+                }
+
+                if (remaining > 0.0001m)
+                {
+                    await tx.RollbackAsync(ct);
+                    return BadRequest(new { error = "Barkodlu hurda çıkışı tamamlanamadı (yetersiz stokta ürün)." });
+                }
+            }
+            else
+            {
+                if (metric.BarkodsuzGram < gram - 0.0001m)
+                {
+                    await tx.RollbackAsync(ct);
+                    return BadRequest(new { error = $"Yetersiz barkodsuz hurda. İstenen: {gram:0.###}, Barkodsuz: {metric.BarkodsuzGram:0.###} g" });
+                }
+
+                pi.Quantity = Math.Round(pi.Quantity - gram, 4, MidpointRounding.AwayFromZero);
+            }
+
+            await _db.SaveChangesAsync(ct);
+            await tx.CommitAsync(ct);
+
+            var updated = await HurdaPurchaseMetricsHelper.ComputeHurdaPurchaseLineMetricsAsync(
+                _db, tid, req.BranchId, new List<Guid> { pi.Id }, ct);
+
+            return Ok(new
+            {
+                ok = true,
+                metrics = updated.FirstOrDefault()
+            });
+        }
+        catch
+        {
+            await tx.RollbackAsync(ct);
+            throw;
+        }
+    }
+
     public sealed record ScrapBarcodeFromPurchaseLineReq(
         Guid BranchId,
         Guid PurchaseItemId,
@@ -584,11 +690,13 @@ public sealed class ScrapController : ControllerBase
             return Conflict(new { error = "Bu ürün kodu başka şubede kullanılıyor." });
 
         var gram = Math.Round(req.Gram, 4, MidpointRounding.AwayFromZero);
-        var karatForScrap = string.IsNullOrWhiteSpace(pi.Karat) ? dto.Karat ?? "" : pi.Karat;
+        var karatForScrap = (pi.Karat ?? "").Trim();
 
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         try
         {
+            await _scrap.EnsureScrapStockFromPurchaseItemAsync(tid, req.BranchId, pi, ct);
+
             var (subOk, subErr) = await _scrap.TrySubtractScrapForPurchaseLineBarcodeAsync(
                 tid, req.BranchId, karatForScrap, gram, pi.PurchaseId,
                 $"Hurda satır vitrin L{pi.LineNo}", ct);

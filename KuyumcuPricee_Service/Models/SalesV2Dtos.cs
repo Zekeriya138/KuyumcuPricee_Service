@@ -12,7 +12,8 @@ public sealed record CreateSaleItemReq(
     decimal Discount,           // TL
     decimal TaxRate,            // 0.00..1.00
     Guid? ProductItemId,        // barkodlu tekil parça satılıyorsa (ProductItems.Id)
-    string? Olcu = null         // ziynet tipi (Yeni/Eski) - katalog eşleşmesi olmayan satırlar için
+    string? Olcu = null,        // ziynet tipi (Yeni/Eski) - katalog eşleşmesi olmayan satırlar için
+    decimal? DeliveredQuantity = null // döviz satışında kasadan düşülecek teslim miktarı (null = tamamı)
 );
 
 public sealed record CreateSaleReqV2(
@@ -24,8 +25,13 @@ public sealed record CreateSaleReqV2(
     List<CreateSaleItemReq> Items,
     string? DeliveryType = null,
     /// <summary>Ödeme kaleminde <c>TedarikciVeresiye</c> varsa zorunlu: tedarikçi cari hareketi bu tedarikçiye yazılır.</summary>
-    Guid? SupplierIdForTedarikciVeresiye = null
-);
+    Guid? SupplierIdForTedarikciVeresiye = null,
+    /// <summary>EMANET satışta müşteri cari hareketini SalesV2 içinde yazma (WPF ProcessCustomerTransaction ile yazar).</summary>
+    bool SkipEmanetCustomerLedger = false)
+{
+    /// <summary>Emanet döviz birim → BORC|ALACAK hedef brüt sütun.</summary>
+    public Dictionary<string, string>? EmanetDovizLedgerByUnit { get; init; }
+}
 
 public sealed class SalePaymentReq
 {
@@ -36,6 +42,8 @@ public sealed class SalePaymentReq
     public decimal? TlAmount { get; set; }
     public string? Currency { get; set; }
     public string? Account { get; set; }
+    /// <summary>Veresiye: BORC = borç sütununa ekle, ALACAK = alacak sütunundan düş.</summary>
+    public string? LedgerSide { get; set; }
 }
 
 public sealed record TakasHammaddeReq(

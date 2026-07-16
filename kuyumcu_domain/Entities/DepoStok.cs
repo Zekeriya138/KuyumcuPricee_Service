@@ -63,6 +63,22 @@ namespace kuyumcu_domain.Entities
             return true;
         }
 
+        /// <summary>
+        /// Barkodlu ürün silme/iptal: barkodlamayı geri alır.
+        /// <see cref="TotalGram"/> sabit; barkodlu azalır, barkodsuz artar.
+        /// </summary>
+        public bool MoveToUnbarcoded(decimal gram)
+        {
+            if (gram <= 0) return true;
+            if (BarcodedGram + 0.0001m < gram)
+                return false;
+            BarcodedGram -= gram;
+            UnbarcodedGram = TotalGram - BarcodedGram;
+            EnforceInvariant();
+            UpdatedAt = DateTime.UtcNow;
+            return true;
+        }
+
         /// <summary>Tekil ürün satışı: metal işyerinden çıkar.</summary>
         public bool OnBarcodedProductSold(decimal gram)
         {

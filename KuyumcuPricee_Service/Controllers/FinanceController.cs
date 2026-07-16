@@ -64,6 +64,40 @@ public sealed class FinanceController : ControllerBase
         public Guid? RefId { get; set; }
         public string? Description { get; set; }
         public DateTime? TxDate { get; set; }
+        public Guid? BatchId { get; set; }
+    }
+
+    public sealed class CreatePlannedCashCardRequest
+    {
+        public Guid BranchId { get; set; }
+        public string Title { get; set; } = "";
+        public string TxType { get; set; } = "Income";
+        public string Currency { get; set; } = "TL";
+        public string PaymentMethod { get; set; } = "Nakit";
+        public decimal Amount { get; set; }
+        public string? Description { get; set; }
+    }
+
+    public sealed class AddPlannedCashLineRequest
+    {
+        public Guid CardId { get; set; }
+        public Guid BranchId { get; set; }
+        public string TxType { get; set; } = "Income";
+        public string Currency { get; set; } = "TL";
+        public string PaymentMethod { get; set; } = "Nakit";
+        public decimal Amount { get; set; }
+        public string? Description { get; set; }
+    }
+
+    public sealed class CreateCashTransferRequest
+    {
+        public Guid BranchId { get; set; }
+        public string FromPaymentMethod { get; set; } = "";
+        public string FromCurrency { get; set; } = "TL";
+        public string ToPaymentMethod { get; set; } = "";
+        public string ToCurrency { get; set; } = "TL";
+        public decimal Amount { get; set; }
+        public string? Description { get; set; }
     }
 
     private static string NormalizeCurrency(string? unit)
@@ -130,6 +164,7 @@ public sealed class FinanceController : ControllerBase
         var c = NormalizeCurrency(currencyRaw);
         return m switch
         {
+            "NAKIT" when c is "USD" or "EUR" or "GBP" or "HAS" or "GUMUS" => ("Vault", c, $"Vault {c}"),
             "NAKIT" => ("Kasa", "TL", "Kasa TL"),
             "HAVALE" or "IBAN" or "BANKA" => c == "TL"
                 ? ("PosBanka", "TL", "Banka")
@@ -548,6 +583,7 @@ public sealed class FinanceController : ControllerBase
         [FromQuery] int page = 1,
         [FromQuery] int pageSize = 100,
         [FromQuery] bool excludeHasSilver = false,
+        [FromQuery] bool includeReversed = false,
         CancellationToken ct = default)
     {
         var tenantId = GetTenantId();
@@ -676,10 +712,13 @@ public sealed class FinanceController : ControllerBase
                     var upDesc = desc.ToUpperInvariant();
                     var parsedSaleRefId = TryExtractRefId(desc, "REF:SALE:");
                     var parsedPurchaseRefId = TryExtractRefId(desc, "REF:PURCHASE:");
+                    var parsedCashRefId = TryExtractRefId(desc, "REF:CASH:");
 
                     var sourceModule =
                         upDesc.Contains("REF:SALE:") ? "Sale" :
                         upDesc.Contains("REF:PURCHASE:") ? "Purchase" :
+                        upDesc.Contains("REF:PLANNED") || upDesc.Contains("PLANLANMIŞ") || upDesc.Contains("PLANLANMIS") ? "Planned" :
+                        upDesc.Contains("REF:TRANSFER") || upDesc.Contains("HESAP TRANSFERI") ? "Transfer" :
                         "Manual";
                     var refType =
                         upDesc.Contains("REF:SALE:") ? "SALE" :
@@ -766,6 +805,7 @@ public sealed class FinanceController : ControllerBase
         try
         {
             var q = _db.CashTransactions.AsNoTracking().Where(x => x.TenantId == tenantId && !x.IsDeleted);
+            if (!includeReversed) q = q.Where(x => !x.IsReversed);
             if (branchId.HasValue && branchId.Value != Guid.Empty) q = q.Where(x => x.BranchId == branchId.Value);
             if (from.HasValue) q = q.Where(x => x.TxDate >= from.Value);
             if (to.HasValue) q = q.Where(x => x.TxDate < to.Value);
@@ -961,6 +1001,7 @@ public sealed class FinanceController : ControllerBase
         var existingKeys = new HashSet<string>(
             baseRows.Select(x => BuildKey(x.RefType, x.RefId, x.TxType, x.Currency, x.Amount)),
             StringComparer.OrdinalIgnoreCase);
+        var cashTxIdsInBase = new HashSet<Guid>(baseRows.Where(x => x.Id != Guid.Empty).Select(x => x.Id));
 
         var syntheticRows = new List<CashTxRow>();
         foreach (var s in fallbackSaleRows)
@@ -993,6 +1034,9 @@ public sealed class FinanceController : ControllerBase
         }
         foreach (var j in journalDerivedRows)
         {
+            var cashRefId = TryExtractRefId(j.Description, "REF:CASH:");
+            if (cashRefId.HasValue && cashTxIdsInBase.Contains(cashRefId.Value))
+                continue;
             var key = BuildKey(j.RefType, j.RefId, j.TxType, j.Currency, j.Amount);
             if (existingKeys.Contains(key)) continue;
             existingKeys.Add(key);
@@ -1277,7 +1321,7 @@ public sealed class FinanceController : ControllerBase
         try
         {
             var txQ = _db.CashTransactions.AsNoTracking()
-                .Where(x => x.TenantId == tenantId && !x.IsDeleted);
+                .Where(x => x.TenantId == tenantId && !x.IsDeleted && !x.IsReversed);
             if (branchId.HasValue && branchId.Value != Guid.Empty)
                 txQ = txQ.Where(x => x.BranchId == branchId.Value);
             if (from.HasValue) txQ = txQ.Where(x => x.TxDate >= from.Value);
@@ -1408,7 +1452,8 @@ public sealed class FinanceController : ControllerBase
             TxDate = req.TxDate ?? DateTime.UtcNow,
             RefType = req.RefType,
             RefId = req.RefId,
-            Description = req.Description
+            Description = req.Description,
+            BatchId = req.BatchId
         };
         _db.CashTransactions.Add(tx);
         await _db.SaveChangesAsync(ct);
@@ -1427,6 +1472,429 @@ public sealed class FinanceController : ControllerBase
             tx.RefId,
             tx.Description
         });
+    }
+
+    private static string NormalizeCashTxTypeFull(string? txType)
+    {
+        var t = (txType ?? "").Trim().ToUpperInvariant();
+        return t switch
+        {
+            "EXPENSE" or "GIDER" => "Expense",
+            "TRANSFER" => "Transfer",
+            _ => "Income"
+        };
+    }
+
+    private async Task<CashTransaction> PostCashMovementAsync(
+        Guid tenantId,
+        Guid branchId,
+        string paymentMethod,
+        string currencyRaw,
+        decimal amount,
+        string txType,
+        string sourceModule,
+        string? description,
+        string? refType,
+        Guid? refId,
+        Guid? batchId,
+        DateTime? txDate,
+        CancellationToken ct)
+    {
+        var (accountType, currency, name) = ResolveManualAccount(paymentMethod, currencyRaw);
+        var normalizedTxType = NormalizeCashTxTypeFull(txType);
+        var account = await GetOrCreateAccountAsync(tenantId, branchId, accountType, currency, name, ct);
+
+        account.CurrentBalance += normalizedTxType switch
+        {
+            "Expense" => -amount,
+            "Income" => amount,
+            _ => 0m
+        };
+
+        var tx = new CashTransaction
+        {
+            TenantId = tenantId,
+            BranchId = branchId,
+            CashAccountId = account.Id,
+            TxType = normalizedTxType == "Transfer" ? "Expense" : normalizedTxType,
+            SourceModule = string.IsNullOrWhiteSpace(sourceModule) ? "Manual" : sourceModule.Trim(),
+            Currency = currency,
+            Amount = amount,
+            TxDate = txDate ?? DateTime.UtcNow,
+            RefType = refType,
+            RefId = refId,
+            Description = description,
+            BatchId = batchId
+        };
+        _db.CashTransactions.Add(tx);
+        await _db.SaveChangesAsync(ct);
+        await _accounting.RecordManualCashTransactionAsync(tx, account, ct);
+        return tx;
+    }
+
+    private async Task ReverseLinkedCashTransactionAsync(Guid tenantId, Guid cashTransactionId, CancellationToken ct)
+    {
+        var original = await _db.CashTransactions
+            .Include(x => x.CashAccount)
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == cashTransactionId && !x.IsDeleted, ct);
+        if (original == null || original.IsReversed) return;
+
+        var opposite = string.Equals(original.TxType, "Income", StringComparison.OrdinalIgnoreCase) ? "Expense" : "Income";
+        original.CashAccount.CurrentBalance += opposite == "Income" ? original.Amount : -original.Amount;
+        var reversal = new CashTransaction
+        {
+            TenantId = tenantId,
+            BranchId = original.BranchId,
+            CashAccountId = original.CashAccountId,
+            TxType = opposite,
+            SourceModule = original.SourceModule,
+            Currency = original.Currency,
+            Amount = original.Amount,
+            TxDate = DateTime.UtcNow,
+            RefType = "PLANNED_REVERSAL",
+            RefId = original.Id,
+            Description = $"Planlanmış kayıt güncelleme iptali: {original.Description}",
+            BatchId = original.BatchId
+        };
+        original.IsReversed = true;
+        original.ReversedAt = DateTime.UtcNow;
+        _db.CashTransactions.Add(reversal);
+        await _db.SaveChangesAsync(ct);
+        await _accounting.RecordManualCashTransactionAsync(reversal, original.CashAccount, ct);
+    }
+
+    [HttpGet("planned-cash")]
+    public async Task<IActionResult> ListPlannedCash([FromQuery] Guid? branchId, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        var cardQ = _db.PlannedCashTransactions.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && !x.IsDeleted);
+        if (branchId.HasValue && branchId.Value != Guid.Empty)
+            cardQ = cardQ.Where(x => x.BranchId == branchId.Value);
+
+        var cards = await cardQ.OrderByDescending(x => x.CreatedAt).ToListAsync(ct);
+
+        List<PlannedCashTransactionLine> lines;
+        if (cards.Count == 0)
+        {
+            lines = [];
+        }
+        else
+        {
+            try
+            {
+                // cardIds.Contains OPENJSON WITH üretir; SQL Server'da batch hatasına yol açabiliyor.
+                lines = await (
+                    from line in _db.PlannedCashTransactionLines.AsNoTracking()
+                    join card in _db.PlannedCashTransactions.AsNoTracking() on line.PlannedCashTransactionId equals card.Id
+                    where line.TenantId == tenantId && !line.IsDeleted
+                          && card.TenantId == tenantId && !card.IsDeleted
+                          && (!branchId.HasValue || branchId == Guid.Empty || card.BranchId == branchId.Value)
+                    orderby line.CreatedAt descending
+                    select line).ToListAsync(ct);
+            }
+            catch (Exception ex) when (ex.Message.Contains("PlannedCashTransactionLines", StringComparison.OrdinalIgnoreCase)
+                                       || ex.Message.Contains("Invalid object name", StringComparison.OrdinalIgnoreCase))
+            {
+                lines = [];
+            }
+        }
+
+        var linesByCard = lines.GroupBy(x => x.PlannedCashTransactionId)
+            .ToDictionary(g => g.Key, g => g.ToList());
+
+        var items = cards.Select(card =>
+        {
+            linesByCard.TryGetValue(card.Id, out var dbLines);
+            var cardLines = BuildMergedCardLines(card, dbLines);
+
+            return new
+            {
+                card.Id,
+                card.BranchId,
+                card.Title,
+                card.CreatedAt,
+                Lines = cardLines.Select(line => new
+                {
+                    line.Id,
+                    line.TxType,
+                    line.Currency,
+                    line.PaymentMethod,
+                    line.Amount,
+                    line.Description,
+                    line.CashTransactionId,
+                    line.CreatedAt
+                }).ToList()
+            };
+        }).ToList();
+
+        return Ok(new { items });
+    }
+
+    private static List<PlannedCashTransactionLine> BuildMergedCardLines(
+        PlannedCashTransaction card,
+        List<PlannedCashTransactionLine>? dbLines)
+    {
+        var result = dbLines?.ToList() ?? [];
+
+        // Eski kart formatı: hareket doğrudan kart üzerinde tutuluyordu. Yeni satır eklenince kaybolmaması için birleştir.
+        if (card.CashTransactionId.HasValue && card.Amount > 0m &&
+            !result.Any(l => l.CashTransactionId == card.CashTransactionId))
+        {
+            result.Add(new PlannedCashTransactionLine
+            {
+                Id = card.Id,
+                PlannedCashTransactionId = card.Id,
+                TxType = card.TxType,
+                Currency = card.Currency,
+                PaymentMethod = card.PaymentMethod,
+                Amount = card.Amount,
+                Description = card.Description,
+                CashTransactionId = card.CashTransactionId,
+                CreatedAt = card.CreatedAt
+            });
+        }
+
+        return result
+            .OrderByDescending(x => x.CreatedAt)
+            .ToList();
+    }
+
+    private async Task EnsureLegacyLineMigratedAsync(
+        Guid tenantId,
+        PlannedCashTransaction card,
+        CancellationToken ct)
+    {
+        if (!card.CashTransactionId.HasValue || card.Amount <= 0m) return;
+
+        var alreadyMigrated = await _db.PlannedCashTransactionLines
+            .AnyAsync(x => x.TenantId == tenantId && !x.IsDeleted
+                && x.PlannedCashTransactionId == card.Id
+                && x.CashTransactionId == card.CashTransactionId, ct);
+        if (alreadyMigrated) return;
+
+        _db.PlannedCashTransactionLines.Add(new PlannedCashTransactionLine
+        {
+            TenantId = tenantId,
+            PlannedCashTransactionId = card.Id,
+            TxType = NormalizeCashTxTypeFull(card.TxType),
+            Currency = NormalizeCurrency(card.Currency),
+            PaymentMethod = (card.PaymentMethod ?? "Nakit").Trim(),
+            Amount = card.Amount,
+            Description = card.Description?.Trim(),
+            CashTransactionId = card.CashTransactionId,
+            CreatedAt = card.CreatedAt
+        });
+
+        card.CashTransactionId = null;
+        card.Amount = 0m;
+        card.TxType = "Income";
+        card.Currency = "TL";
+        card.PaymentMethod = "Nakit";
+        card.Description = null;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    private async Task<PlannedCashTransactionLine> AddPlannedLineAsync(
+        Guid tenantId,
+        PlannedCashTransaction card,
+        string txType,
+        string currency,
+        string paymentMethod,
+        decimal amount,
+        string? description,
+        CancellationToken ct)
+    {
+        var line = new PlannedCashTransactionLine
+        {
+            TenantId = tenantId,
+            PlannedCashTransactionId = card.Id,
+            TxType = NormalizeCashTxTypeFull(txType),
+            Currency = NormalizeCurrency(currency),
+            PaymentMethod = (paymentMethod ?? "Nakit").Trim(),
+            Amount = amount,
+            Description = description?.Trim()
+        };
+        _db.PlannedCashTransactionLines.Add(line);
+        await _db.SaveChangesAsync(ct);
+
+        var desc = string.IsNullOrWhiteSpace(line.Description)
+            ? $"Planlanmış: {card.Title}"
+            : $"Planlanmış: {card.Title} — {line.Description}";
+
+        var cashTx = await PostCashMovementAsync(
+            tenantId,
+            card.BranchId,
+            line.PaymentMethod,
+            line.Currency,
+            line.Amount,
+            line.TxType,
+            "Planned",
+            desc,
+            "PLANNED_LINE",
+            line.Id,
+            null,
+            DateTime.UtcNow,
+            ct);
+
+        line.CashTransactionId = cashTx.Id;
+        await _db.SaveChangesAsync(ct);
+        return line;
+    }
+
+    [HttpPost("planned-cash")]
+    public async Task<IActionResult> CreatePlannedCashCard([FromBody] CreatePlannedCashCardRequest req, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (req is null) return BadRequest(new { error = "İstek boş olamaz." });
+        if (req.BranchId == Guid.Empty) return BadRequest(new { error = "BranchId zorunludur." });
+        if (string.IsNullOrWhiteSpace(req.Title)) return BadRequest(new { error = "Başlık zorunludur." });
+        if (req.Amount <= 0) return BadRequest(new { error = "Amount 0'dan büyük olmalıdır." });
+
+        var card = new PlannedCashTransaction
+        {
+            TenantId = tenantId,
+            BranchId = req.BranchId,
+            Title = req.Title.Trim()
+        };
+        _db.PlannedCashTransactions.Add(card);
+        await _db.SaveChangesAsync(ct);
+
+        var line = await AddPlannedLineAsync(
+            tenantId,
+            card,
+            req.TxType,
+            req.Currency,
+            req.PaymentMethod,
+            req.Amount,
+            req.Description,
+            ct);
+
+        return Ok(new
+        {
+            card.Id,
+            card.BranchId,
+            card.Title,
+            card.CreatedAt,
+            Lines = new[]
+            {
+                new
+                {
+                    line.Id,
+                    line.TxType,
+                    line.Currency,
+                    line.PaymentMethod,
+                    line.Amount,
+                    line.Description,
+                    line.CashTransactionId,
+                    line.CreatedAt
+                }
+            }
+        });
+    }
+
+    [HttpPost("planned-cash/lines")]
+    public async Task<IActionResult> AddPlannedCashLine([FromBody] AddPlannedCashLineRequest req, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (req is null) return BadRequest(new { error = "İstek boş olamaz." });
+        if (req.CardId == Guid.Empty) return BadRequest(new { error = "CardId zorunludur." });
+        if (req.Amount <= 0) return BadRequest(new { error = "Amount 0'dan büyük olmalıdır." });
+
+        var card = await _db.PlannedCashTransactions
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == req.CardId && !x.IsDeleted, ct);
+        if (card == null) return NotFound(new { error = "Planlanmış kart bulunamadı." });
+
+        await EnsureLegacyLineMigratedAsync(tenantId, card, ct);
+
+        var line = await AddPlannedLineAsync(
+            tenantId,
+            card,
+            req.TxType,
+            req.Currency,
+            req.PaymentMethod,
+            req.Amount,
+            req.Description,
+            ct);
+
+        return Ok(new
+        {
+            line.Id,
+            line.PlannedCashTransactionId,
+            line.TxType,
+            line.Currency,
+            line.PaymentMethod,
+            line.Amount,
+            line.Description,
+            line.CashTransactionId,
+            line.CreatedAt
+        });
+    }
+
+    [HttpDelete("planned-cash/{id:guid}")]
+    public async Task<IActionResult> DeletePlannedCash(Guid id, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        var card = await _db.PlannedCashTransactions
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == id && !x.IsDeleted, ct);
+        if (card == null) return NotFound(new { error = "Planlanmış kayıt bulunamadı." });
+
+        var lines = await _db.PlannedCashTransactionLines
+            .Where(x => x.TenantId == tenantId && !x.IsDeleted && x.PlannedCashTransactionId == card.Id)
+            .ToListAsync(ct);
+
+        foreach (var line in lines)
+        {
+            if (line.CashTransactionId.HasValue)
+                await ReverseLinkedCashTransactionAsync(tenantId, line.CashTransactionId.Value, ct);
+            line.IsDeleted = true;
+        }
+
+        if (card.CashTransactionId.HasValue && lines.Count == 0)
+            await ReverseLinkedCashTransactionAsync(tenantId, card.CashTransactionId.Value, ct);
+
+        card.IsDeleted = true;
+        await _db.SaveChangesAsync(ct);
+        return Ok(new { ok = true });
+    }
+
+    [HttpPost("cash-transactions/transfer")]
+    public async Task<IActionResult> CreateCashTransfer([FromBody] CreateCashTransferRequest req, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        if (req is null) return BadRequest(new { error = "İstek boş olamaz." });
+        if (req.BranchId == Guid.Empty) return BadRequest(new { error = "BranchId zorunludur." });
+        if (req.Amount <= 0) return BadRequest(new { error = "Amount 0'dan büyük olmalıdır." });
+
+        var fromCurrency = NormalizeCurrency(req.FromCurrency);
+        var toCurrency = NormalizeCurrency(req.ToCurrency);
+        if (!string.Equals(fromCurrency, toCurrency, StringComparison.OrdinalIgnoreCase))
+            return BadRequest(new { error = "Kaynak ve hedef hesap birimi aynı olmalıdır." });
+
+        var fromKey = $"{req.FromPaymentMethod}|{fromCurrency}";
+        var toKey = $"{req.ToPaymentMethod}|{toCurrency}";
+        if (string.Equals(fromKey, toKey, StringComparison.OrdinalIgnoreCase))
+            return BadRequest(new { error = "Kaynak ve hedef hesap farklı olmalıdır." });
+
+        var fromResolved = ResolveManualAccount(req.FromPaymentMethod, fromCurrency);
+        var toResolved = ResolveManualAccount(req.ToPaymentMethod, toCurrency);
+        var fromName = fromResolved.name;
+        var toName = toResolved.name;
+
+        var batchId = Guid.NewGuid();
+        var userDesc = (req.Description ?? "").Trim();
+        var baseDesc = $"Hesap transferi: {fromName} → {toName}";
+        var desc = string.IsNullOrWhiteSpace(userDesc) ? baseDesc : $"{baseDesc}. {userDesc}";
+
+        await PostCashMovementAsync(
+            tenantId, req.BranchId, req.FromPaymentMethod, fromCurrency, req.Amount, "Expense", "Transfer",
+            desc, "CASH_TRANSFER", batchId, batchId, DateTime.UtcNow, ct);
+
+        await PostCashMovementAsync(
+            tenantId, req.BranchId, req.ToPaymentMethod, toCurrency, req.Amount, "Income", "Transfer",
+            desc, "CASH_TRANSFER", batchId, batchId, DateTime.UtcNow, ct);
+
+        return Ok(new { ok = true, batchId });
     }
 
     private async Task<Guid> ResolveBranchIdFromReferenceAsync(Guid tenantId, string? refType, Guid refId, CancellationToken ct)
@@ -1506,7 +1974,7 @@ public sealed class FinanceController : ControllerBase
         var sales = await salesQ.SelectMany(x => x.Items).SumAsync(i => (decimal?)i.LineTotal, ct) ?? 0m;
         var purchases = await purchaseQ.SumAsync(x => (decimal?)x.GrandTotal, ct) ?? 0m;
         var cashExpenses = await _db.CashTransactions.AsNoTracking()
-            .Where(x => x.TenantId == tenantId && !x.IsDeleted && x.TxType == "Expense" && x.TxDate >= f && x.TxDate < t)
+            .Where(x => x.TenantId == tenantId && !x.IsDeleted && !x.IsReversed && x.TxType == "Expense" && x.TxDate >= f && x.TxDate < t)
             .Where(x => !branchId.HasValue || branchId == Guid.Empty || x.BranchId == branchId.Value)
             .SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
 
@@ -1827,6 +2295,7 @@ public sealed class FinanceController : ControllerBase
         public string Category { get; set; } = "";
         public string Karat { get; set; } = "";
         public decimal Quantity { get; set; }
+        public decimal? DeliveredQuantity { get; set; }
         public string QuantityDisplay { get; set; } = "";
         public decimal Revenue { get; set; }
         public decimal RevenueHas { get; set; }
@@ -1900,6 +2369,7 @@ public sealed class FinanceController : ControllerBase
                 i.Category,
                 i.ProductItemId,
                 i.Quantity,
+                i.DeliveredQuantity,
                 Revenue = i.LineTotal
             }))
             .ToListAsync(ct);
@@ -2160,6 +2630,7 @@ public sealed class FinanceController : ControllerBase
                 Category = x.Category ?? "",
                 Karat = x.Karat ?? "",
                 Quantity = x.Quantity,
+                DeliveredQuantity = x.DeliveredQuantity,
                 QuantityDisplay = quantityDisplay,
                 Revenue = x.Revenue,
                 RevenueHas = resolvedRevenueHas,
@@ -2677,10 +3148,10 @@ public sealed class FinanceController : ControllerBase
         decimal SumByCurrency(string cur) => allAccounts.Where(x => x.Currency == cur).Sum(x => x.CurrentBalance);
 
         var income = await _db.CashTransactions.AsNoTracking()
-            .Where(x => x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted && x.TxDate >= day && x.TxDate < next && x.TxType == "Income")
+            .Where(x => x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted && !x.IsReversed && x.TxDate >= day && x.TxDate < next && x.TxType == "Income")
             .SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
         var expense = await _db.CashTransactions.AsNoTracking()
-            .Where(x => x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted && x.TxDate >= day && x.TxDate < next && x.TxType == "Expense")
+            .Where(x => x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted && !x.IsReversed && x.TxDate >= day && x.TxDate < next && x.TxType == "Expense")
             .SumAsync(x => (decimal?)x.Amount, ct) ?? 0m;
 
         var row = new kuyumcu_domain.Entities.DayEndReport

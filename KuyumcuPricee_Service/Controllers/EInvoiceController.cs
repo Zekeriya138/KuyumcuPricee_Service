@@ -94,6 +94,8 @@ END", ct);
             return BadRequest(new { error = "Vergi numarası en az 10 hane olmalıdır." });
         if (string.IsNullOrWhiteSpace(req.TaxOffice))
             return BadRequest(new { error = "Vergi dairesi zorunludur." });
+        if (string.IsNullOrWhiteSpace(req.CompanyName))
+            return BadRequest(new { error = "Firma adı zorunludur." });
         if (string.IsNullOrWhiteSpace(req.CompanyAddress))
             return BadRequest(new { error = "Firma adresi zorunludur." });
         if (string.IsNullOrWhiteSpace(req.IntegratorUsername))
@@ -186,7 +188,7 @@ END", ct);
         }
 
         profile.ProviderCode = string.IsNullOrWhiteSpace(req.ProviderCode) ? "edm" : req.ProviderCode.Trim().ToLowerInvariant();
-        profile.CompanyName = string.IsNullOrWhiteSpace(req.CompanyName) ? "Firma" : req.CompanyName.Trim();
+        profile.CompanyName = req.CompanyName.Trim();
         profile.CompanyAddress = req.CompanyAddress.Trim();
         profile.TaxNumber = req.TaxNumber.Trim();
         profile.TaxOffice = req.TaxOffice.Trim();
@@ -197,6 +199,128 @@ END", ct);
         if (!string.IsNullOrWhiteSpace(req.IntegratorPassword))
             profile.IntegratorSecretRef = req.IntegratorPassword.Trim();
         profile.IsActive = req.IsActive;
+        profile.IntegratorCompanyCode = EInvoiceProfileSettingsCodec.Encode(new EInvoiceProfileSettings
+        {
+            SpecialMatrahCraftedVatRatePercent = req.SpecialMatrahCraftedVatRatePercent,
+            SpecialMatrahZiynetVatRatePercent = req.SpecialMatrahZiynetVatRatePercent,
+            SalesInvoiceVatRatePercent = req.SalesInvoiceVatRatePercent,
+            AutoDraftEnabled = req.AutoDraftEnabled,
+            AutoDraftMatchMode = req.AutoDraftMatchMode,
+            AutoDraftAllowedPaymentMethods = req.AutoDraftAllowedPaymentMethods ?? [],
+            AutoDraftMinTotal = req.AutoDraftMinTotal,
+            AutoDraftMaxTotal = req.AutoDraftMaxTotal,
+            WorkmanshipRules = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipRules(normalizedWorkmanshipRules)
+        });
+
+        await _db.SaveChangesAsync(ct);
+        return Ok(ToDto(profile));
+    }
+
+    [HttpPut("profile/invoice-settings")]
+    [Authorize]
+    public async Task<IActionResult> UpsertInvoiceSettings([FromBody] SaveInvoiceSettingsReq req, CancellationToken ct)
+    {
+        if (!CanUseEInvoice())
+            return Forbid();
+        var tid = _tenant.TenantId;
+        try
+        {
+            await _db.Database.ExecuteSqlRawAsync(@"
+IF COL_LENGTH('EInvoiceProfiles', 'IntegratorCompanyCode') IS NOT NULL
+BEGIN
+    ALTER TABLE [dbo].[EInvoiceProfiles] ALTER COLUMN [IntegratorCompanyCode] nvarchar(max) NULL;
+END", ct);
+        }
+        catch
+        {
+            // Kolon zaten uygunsa kaydı engelleme.
+        }
+
+        if (req.BranchId == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+        if (req.SpecialMatrahCraftedVatRatePercent < 0m || req.SpecialMatrahCraftedVatRatePercent > 100m)
+            return BadRequest(new { error = "İşçilikli ürün KDV oranı 0-100 arasında olmalıdır." });
+        if (req.SpecialMatrahZiynetVatRatePercent < 0m || req.SpecialMatrahZiynetVatRatePercent > 100m)
+            return BadRequest(new { error = "Ziynet ürün KDV oranı 0-100 arasında olmalıdır." });
+        if (req.SalesInvoiceVatRatePercent < 0m || req.SalesInvoiceVatRatePercent > 100m)
+            return BadRequest(new { error = "Satış faturası KDV oranı 0-100 arasında olmalıdır." });
+        if (req.AutoDraftMinTotal.HasValue && req.AutoDraftMaxTotal.HasValue &&
+            req.AutoDraftMaxTotal.Value > 0m && req.AutoDraftMinTotal.Value > req.AutoDraftMaxTotal.Value)
+            return BadRequest(new { error = "Otomatik taslak alt tutarı üst tutardan büyük olamaz." });
+
+        var normalizedWorkmanshipRules = (req.WorkmanshipRules ?? [])
+            .Select(x => new WorkmanshipRuleSetting
+            {
+                ProductType = x.ProductType,
+                Karat = x.Karat,
+                MinTotal = x.MinTotal,
+                MaxTotal = x.MaxTotal,
+                Percentage = x.Percentage
+            })
+            .ToList();
+
+        foreach (var rule in normalizedWorkmanshipRules)
+        {
+            var productType = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipProductType(rule.ProductType);
+            if (productType != EInvoiceProfileSettingsCodec.WorkmanshipProductTypeCrafted &&
+                productType != EInvoiceProfileSettingsCodec.WorkmanshipProductTypeZiynet &&
+                productType != EInvoiceProfileSettingsCodec.WorkmanshipProductTypeCollection)
+                return BadRequest(new { error = "İşçilik kuralı ürün tipi geçersiz." });
+            if (rule.MinTotal < 0m)
+                return BadRequest(new { error = "İşçilik kuralı alt limit 0'dan küçük olamaz." });
+            if (rule.MaxTotal <= 0m)
+                return BadRequest(new { error = "İşçilik kuralı üst limit 0'dan büyük olmalıdır." });
+            if (rule.MinTotal > rule.MaxTotal)
+                return BadRequest(new { error = "İşçilik kuralı alt limit üst limitten büyük olamaz." });
+            if (rule.Percentage < 0m || rule.Percentage > 100m)
+                return BadRequest(new { error = "İşçilik yüzdesi 0-100 arasında olmalıdır." });
+            var normalizedSelector = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipSelector(productType, rule.Karat);
+            if (string.IsNullOrWhiteSpace(normalizedSelector))
+            {
+                var msg = string.Equals(productType, EInvoiceProfileSettingsCodec.WorkmanshipProductTypeZiynet, StringComparison.OrdinalIgnoreCase)
+                    ? "Ziynet ürün seçimi geçersiz."
+                    : string.Equals(productType, EInvoiceProfileSettingsCodec.WorkmanshipProductTypeCollection, StringComparison.OrdinalIgnoreCase)
+                        ? "Tahsilat kuralı geçersiz."
+                        : "Ayar seçimi geçersiz. Sadece 24K, 22K, 18K, 14K, 8K desteklenir.";
+                return BadRequest(new { error = msg });
+            }
+        }
+
+        var overlapGroup = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipRules(normalizedWorkmanshipRules)
+            .GroupBy(x => $"{EInvoiceProfileSettingsCodec.NormalizeWorkmanshipProductType(x.ProductType)}|{EInvoiceProfileSettingsCodec.NormalizeWorkmanshipSelector(x.ProductType, x.Karat)}",
+                StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(g =>
+            {
+                var ordered = g.OrderBy(x => x.MinTotal).ThenBy(x => x.MaxTotal).ToList();
+                for (var i = 1; i < ordered.Count; i++)
+                {
+                    if (ordered[i].MinTotal <= ordered[i - 1].MaxTotal)
+                        return true;
+                }
+                return false;
+            });
+        if (overlapGroup is not null)
+            return BadRequest(new { error = "İşçilik kurallarında çakışan tutar aralıkları var. Aynı ürün tipi ve ayar için aralıklar üst üste gelemez." });
+
+        var profile = await _db.EInvoiceProfiles.FirstOrDefaultAsync(x => x.TenantId == tid && x.BranchId == req.BranchId, ct);
+        if (profile is null)
+        {
+            profile = new kuyumcu_domain.Entities.EInvoiceProfile
+            {
+                TenantId = tid,
+                BranchId = req.BranchId,
+                ProviderCode = "edm",
+                CompanyName = "-",
+                CompanyAddress = "-",
+                TaxNumber = "0000000000",
+                TaxOffice = "-",
+                DefaultInvoicePrefix = "AUR",
+                DefaultArchivePrefix = "ARS",
+                IsActive = false
+            };
+            _db.EInvoiceProfiles.Add(profile);
+        }
+
         profile.IntegratorCompanyCode = EInvoiceProfileSettingsCodec.Encode(new EInvoiceProfileSettings
         {
             SpecialMatrahCraftedVatRatePercent = req.SpecialMatrahCraftedVatRatePercent,
@@ -1232,6 +1356,20 @@ END", ct);
         public List<WorkmanshipRuleDto>? WorkmanshipRules { get; set; }
     }
 
+    public sealed class SaveInvoiceSettingsReq
+    {
+        public Guid BranchId { get; set; }
+        public decimal SpecialMatrahCraftedVatRatePercent { get; set; } = 20m;
+        public decimal SpecialMatrahZiynetVatRatePercent { get; set; } = 20m;
+        public decimal SalesInvoiceVatRatePercent { get; set; } = 20m;
+        public bool AutoDraftEnabled { get; set; } = true;
+        public string AutoDraftMatchMode { get; set; } = "ANY";
+        public List<string>? AutoDraftAllowedPaymentMethods { get; set; }
+        public decimal? AutoDraftMinTotal { get; set; }
+        public decimal? AutoDraftMaxTotal { get; set; }
+        public List<WorkmanshipRuleDto>? WorkmanshipRules { get; set; }
+    }
+
     public sealed class TestEInvoiceConnectionReq
     {
         public Guid BranchId { get; set; }
@@ -1346,7 +1484,8 @@ END", ct);
                 .Select(x => new WorkmanshipRuleDto
                 {
                     ProductType = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipProductType(x.ProductType),
-                    Karat = EInvoiceProfileSettingsCodec.ToWorkmanshipSelectorDisplay(x.ProductType, x.Karat),
+                    Karat = EInvoiceProfileSettingsCodec.NormalizeWorkmanshipSelector(x.ProductType, x.Karat)
+                              ?? x.Karat,
                     MinTotal = x.MinTotal,
                     MaxTotal = x.MaxTotal,
                     Percentage = x.Percentage

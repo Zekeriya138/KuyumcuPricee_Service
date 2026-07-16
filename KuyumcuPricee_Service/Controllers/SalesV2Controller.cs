@@ -23,6 +23,7 @@ public sealed class SalesV2Controller : ControllerBase
     private readonly IAccountingJournalService _accounting;
     private readonly IScrapService _scrap;
     private readonly IEInvoiceWorkflowService _eInvoiceWorkflow;
+    private readonly TransactionReversalService _reversal;
 
     public SalesV2Controller(
         AppDbContext db,
@@ -31,7 +32,8 @@ public sealed class SalesV2Controller : ControllerBase
         IFinanceService finance,
         IAccountingJournalService accounting,
         IScrapService scrap,
-        IEInvoiceWorkflowService eInvoiceWorkflow)
+        IEInvoiceWorkflowService eInvoiceWorkflow,
+        TransactionReversalService reversal)
     {
         _db = db;
         _stock = stock;
@@ -40,6 +42,7 @@ public sealed class SalesV2Controller : ControllerBase
         _accounting = accounting;
         _scrap = scrap;
         _eInvoiceWorkflow = eInvoiceWorkflow;
+        _reversal = reversal;
     }
 
     // -------- Tenant helper --------
@@ -101,6 +104,7 @@ public sealed class SalesV2Controller : ControllerBase
 
         int lineNo = 0;
         decimal subtotal = 0m, discTot = 0m, taxTot = 0m, grandTot = 0m;
+        var deliveredQtyByLineNo = new Dictionary<int, decimal>();
 
         foreach (var it in req.Items)
         {
@@ -114,6 +118,18 @@ public sealed class SalesV2Controller : ControllerBase
                 return BadRequest(new { error = "ProductCode zorunludur." });
 
             var isVirtualForexLine = IsVirtualForexSaleItem(it.ProductCode ?? "", it.Category);
+            var isDovizItem = string.Equals((it.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase)
+                              || isVirtualForexLine;
+            var isGumusItem = string.Equals((it.Category ?? "").Trim(), "GUMUS", StringComparison.OrdinalIgnoreCase);
+            if ((isDovizItem || isGumusItem) && it.DeliveredQuantity.HasValue)
+            {
+                var delivered = Math.Round(it.DeliveredQuantity.Value, 4, MidpointRounding.AwayFromZero);
+                if (delivered < 0 || delivered > it.Quantity)
+                    return BadRequest(new { error = "Teslim miktarı 0 ile satır miktarı arasında olmalıdır." });
+                if (delivered < it.Quantity - 0.0001m && !req.CustomerId.HasValue)
+                    return BadRequest(new { error = "Teslim edilmeyen kısım için müşteri seçilmelidir." });
+            }
+
             Product? product = null;
             if (!string.IsNullOrWhiteSpace(it.ProductCode))
             {
@@ -177,18 +193,25 @@ public sealed class SalesV2Controller : ControllerBase
             taxTot += Math.Round(tax, 2);
             grandTot += lineTotal;
 
+            var assignedLineNo = it.LineNo ?? ++lineNo;
+            if ((isDovizItem || isGumusItem) && it.DeliveredQuantity.HasValue)
+                deliveredQtyByLineNo[assignedLineNo] = Math.Round(it.DeliveredQuantity.Value, 4, MidpointRounding.AwayFromZero);
+
             sale.Items.Add(new SaleItem
             {
                 Id = Guid.NewGuid(),
                 TenantId = tenantId,
                 SaleId = sale.Id,
-                LineNo = it.LineNo ?? ++lineNo,
+                LineNo = assignedLineNo,
                 Kind = ResolveSaleItemKind(isVirtualForexLine, product, it.Category, it.Karat, it.ProductName),
                 ProductCode = it.ProductCode.Trim(),
                 ProductName = it.ProductName?.Trim() ?? "",
                 Karat = it.Karat?.Trim() ?? "",
                 Category = string.IsNullOrWhiteSpace(it.Category) ? null : it.Category.Trim(),
                 Quantity = it.Quantity,
+                DeliveredQuantity = (isDovizItem || isGumusItem) && it.DeliveredQuantity.HasValue
+                    ? Math.Round(it.DeliveredQuantity.Value, 4, MidpointRounding.AwayFromZero)
+                    : null,
                 UnitPrice = it.UnitPrice,
                 Discount = it.Discount,
                 TaxRate = it.TaxRate,
@@ -248,6 +271,7 @@ public sealed class SalesV2Controller : ControllerBase
         await using var tx = await _db.Database.BeginTransactionAsync(ct);
         try
         {
+            var batchId = Guid.NewGuid();
             _db.Sales.Add(sale);
             _db.SaleItems.AddRange(sale.Items);
             await _db.SaveChangesAsync(ct);
@@ -400,7 +424,33 @@ public sealed class SalesV2Controller : ControllerBase
                 sale.Items,
                 sign: -1m,
                 description: "Doviz satisi kasa cikisi",
-                ct: ct);
+                ct: ct,
+                deliveredQtyByLineNo: deliveredQtyByLineNo.Count > 0 ? deliveredQtyByLineNo : null);
+
+            if (deliveryType != "EMANET" && sale.CustomerId.HasValue && deliveredQtyByLineNo.Count > 0)
+            {
+                await ApplyUndeliveredMetalCustomerCreditAsync(
+                    tenantId,
+                    sale.CustomerId.Value,
+                    sale.BranchId,
+                    sale.Id,
+                    sale.Items,
+                    deliveredQtyByLineNo,
+                    req.EmanetDovizLedgerByUnit,
+                    batchId,
+                    sale.CreatedAt,
+                    ct);
+            }
+
+            await ApplySilverVaultAdjustmentAsync(
+                tenantId,
+                sale.BranchId,
+                sale.Id,
+                sale.Items,
+                sign: -1m,
+                description: "Gumus satisi kasa cikisi",
+                ct: ct,
+                deliveredQtyByLineNo: deliveredQtyByLineNo.Count > 0 ? deliveredQtyByLineNo : null);
 
             // Satılan tekil barkodlu ürünün stokta açık parçası kalmadıysa ürün kartından düş.
             foreach (var productId in soldTekilProductIds)
@@ -442,51 +492,26 @@ public sealed class SalesV2Controller : ControllerBase
                     foreach (var si in sale.Items)
                     {
                         productMap.TryGetValue(si.ProductCode, out var prod);
+                        if (await TryApplyHasAltinSaleLedgerAsync(
+                                _db, tenantId, customerId, sale, si, prod, bal,
+                                direction: -1, noteSuffix: "ziynet has veresiye", batchId, ct))
+                            continue;
+
                         var isDoviz = string.Equals((si.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase)
                                       || string.Equals((prod?.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase);
                         if (isDoviz) continue;
 
-                        var isZiynet =
-                            (prod != null &&
-                             ((prod.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil) == kuyumcu_domain.Enums.InventoryType.Ziynet))
-                            || IsZiynetCategoryToken(si.Category)
-                            || IsZiynetCategoryToken(prod?.Category)
-                            || IsZiynetCategoryToken(si.ProductName)
-                            || IsZiynetCategoryToken(prod?.Name)
-                            || IsZiynetCategoryToken(prod?.ZiynetTipi);
+                            var isZiynet =
+                                ((prod != null &&
+                                  ((prod.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil) == kuyumcu_domain.Enums.InventoryType.Ziynet))
+                                 || IsZiynetCategoryToken(si.Category)
+                                 || IsZiynetCategoryToken(prod?.Category)
+                                 || IsZiynetCategoryToken(si.ProductName)
+                                 || IsZiynetCategoryToken(prod?.Name)
+                                 || IsZiynetCategoryToken(prod?.ZiynetTipi))
+                                && !IsHasAltinZiynetSaleItem(prod, si);
                         if (isZiynet)
                         {
-                            if (IsHasAltinZiynetSaleItem(prod, si))
-                            {
-                                var hasQty = Math.Abs(si.Quantity);
-                                if (hasQty > 0m)
-                                {
-                                    bal.BalanceHAS -= hasQty;
-                                    await CustomerFinanceHelper.AddTransactionAsync(
-                                        _db,
-                                        tenantId,
-                                        customerId,
-                                        sale.BranchId,
-                                        groupCode: "DOVIZ",
-                                        itemName: "HAS",
-                                        itemType: null,
-                                        quantity: hasQty,
-                                        direction: -1,
-                                        gram: hasQty,
-                                        ayar: "HAS",
-                                        milyem: CustomerFinanceHelper.MilyemFromAyar(si.Karat),
-                                        hasEq: hasQty,
-                                        unitPriceTl: si.UnitPrice,
-                                        totalPriceTl: si.LineTotal,
-                                        refType: "SALE",
-                                        refId: sale.Id,
-                                        note: $"Satis L{si.LineNo} (ziynet has veresiye)",
-                                        txDate: sale.CreatedAt,
-                                        ct: ct);
-                                }
-                                continue;
-                            }
-
                             await CustomerFinanceHelper.AddTransactionAsync(
                                 _db,
                                 tenantId,
@@ -509,7 +534,8 @@ public sealed class SalesV2Controller : ControllerBase
                                 refId: sale.Id,
                                 note: $"Satis L{si.LineNo} (ziynet veresiye)",
                                 txDate: sale.CreatedAt,
-                                ct: ct);
+                                ct: ct,
+                                batchId: batchId);
                             continue;
                         }
 
@@ -535,7 +561,8 @@ public sealed class SalesV2Controller : ControllerBase
                             refId: sale.Id,
                             note: $"Satis L{si.LineNo} (yalniz veresiye)",
                             txDate: sale.CreatedAt,
-                            ct: ct);
+                            ct: ct,
+                            batchId: batchId);
                     }
 
                     var hasNonForexItem = sale.Items.Any(si =>
@@ -550,40 +577,17 @@ public sealed class SalesV2Controller : ControllerBase
                     {
                         foreach (var vp in payments.Where(x => string.Equals(x.Method, "Veresiye", StringComparison.OrdinalIgnoreCase)))
                         {
-                            var unit = NormalizeForexCurrency(vp.Currency).ToUpperInvariant();
-                            if (string.IsNullOrWhiteSpace(unit)) unit = "TL";
-                            var amount = Math.Round(vp.Amount, 4, MidpointRounding.AwayFromZero);
-                            if (amount <= 0m) continue;
-
-                            ApplyBalanceDeltaByUnit(bal, unit, -amount);
-                            await CustomerFinanceHelper.AddTransactionAsync(
-                                _db,
-                                tenantId,
-                                customerId,
-                                sale.BranchId,
-                                groupCode: "DOVIZ",
-                                itemName: unit,
-                                itemType: null,
-                                quantity: amount,
-                                direction: -1,
-                                gram: null,
-                                ayar: unit,
-                                milyem: null,
-                                hasEq: null,
-                                unitPriceTl: null,
-                                totalPriceTl: vp.AmountTl,
-                                refType: "SALE",
-                                refId: sale.Id,
+                            await ApplyVeresiyePaymentToCustomerAsync(
+                                bal, tenantId, customerId, sale.BranchId, sale.Id, vp,
                                 note: "Yalniz veresiye odeme birimi",
-                                txDate: sale.CreatedAt,
-                                ct: ct);
+                                txDate: sale.CreatedAt, batchId, ct);
                         }
                     }
                     bal.UpdatedAt = DateTime.UtcNow;
                 }
                 else
                 {
-                    if (deliveryType == "EMANET")
+                    if (deliveryType == "EMANET" && !req.SkipEmanetCustomerLedger)
                     {
                         var hasRate = unitRates.TryGetValue("HAS", out var h) && h > 0 ? h : 0m;
                         var bal = await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, customerId, ct);
@@ -603,6 +607,11 @@ public sealed class SalesV2Controller : ControllerBase
                         foreach (var si in sale.Items)
                         {
                             productMap.TryGetValue(si.ProductCode, out var prod);
+                            if (await TryApplyHasAltinSaleLedgerAsync(
+                                    _db, tenantId, customerId, sale, si, prod, bal,
+                                    direction: +1, noteSuffix: "ziynet has emanet", batchId, ct))
+                                continue;
+
                             var isDoviz = string.Equals((si.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase)
                                           || string.Equals((prod?.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase);
                             if (isDoviz)
@@ -612,76 +621,33 @@ public sealed class SalesV2Controller : ControllerBase
                                 var amount = Math.Round(Math.Abs(si.Quantity), 4, MidpointRounding.AwayFromZero);
                                 if (amount > 0m)
                                 {
-                                    // Emanet döviz satışında müşteri döviz bakiyesi artar (+).
-                                    ApplyBalanceDeltaByUnit(bal, unit, +amount);
-                                    await CustomerFinanceHelper.AddTransactionAsync(
-                                        _db,
-                                        tenantId,
-                                        customerId,
-                                        sale.BranchId,
-                                        groupCode: "DOVIZ",
-                                        itemName: unit,
-                                        itemType: null,
-                                        quantity: amount,
-                                        direction: +1,
-                                        gram: null,
-                                        ayar: unit,
-                                        milyem: null,
-                                        hasEq: null,
+                                    string? ledgerSide = null;
+                                    req.EmanetDovizLedgerByUnit?.TryGetValue(unit, out ledgerSide);
+                                    await CustomerFinanceHelper.ApplyEmanetDovizLegAsync(
+                                        _db, bal, tenantId, customerId, sale.BranchId,
+                                        unit, amount, ledgerSide,
                                         unitPriceTl: si.UnitPrice,
                                         totalPriceTl: si.LineTotal,
-                                        refType: "SALE",
-                                        refId: sale.Id,
+                                        gram: null, ayar: unit, hasEq: null,
+                                        refType: "SALE", refId: sale.Id,
                                         note: $"Satis L{si.LineNo} (emanet doviz)",
-                                        txDate: sale.CreatedAt,
-                                        ct: ct);
+                                        txDate: sale.CreatedAt, batchId: batchId, ct: ct,
+                                        applyBalanceDelta: ApplyBalanceDeltaByUnit);
                                 }
                                 continue;
                             }
 
                             var isZiynet =
-                                (prod != null &&
-                                 ((prod.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil) == kuyumcu_domain.Enums.InventoryType.Ziynet))
-                                || IsZiynetCategoryToken(si.Category)
-                                || IsZiynetCategoryToken(prod?.Category)
-                                || IsZiynetCategoryToken(si.ProductName)
-                                || IsZiynetCategoryToken(prod?.Name)
-                                || IsZiynetCategoryToken(prod?.ZiynetTipi);
+                                ((prod != null &&
+                                  ((prod.InventoryType ?? kuyumcu_domain.Enums.InventoryType.Tekil) == kuyumcu_domain.Enums.InventoryType.Ziynet))
+                                 || IsZiynetCategoryToken(si.Category)
+                                 || IsZiynetCategoryToken(prod?.Category)
+                                 || IsZiynetCategoryToken(si.ProductName)
+                                 || IsZiynetCategoryToken(prod?.Name)
+                                 || IsZiynetCategoryToken(prod?.ZiynetTipi))
+                                && !IsHasAltinZiynetSaleItem(prod, si);
                             if (isZiynet)
                             {
-                                // Has altın ziynet kalemi: adet defterine değil, DOVIZ/HAS bakiyesine yaz.
-                                if (IsHasAltinZiynetSaleItem(prod, si))
-                                {
-                                    var hasQtyEmanet = Math.Abs(si.Quantity);
-                                    if (hasQtyEmanet > 0m)
-                                    {
-                                        // Emanet (teslim edilmeyen) has altın: müşteri alacaklı → HAS bakiyesi artar (+).
-                                        bal.BalanceHAS += hasQtyEmanet;
-                                        await CustomerFinanceHelper.AddTransactionAsync(
-                                            _db,
-                                            tenantId,
-                                            customerId,
-                                            sale.BranchId,
-                                            groupCode: "DOVIZ",
-                                            itemName: "HAS",
-                                            itemType: null,
-                                            quantity: hasQtyEmanet,
-                                            direction: +1,
-                                            gram: hasQtyEmanet,
-                                            ayar: "HAS",
-                                            milyem: CustomerFinanceHelper.MilyemFromAyar(si.Karat),
-                                            hasEq: hasQtyEmanet,
-                                            unitPriceTl: si.UnitPrice,
-                                            totalPriceTl: si.LineTotal,
-                                            refType: "SALE",
-                                            refId: sale.Id,
-                                            note: $"Satis L{si.LineNo} (ziynet has emanet)",
-                                            txDate: sale.CreatedAt,
-                                            ct: ct);
-                                    }
-                                    continue;
-                                }
-
                                 // Tip önceliği: request Olcu (Yeni/Eski) → katalog ürünü Olcu → "Yeni".
                                 var rawTip = reqOlcuByLine.TryGetValue(si.LineNo, out var reqOlcu) && !string.IsNullOrWhiteSpace(reqOlcu)
                                     ? reqOlcu!.Trim()
@@ -708,7 +674,8 @@ public sealed class SalesV2Controller : ControllerBase
                                     refId: sale.Id,
                                     note: $"Satis L{si.LineNo} (ziynet teslim edilmeyen)",
                                     txDate: sale.CreatedAt,
-                                    ct: ct);
+                                    ct: ct,
+                                    batchId: batchId);
                                 continue;
                             }
 
@@ -734,7 +701,8 @@ public sealed class SalesV2Controller : ControllerBase
                                 refId: sale.Id,
                                 note: $"Satis L{si.LineNo} (emanet)",
                                 txDate: sale.CreatedAt,
-                                ct: ct);
+                                ct: ct,
+                                batchId: batchId);
                         }
                         bal.UpdatedAt = DateTime.UtcNow;
                     }
@@ -745,32 +713,10 @@ public sealed class SalesV2Controller : ControllerBase
                         var bal = await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, customerId, ct);
                         foreach (var vp in payments.Where(x => string.Equals(x.Method, "Veresiye", StringComparison.OrdinalIgnoreCase)))
                         {
-                            var unit = (vp.Currency ?? "TL").Trim().ToUpperInvariant();
-                            var amount = Math.Round(vp.Amount, 4, MidpointRounding.AwayFromZero);
-                            if (amount <= 0) continue;
-                            ApplyBalanceDeltaByUnit(bal, unit, -amount);
-
-                            await CustomerFinanceHelper.AddTransactionAsync(
-                                _db,
-                                tenantId,
-                                customerId,
-                                sale.BranchId,
-                                groupCode: "DOVIZ",
-                                itemName: unit,
-                                itemType: null,
-                                quantity: amount,
-                                direction: -1,
-                                gram: null,
-                                ayar: null,
-                                milyem: null,
-                                hasEq: null,
-                                unitPriceTl: unit == "TL" ? 1m : null,
-                                totalPriceTl: vp.AmountTl,
-                                refType: "SALE",
-                                refId: sale.Id,
+                            await ApplyVeresiyePaymentToCustomerAsync(
+                                bal, tenantId, customerId, sale.BranchId, sale.Id, vp,
                                 note: "Karma odeme veresiye kismi",
-                                txDate: sale.CreatedAt,
-                                ct: ct);
+                                txDate: sale.CreatedAt, batchId, ct);
                         }
                         bal.UpdatedAt = DateTime.UtcNow;
                     }
@@ -937,7 +883,18 @@ public sealed class SalesV2Controller : ControllerBase
                 s.Items,
                 sign: +1m,
                 description: "Doviz satisi geri alim (update)",
-                ct: ct);
+                ct: ct,
+                useCashTransactionHistory: true);
+
+            await ApplySilverVaultAdjustmentAsync(
+                tenantId,
+                previousBranchId,
+                s.Id,
+                s.Items,
+                sign: +1m,
+                description: "Gumus satisi geri alim (update)",
+                ct: ct,
+                useCashTransactionHistory: true);
 
             s.BranchId = req.BranchId;
             s.CustomerId = req.CustomerId;
@@ -1052,6 +1009,15 @@ public sealed class SalesV2Controller : ControllerBase
                 description: "Doviz satisi kasa cikisi (update)",
                 ct: ct);
 
+            await ApplySilverVaultAdjustmentAsync(
+                tenantId,
+                s.BranchId,
+                s.Id,
+                s.Items,
+                sign: -1m,
+                description: "Gumus satisi kasa cikisi (update)",
+                ct: ct);
+
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
 
@@ -1064,6 +1030,34 @@ public sealed class SalesV2Controller : ControllerBase
             throw;
         }
     }
+
+    [HttpPost("{id:guid}/reverse")]
+    public async Task<IActionResult> Reverse(Guid id, [FromBody] ReverseSaleReq req, CancellationToken ct)
+    {
+        var tenantId = GetTenantId();
+        var sale = await _db.Sales.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == id && x.TenantId == tenantId && !x.IsDeleted, ct);
+        if (sale is null) return NotFound();
+        var (userId, userName) = ResolveUser();
+        var result = await _reversal.ReverseSaleAsync(
+            tenantId, id, sale.CustomerId, null, req.Reason ?? "", userId, userName, ct);
+        if (!result.Ok) return BadRequest(new { error = result.Error });
+        return Ok(new { ok = true, reversalLogId = result.ReversalLogId, batchId = result.BatchId });
+    }
+
+    public sealed record ReverseSaleReq(string Reason);
+
+    private (Guid? userId, string? userName) ResolveUser()
+    {
+        var claim = User?.Claims?.FirstOrDefault(c =>
+            c.Type.Equals(ClaimTypes.NameIdentifier, StringComparison.OrdinalIgnoreCase) ||
+            c.Type.Equals("sub", StringComparison.OrdinalIgnoreCase))?.Value;
+        Guid? userId = Guid.TryParse(claim, out var g) ? g : null;
+        var name = User?.Claims?.FirstOrDefault(c => c.Type.Equals("full_name", StringComparison.OrdinalIgnoreCase))?.Value
+                   ?? User?.Identity?.Name;
+        return (userId, name);
+    }
+
     [HttpDelete("{id:guid}")]
     public async Task<IActionResult> Delete(Guid id, CancellationToken ct)
     {
@@ -1130,7 +1124,18 @@ public sealed class SalesV2Controller : ControllerBase
                 s.Items,
                 sign: +1m,
                 description: "Doviz satisi geri alim (delete)",
-                ct: ct);
+                ct: ct,
+                useCashTransactionHistory: true);
+
+            await ApplySilverVaultAdjustmentAsync(
+                tenantId,
+                s.BranchId,
+                s.Id,
+                s.Items,
+                sign: +1m,
+                description: "Gumus satisi geri alim (delete)",
+                ct: ct,
+                useCashTransactionHistory: true);
 
             await _db.SaveChangesAsync(ct);
             await tx.CommitAsync(ct);
@@ -1213,6 +1218,7 @@ public sealed class SalesV2Controller : ControllerBase
         public decimal AmountTl { get; init; }
         public string Currency { get; init; } = "TL";
         public string? Account { get; init; }
+        public string? LedgerSide { get; init; }
     }
 
     private static List<NormalizedPayment> NormalizePayments(
@@ -1257,7 +1263,8 @@ public sealed class SalesV2Controller : ControllerBase
                     Amount = amount,
                     AmountTl = amountTl,
                     Currency = currency,
-                    Account = string.IsNullOrWhiteSpace(p.Account) ? null : p.Account.Trim()
+                    Account = string.IsNullOrWhiteSpace(p.Account) ? null : p.Account.Trim(),
+                    LedgerSide = CustomerFinanceHelper.NormalizeLedgerSide(p.LedgerSide)
                 });
             }
         }
@@ -1370,41 +1377,64 @@ public sealed class SalesV2Controller : ControllerBase
 
     private static bool IsHasAltinZiynetSaleItem(Product? product, SaleItem item)
     {
-        var itemName = (item.ProductName ?? "").Trim().ToUpperInvariant();
-        var itemHasAltin = itemName.Contains("HAS ALTIN") || itemName.Contains("HASALTIN");
-        var itemLegacyGramHas = itemName.Contains("GRAM ALTIN(HAS)") || itemName.Contains("GRAM ALTIN (HAS)");
-        var itemKulce = itemName.Contains("KÜLÇE") || itemName.Contains("KULCE");
-        var item22AyarGram = (itemName.Contains("22 AYAR") || itemName.Contains("22AYAR")) &&
-                             (itemName.Contains("GR") || itemName.Contains("GRAM"));
-        if ((itemHasAltin || itemLegacyGramHas) && !itemKulce && !item22AyarGram)
+        if (CustomerFinanceHelper.ShouldRouteHasAltinToDovizBalance(
+                item.ProductName,
+                item.Category,
+                item.Karat,
+                product?.Name,
+                product?.Category,
+                product?.Karat,
+                product?.ZiynetTipi))
             return true;
 
-        var src = ((product?.ZiynetTipi ?? "") + " " +
-                   (product?.Name ?? "") + " " +
-                   (product?.Category ?? "") + " " +
-                   (item.ProductName ?? "") + " " +
-                   (item.Category ?? ""))
-            .Trim()
-            .ToUpperInvariant();
-        var legacyGramHas = src.Contains("GRAM ALTIN(HAS)") || src.Contains("GRAM ALTIN (HAS)");
-        var karat = (item.Karat ?? product?.Karat ?? "").Trim().ToUpperInvariant();
-        var is22AyarGram = (src.Contains("22 AYAR") || src.Contains("22AYAR")) &&
-                           (src.Contains("GR") || src.Contains("GRAM"));
-        var isKulceGram = src.Contains("KÜLÇE") || src.Contains("KULCE");
-        if (is22AyarGram || isKulceGram)
+        var normalized = NormalizeZiynetName(product, item.ProductName);
+        return CustomerFinanceHelper.IsHasAltinZiynetAd(normalized);
+    }
+
+    private static async Task<bool> TryApplyHasAltinSaleLedgerAsync(
+        AppDbContext db,
+        Guid tenantId,
+        Guid customerId,
+        Sale sale,
+        SaleItem si,
+        Product? prod,
+        CustomerBalance bal,
+        int direction,
+        string noteSuffix,
+        Guid batchId,
+        CancellationToken ct)
+    {
+        if (!IsHasAltinZiynetSaleItem(prod, si))
             return false;
-        if (legacyGramHas)
+
+        var hasQty = Math.Abs(si.Quantity);
+        if (hasQty <= 0m)
             return true;
 
-        var hasAltinText = src.Contains("HAS ALTIN") || src.Contains("HASALTIN");
-        var gramText = src.Contains("GRAM");
-
-        if (hasAltinText && !gramText)
-            return true;
-
-        var hasMatch = src.Contains("HAS");
-        var karatHasMatch = karat.Contains("24") || karat.Contains("999") || karat.Contains("HAS");
-        return !gramText && hasMatch && karatHasMatch;
+        bal.BalanceHAS += direction * hasQty;
+        await CustomerFinanceHelper.AddTransactionAsync(
+            db,
+            tenantId,
+            customerId,
+            sale.BranchId,
+            groupCode: "DOVIZ",
+            itemName: "HAS",
+            itemType: null,
+            quantity: hasQty,
+            direction: direction >= 0 ? +1 : -1,
+            gram: hasQty,
+            ayar: "HAS",
+            milyem: CustomerFinanceHelper.MilyemFromAyar(si.Karat),
+            hasEq: hasQty,
+            unitPriceTl: si.UnitPrice,
+            totalPriceTl: si.LineTotal,
+            refType: "SALE",
+            refId: sale.Id,
+            note: $"Satis L{si.LineNo} ({noteSuffix})",
+            txDate: sale.CreatedAt,
+            ct: ct,
+            batchId: batchId);
+        return true;
     }
 
     private async Task AddCustomerRecentSaleAuditAsync(
@@ -1441,6 +1471,116 @@ public sealed class SalesV2Controller : ControllerBase
             cariDurumOverride: "Finans");
     }
 
+    private async Task ApplyVeresiyePaymentToCustomerAsync(
+        CustomerBalance bal,
+        Guid tenantId,
+        Guid customerId,
+        Guid branchId,
+        Guid saleId,
+        NormalizedPayment vp,
+        string note,
+        DateTime txDate,
+        Guid batchId,
+        CancellationToken ct)
+    {
+        var unit = NormalizeForexCurrency(vp.Currency).ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(unit)) unit = "TL";
+        var amount = Math.Round(vp.Amount, 4, MidpointRounding.AwayFromZero);
+        if (amount <= 0m) return;
+
+        var ledgerSide = CustomerFinanceHelper.NormalizeLedgerSide(vp.LedgerSide);
+        if (string.IsNullOrEmpty(ledgerSide))
+        {
+            var (grossBorc, grossAlacak) = await GetCustomerDovizGrossAsync(tenantId, customerId, branchId, unit, ct);
+            ledgerSide = CustomerFinanceHelper.ResolveVeresiyeLedgerSideAuto(grossBorc, grossAlacak);
+        }
+
+        if (CustomerFinanceHelper.IsLedgerAlacak(ledgerSide))
+        {
+            var (direction, refType, balanceDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount);
+            ApplyBalanceDeltaByUnit(bal, unit, balanceDelta);
+            await CustomerFinanceHelper.AddTransactionAsync(
+                _db,
+                tenantId,
+                customerId,
+                branchId,
+                groupCode: "DOVIZ",
+                itemName: unit,
+                itemType: null,
+                quantity: amount,
+                direction: direction,
+                gram: null,
+                ayar: unit == "TL" ? null : unit,
+                milyem: null,
+                hasEq: null,
+                unitPriceTl: unit == "TL" ? 1m : null,
+                totalPriceTl: vp.AmountTl,
+                refType: refType,
+                refId: saleId,
+                note: note,
+                txDate: txDate,
+                ct: ct,
+                cariDurumOverride: "Alacakli",
+                batchId: batchId);
+        }
+        else
+        {
+            var (direction, cariDurum, balanceDelta) = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, amount);
+            ApplyBalanceDeltaByUnit(bal, unit, balanceDelta);
+            await CustomerFinanceHelper.AddTransactionAsync(
+                _db,
+                tenantId,
+                customerId,
+                branchId,
+                groupCode: "DOVIZ",
+                itemName: unit,
+                itemType: null,
+                quantity: amount,
+                direction: direction,
+                gram: null,
+                ayar: unit == "TL" ? null : unit,
+                milyem: null,
+                hasEq: null,
+                unitPriceTl: unit == "TL" ? 1m : null,
+                totalPriceTl: vp.AmountTl,
+                refType: "SALE",
+                refId: saleId,
+                note: note,
+                txDate: txDate,
+                ct: ct,
+                cariDurumOverride: cariDurum,
+                batchId: batchId);
+        }
+    }
+
+    private async Task<(decimal Borc, decimal Alacak)> GetCustomerDovizGrossAsync(
+        Guid tenantId, Guid customerId, Guid branchId, string unit, CancellationToken ct)
+    {
+        var normalizedUnit = NormalizeForexCurrency(unit).ToUpperInvariant();
+        if (string.IsNullOrWhiteSpace(normalizedUnit)) normalizedUnit = "TL";
+
+        var rows = await _db.CustomerTransactions.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.CustomerId == customerId && x.BranchId == branchId
+                        && !x.IsDeleted && !x.IsReversed && x.GroupCode == "DOVIZ"
+                        && x.ItemName == normalizedUnit)
+            .ToListAsync(ct);
+
+        if (normalizedUnit == "HAS")
+        {
+            var hasZiynetRows = await _db.CustomerTransactions.AsNoTracking()
+                .Where(x => x.TenantId == tenantId && x.CustomerId == customerId && x.BranchId == branchId
+                            && !x.IsDeleted && !x.IsReversed && x.GroupCode == "ZIYNET")
+                .ToListAsync(ct);
+            var misclassified = hasZiynetRows
+                .Where(x => CustomerFinanceHelper.IsHasAltinZiynetAd(
+                    CustomerFinanceHelper.NormalizeZiynetItemName(x.ItemName)))
+                .ToList();
+            rows = rows.Concat(misclassified).ToList();
+        }
+
+        return CustomerFinanceHelper.ComputeGrossColumns(rows);
+    }
+
     private static void ApplyBalanceDeltaByUnit(CustomerBalance bal, string unit, decimal delta)
     {
         var u = (unit ?? "TL").Trim().ToUpperInvariant();
@@ -1472,6 +1612,141 @@ public sealed class SalesV2Controller : ControllerBase
         }
     }
 
+    private async Task ApplyUndeliveredMetalCustomerCreditAsync(
+        Guid tenantId,
+        Guid customerId,
+        Guid branchId,
+        Guid saleId,
+        IEnumerable<SaleItem> items,
+        IReadOnlyDictionary<int, decimal> deliveredQtyByLineNo,
+        IReadOnlyDictionary<string, string>? emanetDovizLedgerByUnit,
+        Guid batchId,
+        DateTime txDate,
+        CancellationToken ct)
+    {
+        var bal = await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, customerId, ct);
+        var changed = false;
+        foreach (var si in items)
+        {
+            if (!deliveredQtyByLineNo.TryGetValue(si.LineNo, out var delivered))
+                continue;
+
+            var isDoviz = string.Equals((si.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase);
+            var isGumus = string.Equals((si.Category ?? "").Trim(), "GUMUS", StringComparison.OrdinalIgnoreCase)
+                          || si.Kind == ItemKind.Silver;
+            if (!isDoviz && !isGumus)
+                continue;
+
+            var total = Math.Round(Math.Abs(si.Quantity), 4, MidpointRounding.AwayFromZero);
+            var teslim = Math.Max(0m, Math.Min(delivered, total));
+            var kalan = Math.Round(total - teslim, 4, MidpointRounding.AwayFromZero);
+            if (kalan <= 0m)
+                continue;
+
+            string unit;
+            string note;
+            if (isGumus)
+            {
+                unit = "GUMUS";
+                note = $"Satis L{si.LineNo} (gumus teslim edilmeyen)";
+            }
+            else
+            {
+                unit = NormalizeForexCurrency(string.IsNullOrWhiteSpace(si.Karat) ? si.ProductName : si.Karat).ToUpperInvariant();
+                if (string.IsNullOrWhiteSpace(unit) || unit == "TL")
+                    continue;
+                note = $"Satis L{si.LineNo} (doviz teslim edilmeyen)";
+            }
+
+            string? ledgerSide = null;
+            emanetDovizLedgerByUnit?.TryGetValue(unit, out ledgerSide);
+            if (string.IsNullOrEmpty(ledgerSide))
+            {
+                var (grossBorc, grossAlacak) = await GetCustomerDovizGrossAsync(tenantId, customerId, branchId, unit, ct);
+                ledgerSide = CustomerFinanceHelper.ResolveEmanetLedgerSideAuto(grossBorc, grossAlacak);
+            }
+
+            await CustomerFinanceHelper.ApplyEmanetDovizLegAsync(
+                _db, bal, tenantId, customerId, branchId,
+                unit, kalan, ledgerSide,
+                unitPriceTl: si.UnitPrice,
+                totalPriceTl: Math.Round(si.UnitPrice * kalan, 2, MidpointRounding.AwayFromZero),
+                gram: isGumus ? kalan : null,
+                ayar: isGumus ? "Gümüş" : unit,
+                hasEq: null,
+                refType: "SALE", refId: saleId, note: note,
+                txDate: txDate, batchId: batchId, ct: ct,
+                applyBalanceDelta: ApplyBalanceDeltaByUnit);
+            changed = true;
+        }
+
+        if (changed)
+            bal.UpdatedAt = DateTime.UtcNow;
+    }
+
+    private async Task ApplySilverVaultAdjustmentAsync(
+        Guid tenantId,
+        Guid branchId,
+        Guid saleId,
+        IEnumerable<SaleItem> items,
+        decimal sign,
+        string description,
+        CancellationToken ct,
+        IReadOnlyDictionary<int, decimal>? deliveredQtyByLineNo = null,
+        bool useCashTransactionHistory = false)
+    {
+        decimal qty;
+        if (useCashTransactionHistory)
+        {
+            qty = await _db.CashTransactions.AsNoTracking()
+                .Where(x =>
+                    x.TenantId == tenantId &&
+                    x.BranchId == branchId &&
+                    x.RefType == "SALE" &&
+                    x.RefId == saleId &&
+                    x.SourceModule == "Sale" &&
+                    x.TxType == "Expense" &&
+                    x.Currency == "GUMUS" &&
+                    x.Description != null &&
+                    x.Description.Contains("Gumus satisi"))
+                .SumAsync(x => x.Amount, ct);
+        }
+        else
+        {
+            qty = items
+                .Where(x => string.Equals((x.Category ?? "").Trim(), "GUMUS", StringComparison.OrdinalIgnoreCase)
+                            || x.Kind == ItemKind.Silver)
+                .Sum(x =>
+                {
+                    var total = Math.Abs(x.Quantity);
+                    if (deliveredQtyByLineNo != null && deliveredQtyByLineNo.TryGetValue(x.LineNo, out var delivered))
+                        return Math.Max(0m, Math.Min(delivered, total));
+                    return total;
+                });
+        }
+
+        if (qty <= 0m) return;
+
+        var account = await GetOrCreateVaultAccountAsync(tenantId, branchId, "GUMUS", ct);
+        var delta = sign * qty;
+        account.CurrentBalance += delta;
+
+        _db.CashTransactions.Add(new CashTransaction
+        {
+            TenantId = tenantId,
+            BranchId = branchId,
+            CashAccountId = account.Id,
+            TxType = delta >= 0 ? "Income" : "Expense",
+            SourceModule = "Sale",
+            Currency = "GUMUS",
+            Amount = qty,
+            TxDate = DateTime.UtcNow,
+            RefType = "SALE",
+            RefId = saleId,
+            Description = $"{description}: GUMUS"
+        });
+    }
+
     private async Task ApplyForexVaultAdjustmentAsync(
         Guid tenantId,
         Guid branchId,
@@ -1479,22 +1754,52 @@ public sealed class SalesV2Controller : ControllerBase
         IEnumerable<SaleItem> items,
         decimal sign,
         string description,
-        CancellationToken ct)
+        CancellationToken ct,
+        IReadOnlyDictionary<int, decimal>? deliveredQtyByLineNo = null,
+        bool useCashTransactionHistory = false)
     {
-        var dovizRows = items
-            .Where(x => string.Equals((x.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase))
-            .Select(x => new
-            {
-                Currency = NormalizeForexCurrency(x.Karat),
-                Quantity = Math.Abs(x.Quantity)
-            })
-            .Where(x => (x.Currency == "USD" || x.Currency == "EUR" || x.Currency == "GBP" || x.Currency == "GUMUS") && x.Quantity > 0)
-            .GroupBy(x => x.Currency, StringComparer.OrdinalIgnoreCase)
-            .Select(g => new { Currency = g.Key.ToUpperInvariant(), Quantity = g.Sum(i => i.Quantity) })
-            .ToList();
+        List<(string Currency, decimal Quantity)> dovizRows;
+        if (useCashTransactionHistory)
+        {
+            dovizRows = await _db.CashTransactions.AsNoTracking()
+                .Where(x =>
+                    x.TenantId == tenantId &&
+                    x.BranchId == branchId &&
+                    x.RefType == "SALE" &&
+                    x.RefId == saleId &&
+                    x.SourceModule == "Sale" &&
+                    x.TxType == "Expense" &&
+                    x.Description != null &&
+                    x.Description.Contains("Doviz satisi"))
+                .GroupBy(x => x.Currency.ToUpperInvariant())
+                .Select(g => new ValueTuple<string, decimal>(g.Key, g.Sum(x => x.Amount)))
+                .ToListAsync(ct);
+        }
+        else
+        {
+            dovizRows = items
+                .Where(x => string.Equals((x.Category ?? "").Trim(), "DOVIZ", StringComparison.OrdinalIgnoreCase))
+                .Select(x =>
+                {
+                    var total = Math.Abs(x.Quantity);
+                    var vaultQty = total;
+                    if (deliveredQtyByLineNo != null && deliveredQtyByLineNo.TryGetValue(x.LineNo, out var delivered))
+                        vaultQty = Math.Max(0m, Math.Min(delivered, total));
+                    return new
+                    {
+                        Currency = NormalizeForexCurrency(x.Karat),
+                        Quantity = vaultQty
+                    };
+                })
+                .Where(x => (x.Currency == "USD" || x.Currency == "EUR" || x.Currency == "GBP" || x.Currency == "GUMUS") && x.Quantity > 0)
+                .GroupBy(x => x.Currency, StringComparer.OrdinalIgnoreCase)
+                .Select(g => new ValueTuple<string, decimal>(g.Key.ToUpperInvariant(), g.Sum(i => i.Quantity)))
+                .ToList();
+        }
 
         foreach (var row in dovizRows)
         {
+            if (row.Quantity <= 0m) continue;
             var account = await GetOrCreateVaultAccountAsync(tenantId, branchId, row.Currency, ct);
             var delta = sign * row.Quantity;
             account.CurrentBalance += delta;
@@ -1625,7 +1930,13 @@ public sealed class SalesV2Controller : ControllerBase
         if (v.Contains("22 AYAR") && (v.Contains("GR") || v.Contains("GRAM"))) return true;
         if (v.Contains("KÜLÇE") || v.Contains("KULCE")) return true;
         if (v == "GRAM" || v.Contains("GRAM ALTIN")) return true;
-        if (v.Contains("HAS ALTIN")) return true;
+        if (v.Contains("HAS ALTIN") || v.Contains("HASALTIN"))
+        {
+            // Saf has altın ziynet adet defterine değil DOVIZ/HAS'a gider.
+            if (!v.Contains("GRAM") && !v.Contains("KULCE") && !v.Contains("KÜLÇE")
+                && !((v.Contains("22 AYAR") || v.Contains("22AYAR")) && (v.Contains("GR") || v.Contains("GRAM"))))
+                return false;
+        }
         return false;
     }
 

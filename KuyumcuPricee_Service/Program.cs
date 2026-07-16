@@ -141,6 +141,8 @@ builder.Services.AddScoped<IFinanceService, FinanceService>();
 builder.Services.AddScoped<IAiService, AiService>();
 builder.Services.AddScoped<IBranchSubscriptionService, BranchSubscriptionService>();
 builder.Services.AddScoped<IAccountingJournalService, AccountingJournalService>();
+builder.Services.AddScoped<TransactionReversalService>();
+builder.Services.AddScoped<CariTransferService>();
 builder.Services.AddScoped<IBalanceSheetService, BalanceSheetService>();
 builder.Services.AddSingleton<IJewelryTaxCalculator, JewelryTaxCalculator>();
 builder.Services.AddSingleton<IJewelryProductTypeMapper, JewelryProductTypeMapper>();
@@ -369,6 +371,88 @@ IF OBJECT_ID(N'[dbo].[DepoGumusLots]', N'U') IS NOT NULL
 
     try
     {
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SaleItems') AND name = 'DeliveredQuantity') ALTER TABLE SaleItems ADD DeliveredQuantity decimal(18,4) NULL");
+    }
+    catch (Exception ex) { Console.WriteLine("EnsureSaleItemDeliveredQuantity: " + ex.Message); }
+
+    // Müşteri/tedarikçi özel notları: BranchNotes.OwnerType + OwnerId (migration atlanmış ortamlar).
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BranchNotes]', N'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('BranchNotes', 'OwnerId') IS NULL
+        ALTER TABLE [dbo].[BranchNotes] ADD [OwnerId] uniqueidentifier NULL;
+    IF COL_LENGTH('BranchNotes', 'OwnerType') IS NULL
+        ALTER TABLE [dbo].[BranchNotes] ADD [OwnerType] nvarchar(32) NULL;
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.indexes
+        WHERE name = N'IX_BranchNotes_TenantId_BranchId_OwnerType_OwnerId'
+          AND object_id = OBJECT_ID(N'[dbo].[BranchNotes]'))
+        CREATE INDEX [IX_BranchNotes_TenantId_BranchId_OwnerType_OwnerId]
+            ON [dbo].[BranchNotes]([TenantId],[BranchId],[OwnerType],[OwnerId]);
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BranchNotes]', N'U') IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM [dbo].[__EFMigrationsHistory] WHERE [MigrationId] = N'20260711020000_AddBranchNoteOwnerFields')
+    INSERT INTO [dbo].[__EFMigrationsHistory] ([MigrationId], [ProductVersion])
+    VALUES (N'20260711020000_AddBranchNoteOwnerFields', N'9.0.8');");
+    }
+    catch (Exception ex) { Console.WriteLine("EnsureBranchNoteOwnerFields: " + ex.Message); }
+
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[PlannedCashTransactions]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[PlannedCashTransactions](
+        [Id] uniqueidentifier NOT NULL CONSTRAINT [PK_PlannedCashTransactions] PRIMARY KEY,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [Title] nvarchar(200) NOT NULL,
+        [TxType] nvarchar(16) NOT NULL,
+        [Currency] nvarchar(8) NOT NULL,
+        [PaymentMethod] nvarchar(32) NOT NULL,
+        [Amount] decimal(18,4) NOT NULL,
+        [Description] nvarchar(500) NULL,
+        [CashTransactionId] uniqueidentifier NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_PlannedCashTransactions_IsDeleted] DEFAULT 0,
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_PlannedCashTransactions_CreatedAt] DEFAULT SYSUTCDATETIME()
+    );
+    CREATE INDEX [IX_PlannedCashTransactions_TenantId_BranchId_CreatedAt]
+        ON [dbo].[PlannedCashTransactions]([TenantId],[BranchId],[CreatedAt]);
+END");
+    }
+    catch (Exception ex) { Console.WriteLine("EnsurePlannedCashTransactions: " + ex.Message); }
+
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[PlannedCashTransactionLines]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[PlannedCashTransactionLines](
+        [Id] uniqueidentifier NOT NULL CONSTRAINT [PK_PlannedCashTransactionLines] PRIMARY KEY,
+        [TenantId] uniqueidentifier NOT NULL,
+        [PlannedCashTransactionId] uniqueidentifier NOT NULL,
+        [TxType] nvarchar(16) NOT NULL,
+        [Currency] nvarchar(8) NOT NULL,
+        [PaymentMethod] nvarchar(32) NOT NULL,
+        [Amount] decimal(18,4) NOT NULL,
+        [Description] nvarchar(500) NULL,
+        [CashTransactionId] uniqueidentifier NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_PlannedCashTransactionLines_IsDeleted] DEFAULT 0,
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_PlannedCashTransactionLines_CreatedAt] DEFAULT SYSUTCDATETIME(),
+        CONSTRAINT [FK_PlannedCashTransactionLines_PlannedCashTransactions_PlannedCashTransactionId]
+            FOREIGN KEY ([PlannedCashTransactionId]) REFERENCES [dbo].[PlannedCashTransactions]([Id]) ON DELETE CASCADE
+    );
+    CREATE INDEX [IX_PlannedCashTransactionLines_PlannedCashTransactionId_CreatedAt]
+        ON [dbo].[PlannedCashTransactionLines]([PlannedCashTransactionId],[CreatedAt]);
+END");
+    }
+    catch (Exception ex) { Console.WriteLine("EnsurePlannedCashTransactionLines: " + ex.Message); }
+
+    try
+    {
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'InventoryType') ALTER TABLE Products ADD InventoryType int NULL");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'StokMiktari') ALTER TABLE Products ADD StokMiktari int NULL");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Products') AND name = 'ZiynetTipi') ALTER TABLE Products ADD ZiynetTipi nvarchar(32) NULL");
@@ -388,6 +472,52 @@ END");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SupplierTransactions') AND name = 'KullaniciAdi') ALTER TABLE SupplierTransactions ADD KullaniciAdi nvarchar(200) NULL");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CashTransactions') AND name = 'UserId') ALTER TABLE CashTransactions ADD UserId uniqueidentifier NULL");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CashTransactions') AND name = 'KullaniciAdi') ALTER TABLE CashTransactions ADD KullaniciAdi nvarchar(200) NULL");
+        // İşlem geri alma: BatchId + IsReversed + TransactionReversalLogs
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CustomerTransactions') AND name = 'BatchId') ALTER TABLE CustomerTransactions ADD BatchId uniqueidentifier NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CustomerTransactions') AND name = 'IsReversed') ALTER TABLE CustomerTransactions ADD IsReversed bit NOT NULL CONSTRAINT DF_CustomerTransactions_IsReversed DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CustomerTransactions') AND name = 'ReversedAt') ALTER TABLE CustomerTransactions ADD ReversedAt datetime2 NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CustomerTransactions') AND name = 'ReversalLogId') ALTER TABLE CustomerTransactions ADD ReversalLogId uniqueidentifier NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SupplierTransactions') AND name = 'BatchId') ALTER TABLE SupplierTransactions ADD BatchId uniqueidentifier NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SupplierTransactions') AND name = 'RefType') ALTER TABLE SupplierTransactions ADD RefType nvarchar(24) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SupplierTransactions') AND name = 'RefId') ALTER TABLE SupplierTransactions ADD RefId uniqueidentifier NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SupplierTransactions') AND name = 'IsReversed') ALTER TABLE SupplierTransactions ADD IsReversed bit NOT NULL CONSTRAINT DF_SupplierTransactions_IsReversed DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SupplierTransactions') AND name = 'ReversedAt') ALTER TABLE SupplierTransactions ADD ReversedAt datetime2 NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('SupplierTransactions') AND name = 'ReversalLogId') ALTER TABLE SupplierTransactions ADD ReversalLogId uniqueidentifier NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CashTransactions') AND name = 'BatchId') ALTER TABLE CashTransactions ADD BatchId uniqueidentifier NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CashTransactions') AND name = 'IsReversed') ALTER TABLE CashTransactions ADD IsReversed bit NOT NULL CONSTRAINT DF_CashTransactions_IsReversed DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('CashTransactions') AND name = 'ReversedAt') ALTER TABLE CashTransactions ADD ReversedAt datetime2 NULL");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[TransactionReversalLogs]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[TransactionReversalLogs](
+        [Id] uniqueidentifier NOT NULL PRIMARY KEY,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NULL,
+        [PartyType] nvarchar(16) NOT NULL,
+        [PartyId] uniqueidentifier NOT NULL,
+        [BatchId] uniqueidentifier NOT NULL,
+        [OperationType] nvarchar(32) NOT NULL,
+        [OriginalTxDate] datetime2 NOT NULL,
+        [OriginalPerformedBy] nvarchar(200) NULL,
+        [ReversedByUserId] uniqueidentifier NULL,
+        [ReversedByUserName] nvarchar(200) NULL,
+        [Reason] nvarchar(1000) NOT NULL,
+        [ReversedAt] datetime2 NOT NULL,
+        [SnapshotJson] nvarchar(max) NOT NULL,
+        [DisplayGrup] nvarchar(64) NOT NULL,
+        [DisplayKalem] nvarchar(128) NOT NULL,
+        [DisplayDeger] nvarchar(256) NOT NULL,
+        [DisplayCariDurum] nvarchar(64) NOT NULL,
+        [DisplayAciklama] nvarchar(500) NOT NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT DF_TransactionReversalLogs_IsDeleted DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL
+    );
+    CREATE INDEX IX_TransactionReversalLogs_TenantId_BatchId ON TransactionReversalLogs(TenantId, BatchId);
+    CREATE INDEX IX_TransactionReversalLogs_TenantId_PartyType_PartyId_ReversedAt ON TransactionReversalLogs(TenantId, PartyType, PartyId, ReversedAt);
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF NOT EXISTS (SELECT 1 FROM [dbo].[__EFMigrationsHistory] WHERE [MigrationId] = N'20260706000000_AddTransactionReversal')
+    INSERT INTO [dbo].[__EFMigrationsHistory] ([MigrationId], [ProductVersion]) VALUES (N'20260706000000_AddTransactionReversal', N'9.0.8');");
         // Özel tekil ürünlerde StokMiktari 0 kalmış; ilgili kiracıda hiç satış kalemi yoksa 1 yap (Sales join gerekmez).
         try
         {

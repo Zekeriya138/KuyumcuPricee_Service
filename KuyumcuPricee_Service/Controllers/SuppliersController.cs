@@ -7,6 +7,7 @@ using kuyumcu_domain.Entities;
 using kuyumcu_domain.Enums;
 using kuyumcu_infrastructure.Persistence;
 using KUYUMCU.Price_Service.Persistence;
+using KUYUMCU.Price_Service.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -19,8 +20,13 @@ namespace KUYUMCU.Price_Service.Controllers;
 public class SuppliersController : ControllerBase
 {
     private readonly AppDbContext _db;
+    private readonly TransactionReversalService _reversal;
 
-    public SuppliersController(AppDbContext db) => _db = db;
+    public SuppliersController(AppDbContext db, TransactionReversalService reversal)
+    {
+        _db = db;
+        _reversal = reversal;
+    }
 
     private Guid GetTenantId()
     {
@@ -115,14 +121,56 @@ public class SuppliersController : ControllerBase
         decimal BalanceEUR,
         decimal BalanceGBP,
         decimal BalanceHAS,
-        decimal BalanceGUMUS
+        decimal BalanceGUMUS,
+        decimal BorcTL = 0m,
+        decimal AlacakTL = 0m,
+        decimal BorcUSD = 0m,
+        decimal AlacakUSD = 0m,
+        decimal BorcEUR = 0m,
+        decimal AlacakEUR = 0m,
+        decimal BorcGBP = 0m,
+        decimal AlacakGBP = 0m,
+        decimal BorcHAS = 0m,
+        decimal AlacakHAS = 0m,
+        decimal BorcGUMUS = 0m,
+        decimal AlacakGUMUS = 0m
     );
 
     public sealed record SupplierRecentTxRowDto(
+        Guid? TransactionId,
+        Guid? BatchId,
+        string RefType,
+        Guid? RefId,
+        string SourceKind,
+        bool CanReverse,
+        bool IsReversed,
         DateTime IslemTarihi,
         string Grup,
         string Kalem,
         string Deger,
+        string Birim,
+        string SonMiktar,
+        string CariDurum,
+        string Aciklama,
+        string Kullanici
+    );
+
+    public sealed record SupplierRecentTxWithPartyDto(
+        Guid PartyId,
+        string PartyName,
+        Guid? TransactionId,
+        Guid? BatchId,
+        string RefType,
+        Guid? RefId,
+        string SourceKind,
+        bool CanReverse,
+        bool IsReversed,
+        DateTime IslemTarihi,
+        string Grup,
+        string Kalem,
+        string Deger,
+        string Birim,
+        string SonMiktar,
         string CariDurum,
         string Aciklama,
         string Kullanici
@@ -131,7 +179,9 @@ public class SuppliersController : ControllerBase
     public sealed record SupplierZiynetRowDto(
         string Ad,
         string Tip,
-        decimal Adet
+        decimal Adet,
+        decimal Borc = 0m,
+        decimal Alacak = 0m
     );
 
     public sealed record SupplierFinanceDto(
@@ -247,6 +297,118 @@ public class SuppliersController : ControllerBase
         return Ok(list);
     }
 
+    /// <summary>Şube tedarikçilerinin son işlemleri (liste ekranı Son İşlemler sekmesi).</summary>
+    [HttpGet("recent-transactions")]
+    public async Task<IActionResult> RecentTransactions(
+        [FromQuery] int limit = 200,
+        CancellationToken ct = default)
+    {
+        limit = Math.Clamp(limit, 1, 500);
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+
+        var joined = await (
+            from t in _db.SupplierTransactions.AsNoTracking()
+            join s in _db.Suppliers.AsNoTracking() on t.SupplierId equals s.Id
+            where t.TenantId == tenantId &&
+                  t.BranchId == branchId &&
+                  s.TenantId == tenantId &&
+                  s.BranchId == branchId &&
+                  !t.IsDeleted &&
+                  !t.IsReversed &&
+                  !s.IsDeleted
+            orderby t.TxDate descending, t.CreatedAt descending
+            select new { Tx = t, s.Id, Name = s.CompanyName ?? s.Name ?? "" }
+        ).Take(limit).ToListAsync(ct);
+
+        var partyIdsInScope = joined.Select(x => x.Id).Distinct().ToHashSet();
+        List<SupplierTransaction> historyTx;
+        if (partyIdsInScope.Count == 0)
+        {
+            historyTx = new List<SupplierTransaction>();
+        }
+        else
+        {
+            var branchHistoryTx = await _db.SupplierTransactions.AsNoTracking()
+                .Where(t => t.TenantId == tenantId &&
+                            t.BranchId == branchId &&
+                            !t.IsDeleted &&
+                            !t.IsReversed)
+                .ToListAsync(ct);
+            historyTx = branchHistoryTx.Where(t => partyIdsInScope.Contains(t.SupplierId)).ToList();
+        }
+        var sonMiktarByParty = partyIdsInScope.ToDictionary(
+            pid => pid,
+            pid => CariRecentTxBalanceHelper.BuildSupplierIndex(historyTx.Where(t => t.SupplierId == pid)));
+
+        var result = joined
+            .Select(x =>
+            {
+                var mapped = MapSupplierRecentRow(x.Tx, sonMiktarByParty.GetValueOrDefault(x.Id));
+                return new SupplierRecentTxWithPartyDto(
+                    x.Id,
+                    x.Name,
+                    mapped.TransactionId,
+                    mapped.BatchId,
+                    mapped.RefType,
+                    mapped.RefId,
+                    mapped.SourceKind,
+                    mapped.CanReverse,
+                    mapped.IsReversed,
+                    mapped.IslemTarihi,
+                    mapped.Grup,
+                    mapped.Kalem,
+                    mapped.Deger,
+                    mapped.Birim,
+                    mapped.SonMiktar,
+                    mapped.CariDurum,
+                    mapped.Aciklama,
+                    mapped.Kullanici);
+            })
+            .ToList();
+
+        var reversedJoined = await (
+            from r in _db.TransactionReversalLogs.AsNoTracking()
+            join s in _db.Suppliers.AsNoTracking() on r.PartyId equals s.Id
+            where r.TenantId == tenantId &&
+                  (r.BranchId == null || r.BranchId == branchId) &&
+                  r.PartyType == "Supplier" &&
+                  s.TenantId == tenantId &&
+                  s.BranchId == branchId &&
+                  !r.IsDeleted &&
+                  !s.IsDeleted
+            orderby r.ReversedAt descending
+            select new { Log = r, s.Id, Name = s.CompanyName ?? s.Name ?? "" }
+        ).Take(limit).ToListAsync(ct);
+
+        var reversedRows = reversedJoined.Select(x => new SupplierRecentTxWithPartyDto(
+            x.Id,
+            x.Name,
+            null,
+            x.Log.BatchId,
+            x.Log.OperationType,
+            null,
+            "Reversal",
+            false,
+            true,
+            x.Log.ReversedAt,
+            x.Log.DisplayGrup,
+            x.Log.DisplayKalem,
+            x.Log.DisplayDeger,
+            "",
+            "-",
+            "Geri Alındı",
+            ResolveSupplierReversalAciklama(x.Log),
+            x.Log.ReversedByUserName ?? "")).ToList();
+
+        var merged = result.Concat(reversedRows)
+            .OrderByDescending(x => x.IslemTarihi)
+            .Take(limit)
+            .ToList();
+
+        return Ok(merged);
+    }
+
     [HttpGet("{id:guid}")]
     public async Task<IActionResult> GetById(Guid id, CancellationToken ct = default)
     {
@@ -274,36 +436,37 @@ public class SuppliersController : ControllerBase
         var bal = await _db.SupplierBalances.AsNoTracking()
             .FirstOrDefaultAsync(x => x.SupplierId == id && x.TenantId == tenantId && !x.IsDeleted, ct);
 
+        var tx = await _db.SupplierTransactions.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.SupplierId == id && x.BranchId == branchId && !x.IsDeleted && !x.IsReversed)
+            .OrderByDescending(x => x.CreatedAt)
+            .Take(300)
+            .ToListAsync(ct);
+
+        var dovizGrossTl = SupplierFinanceHelper.ComputeDovizGross(tx, "TL");
+        var dovizGrossUsd = SupplierFinanceHelper.ComputeDovizGross(tx, "USD");
+        var dovizGrossEur = SupplierFinanceHelper.ComputeDovizGross(tx, "EUR");
+        var dovizGrossGbp = SupplierFinanceHelper.ComputeDovizGross(tx, "GBP");
+        var dovizGrossHas = SupplierFinanceHelper.ComputeDovizGross(tx, "HAS");
+        var dovizGrossGumus = SupplierFinanceHelper.ComputeDovizGross(tx, "GUMUS");
+
         var doviz = new SupplierBalanceRowDto(
             bal?.BalanceTL ?? 0m,
             bal?.BalanceUSD ?? 0m,
             bal?.BalanceEUR ?? 0m,
             bal?.BalanceGBP ?? 0m,
             bal?.BalanceHAS ?? 0m,
-            bal?.BalanceGUMUS ?? 0m
+            bal?.BalanceGUMUS ?? 0m,
+            BorcTL: dovizGrossTl.Borc, AlacakTL: dovizGrossTl.Alacak,
+            BorcUSD: dovizGrossUsd.Borc, AlacakUSD: dovizGrossUsd.Alacak,
+            BorcEUR: dovizGrossEur.Borc, AlacakEUR: dovizGrossEur.Alacak,
+            BorcGBP: dovizGrossGbp.Borc, AlacakGBP: dovizGrossGbp.Alacak,
+            BorcHAS: dovizGrossHas.Borc, AlacakHAS: dovizGrossHas.Alacak,
+            BorcGUMUS: dovizGrossGumus.Borc, AlacakGUMUS: dovizGrossGumus.Alacak
         );
 
-        var tx = await _db.SupplierTransactions.AsNoTracking()
-            .Where(x => x.TenantId == tenantId && x.SupplierId == id && x.BranchId == branchId)
-            .OrderByDescending(x => x.CreatedAt)
-            .Take(300)
-            .ToListAsync(ct);
-
+        var sonMiktarIndex = CariRecentTxBalanceHelper.BuildSupplierIndex(tx);
         var sonIslemler = tx
-            .Select(x =>
-            {
-                var grup = string.IsNullOrWhiteSpace(x.TxType) ? "FINANS" : x.TxType.Trim().ToUpperInvariant();
-                var kalem = $"{(string.IsNullOrWhiteSpace(x.SourceUnit) ? "TL" : x.SourceUnit)} → {(string.IsNullOrWhiteSpace(x.TargetUnit) ? "TL" : x.TargetUnit)}";
-                return new SupplierRecentTxRowDto(
-                    x.TxDate,
-                    grup,
-                    kalem,
-                    FormatSupplierRecentValue(x),
-                    ResolveSupplierCariDurum(x),
-                    x.Description ?? "",
-                    x.KullaniciAdi ?? ""
-                );
-            })
+            .Select(x => MapSupplierRecentRow(x, sonMiktarIndex))
             .ToList();
 
         var existingPurchaseRefs = tx
@@ -333,10 +496,15 @@ public class SuppliersController : ControllerBase
             if (exists) continue;
 
             sonIslemler.Add(new SupplierRecentTxRowDto(
+                null, null, "PURCHASE", purchase.Id, "Purchase",
+                true,
+                false,
                 purchase.Date,
                 "AUDIT",
                 "Alış İşlemi",
                 $"{Math.Abs(purchase.GrandTotal):N2} TL",
+                "",
+                "-",
                 "İşlem",
                 $"Alış belgesi (PURCHASE {purchase.Id}, Ödeme: {purchase.PaymentMethod})",
                 userNames.TryGetValue(purchase.UserId, out var pn) ? pn : ""));
@@ -355,17 +523,96 @@ public class SuppliersController : ControllerBase
             .Select(g =>
             {
                 var first = g.First();
+                var gross = SupplierFinanceHelper.ComputeZiynetGross(g.Select(v => v.Adet));
                 return new SupplierZiynetRowDto(
                     first.Ad,
                     string.IsNullOrWhiteSpace(first.Tip) ? "Yeni" : first.Tip.Trim(),
-                    decimal.Round(g.Sum(v => v.Adet), 3, MidpointRounding.AwayFromZero));
+                    decimal.Round(g.Sum(v => v.Adet), 3, MidpointRounding.AwayFromZero),
+                    gross.Borc,
+                    gross.Alacak);
             })
-            .Where(x => x.Adet != 0m)
+            .Where(x => x.Borc != 0m || x.Alacak != 0m)
             .OrderBy(x => x.Ad)
             .ThenBy(x => x.Tip)
             .ToList();
 
         return Ok(new SupplierFinanceDto(doviz, sonIslemler, ziynet));
+    }
+
+    [HttpGet("{id:guid}/reversed-transactions")]
+    public async Task<IActionResult> ReversedTransactions(Guid id, CancellationToken ct = default)
+    {
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+        var supplier = await _db.Suppliers.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == id && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
+        if (supplier is null) return NotFound();
+        var rows = await _reversal.GetSupplierReversedAsync(tenantId, id, ct);
+        return Ok(rows);
+    }
+
+    private static string ResolveSupplierRecentAciklama(SupplierTransaction x)
+    {
+        var desc = x.Description ?? "";
+        if (string.Equals(x.RefType, "TRANSFER", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(x.TxType, "TRANSFER", StringComparison.OrdinalIgnoreCase) ||
+            desc.Contains(CariTransferMarker.Prefix, StringComparison.OrdinalIgnoreCase))
+            return CariTransferMarker.FormatDisplayNote(desc);
+        return desc;
+    }
+
+    private static string ResolveSupplierReversalAciklama(TransactionReversalLog log)
+    {
+        var aciklama = (log.DisplayAciklama ?? "").Trim();
+        var reason = (log.Reason ?? "").Trim();
+
+        if (string.Equals(log.OperationType, "TRANSFER", StringComparison.OrdinalIgnoreCase))
+        {
+            var transferText = CariTransferMarker.FormatDisplayNote(aciklama);
+            if (!string.IsNullOrWhiteSpace(transferText) && transferText != "Transfer")
+                return string.IsNullOrWhiteSpace(reason) ? $"{transferText} (Geri alındı)" : $"{transferText} — {reason}";
+        }
+
+        if (!string.IsNullOrWhiteSpace(aciklama) && !string.IsNullOrWhiteSpace(reason))
+            return $"{aciklama} — {reason}";
+        return !string.IsNullOrWhiteSpace(reason) ? reason : aciklama;
+    }
+
+    private static SupplierRecentTxRowDto MapSupplierRecentRow(
+        SupplierTransaction x,
+        IReadOnlyDictionary<Guid, CariSonMiktarSnapshot>? sonMiktarIndex = null)
+    {
+        var grup = string.IsNullOrWhiteSpace(x.TxType) ? "FINANS" : x.TxType.Trim().ToUpperInvariant();
+        var kalem = $"{(string.IsNullOrWhiteSpace(x.SourceUnit) ? "TL" : x.SourceUnit)} → {(string.IsNullOrWhiteSpace(x.TargetUnit) ? "TL" : x.TargetUnit)}";
+        var refType = (x.RefType ?? x.TxType ?? "").Trim().ToUpperInvariant();
+        var sourceKind = string.Equals(refType, "PURCHASE", StringComparison.OrdinalIgnoreCase) ? "Purchase" : "Transaction";
+
+        var birim = "";
+        var sonMiktar = "-";
+        if (sonMiktarIndex != null &&
+            sonMiktarIndex.TryGetValue(x.Id, out var snap))
+        {
+            birim = snap.Birim;
+            sonMiktar = snap.SonMiktar;
+        }
+
+        return new SupplierRecentTxRowDto(
+            x.Id,
+            x.BatchId,
+            refType,
+            x.RefId,
+            sourceKind,
+            !x.IsReversed,
+            x.IsReversed,
+            x.TxDate,
+            grup,
+            kalem,
+            FormatSupplierRecentValue(x),
+            birim,
+            sonMiktar,
+            ResolveSupplierCariDurum(x),
+            ResolveSupplierRecentAciklama(x),
+            x.KullaniciAdi ?? "");
     }
 
     [HttpPost]
@@ -609,6 +856,7 @@ public class SuppliersController : ControllerBase
         // SupplierIslemWindow manuel akışında eylem metni gösterilsin.
         if (txType == "OPENING_BALANCE") return "Açılış Bakiye Girişi";
         if (txType == "BALANCE_CONVERSION") return "Bakiye Dönüştürme";
+        if (txType == "TRANSFER") return "Transfer";
         if (txType == "PAYMENT") return "Ödeme";
         if (txType == "COLLECTION") return "Tahsilat";
         if (txType == "ZIYNET") return "Ziynet";

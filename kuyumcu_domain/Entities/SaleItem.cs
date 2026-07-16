@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 
 namespace kuyumcu_domain.Entities
 {
@@ -16,6 +16,8 @@ namespace kuyumcu_domain.Entities
 
         // Miktar & fiyatlar
         public decimal Quantity { get; set; }           // gram/adet
+        /// <summary>Kısmi teslimde kasadan/stoktan düşülen miktar. Boş ise tamamı teslim edilir.</summary>
+        public decimal? DeliveredQuantity { get; set; }
         public decimal UnitPrice { get; set; }          // TL
         public decimal Discount { get; set; }           // satır indirimi TL
         public decimal TaxRate { get; set; }            // % (ör. 0,00/0,10)

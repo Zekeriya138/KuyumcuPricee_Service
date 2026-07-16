@@ -17,8 +17,8 @@ public sealed class NotesRemindersController : ControllerBase
 
     public NotesRemindersController(AppDbContext db) => _db = db;
 
-    public sealed record NoteDto(Guid Id, string Title, string Content, DateTime CreatedAt, DateTime UpdatedAt);
-    public sealed record UpsertNoteReq(string Title, string Content);
+    public sealed record NoteDto(Guid Id, string Title, string Content, string? OwnerType, Guid? OwnerId, DateTime CreatedAt, DateTime UpdatedAt);
+    public sealed record UpsertNoteReq(string Title, string Content, string? OwnerType = null, Guid? OwnerId = null);
 
     public sealed record ReminderDto(
         Guid Id,
@@ -34,20 +34,51 @@ public sealed class NotesRemindersController : ControllerBase
     public sealed record SnoozeReminderReq(int Minutes);
 
     [HttpGet("notes")]
-    public async Task<IActionResult> ListNotes(CancellationToken ct)
+    public async Task<IActionResult> ListBranchNotes(CancellationToken ct)
     {
         var tenantId = GetTenantId();
         var branchId = GetBranchId();
         var items = await _db.BranchNotes.AsNoTracking()
-            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted)
+            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
+                && x.OwnerType == null && x.OwnerId == null)
             .OrderByDescending(x => x.UpdatedAt)
-            .Select(x => new NoteDto(x.Id, x.Title, x.Content, x.CreatedAt, x.UpdatedAt))
+            .Select(x => new NoteDto(x.Id, x.Title, x.Content, x.OwnerType, x.OwnerId, x.CreatedAt, x.UpdatedAt))
+            .ToListAsync(ct);
+        return Ok(items);
+    }
+
+    [HttpGet("customers/{customerId:guid}/notes")]
+    public async Task<IActionResult> ListCustomerNotes(Guid customerId, CancellationToken ct)
+    {
+        if (customerId == Guid.Empty) return BadRequest(new { error = "Müşteri kimliği geçersiz." });
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+        var items = await _db.BranchNotes.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
+                && x.OwnerType == "CUSTOMER" && x.OwnerId == customerId)
+            .OrderByDescending(x => x.UpdatedAt)
+            .Select(x => new NoteDto(x.Id, x.Title, x.Content, x.OwnerType, x.OwnerId, x.CreatedAt, x.UpdatedAt))
+            .ToListAsync(ct);
+        return Ok(items);
+    }
+
+    [HttpGet("suppliers/{supplierId:guid}/notes")]
+    public async Task<IActionResult> ListSupplierNotes(Guid supplierId, CancellationToken ct)
+    {
+        if (supplierId == Guid.Empty) return BadRequest(new { error = "Tedarikçi kimliği geçersiz." });
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+        var items = await _db.BranchNotes.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
+                && x.OwnerType == "SUPPLIER" && x.OwnerId == supplierId)
+            .OrderByDescending(x => x.UpdatedAt)
+            .Select(x => new NoteDto(x.Id, x.Title, x.Content, x.OwnerType, x.OwnerId, x.CreatedAt, x.UpdatedAt))
             .ToListAsync(ct);
         return Ok(items);
     }
 
     [HttpPost("notes")]
-    public async Task<IActionResult> CreateNote([FromBody] UpsertNoteReq req, CancellationToken ct)
+    public async Task<IActionResult> CreateBranchNote([FromBody] UpsertNoteReq req, CancellationToken ct)
     {
         var tenantId = GetTenantId();
         var branchId = GetBranchId();
@@ -64,15 +95,31 @@ public sealed class NotesRemindersController : ControllerBase
             UserId = userId,
             Title = title,
             Content = content,
+            OwnerType = null,
+            OwnerId = null,
             UpdatedAt = DateTime.UtcNow
         };
         _db.BranchNotes.Add(row);
         await _db.SaveChangesAsync(ct);
-        return Ok(new NoteDto(row.Id, row.Title, row.Content, row.CreatedAt, row.UpdatedAt));
+        return Ok(new NoteDto(row.Id, row.Title, row.Content, row.OwnerType, row.OwnerId, row.CreatedAt, row.UpdatedAt));
+    }
+
+    [HttpPost("customers/{customerId:guid}/notes")]
+    public async Task<IActionResult> CreateCustomerNote(Guid customerId, [FromBody] UpsertNoteReq req, CancellationToken ct)
+    {
+        if (customerId == Guid.Empty) return BadRequest(new { error = "Müşteri kimliği geçersiz." });
+        return await CreatePartnerNoteAsync("CUSTOMER", customerId, req, ct);
+    }
+
+    [HttpPost("suppliers/{supplierId:guid}/notes")]
+    public async Task<IActionResult> CreateSupplierNote(Guid supplierId, [FromBody] UpsertNoteReq req, CancellationToken ct)
+    {
+        if (supplierId == Guid.Empty) return BadRequest(new { error = "Tedarikçi kimliği geçersiz." });
+        return await CreatePartnerNoteAsync("SUPPLIER", supplierId, req, ct);
     }
 
     [HttpPut("notes/{id:guid}")]
-    public async Task<IActionResult> UpdateNote(Guid id, [FromBody] UpsertNoteReq req, CancellationToken ct)
+    public async Task<IActionResult> UpdateBranchNote(Guid id, [FromBody] UpsertNoteReq req, CancellationToken ct)
     {
         var tenantId = GetTenantId();
         var branchId = GetBranchId();
@@ -82,23 +129,114 @@ public sealed class NotesRemindersController : ControllerBase
         if (string.IsNullOrWhiteSpace(content)) return BadRequest(new { error = "Not içeriği zorunludur." });
 
         var row = await _db.BranchNotes.FirstOrDefaultAsync(
-            x => x.Id == id && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
+            x => x.Id == id && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
+                && x.OwnerType == null && x.OwnerId == null, ct);
         if (row is null) return NotFound();
 
         row.Title = title;
         row.Content = content;
         row.UpdatedAt = DateTime.UtcNow;
         await _db.SaveChangesAsync(ct);
-        return Ok(new NoteDto(row.Id, row.Title, row.Content, row.CreatedAt, row.UpdatedAt));
+        return Ok(new NoteDto(row.Id, row.Title, row.Content, row.OwnerType, row.OwnerId, row.CreatedAt, row.UpdatedAt));
+    }
+
+    [HttpPut("customers/{customerId:guid}/notes/{id:guid}")]
+    public async Task<IActionResult> UpdateCustomerNote(Guid customerId, Guid id, [FromBody] UpsertNoteReq req, CancellationToken ct)
+    {
+        if (customerId == Guid.Empty) return BadRequest(new { error = "Müşteri kimliği geçersiz." });
+        return await UpdatePartnerNoteAsync("CUSTOMER", customerId, id, req, ct);
+    }
+
+    [HttpPut("suppliers/{supplierId:guid}/notes/{id:guid}")]
+    public async Task<IActionResult> UpdateSupplierNote(Guid supplierId, Guid id, [FromBody] UpsertNoteReq req, CancellationToken ct)
+    {
+        if (supplierId == Guid.Empty) return BadRequest(new { error = "Tedarikçi kimliği geçersiz." });
+        return await UpdatePartnerNoteAsync("SUPPLIER", supplierId, id, req, ct);
     }
 
     [HttpDelete("notes/{id:guid}")]
-    public async Task<IActionResult> DeleteNote(Guid id, CancellationToken ct)
+    public async Task<IActionResult> DeleteBranchNote(Guid id, CancellationToken ct)
     {
         var tenantId = GetTenantId();
         var branchId = GetBranchId();
         var row = await _db.BranchNotes.FirstOrDefaultAsync(
-            x => x.Id == id && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
+            x => x.Id == id && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
+                && x.OwnerType == null && x.OwnerId == null, ct);
+        if (row is null) return NotFound();
+        row.IsDeleted = true;
+        row.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+        return NoContent();
+    }
+
+    [HttpDelete("customers/{customerId:guid}/notes/{id:guid}")]
+    public async Task<IActionResult> DeleteCustomerNote(Guid customerId, Guid id, CancellationToken ct)
+    {
+        if (customerId == Guid.Empty) return BadRequest(new { error = "Müşteri kimliği geçersiz." });
+        return await DeletePartnerNoteAsync("CUSTOMER", customerId, id, ct);
+    }
+
+    [HttpDelete("suppliers/{supplierId:guid}/notes/{id:guid}")]
+    public async Task<IActionResult> DeleteSupplierNote(Guid supplierId, Guid id, CancellationToken ct)
+    {
+        if (supplierId == Guid.Empty) return BadRequest(new { error = "Tedarikçi kimliği geçersiz." });
+        return await DeletePartnerNoteAsync("SUPPLIER", supplierId, id, ct);
+    }
+
+    private async Task<IActionResult> CreatePartnerNoteAsync(string ownerType, Guid ownerId, UpsertNoteReq req, CancellationToken ct)
+    {
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+        var userId = GetUserId();
+        var title = (req.Title ?? "").Trim();
+        var content = (req.Content ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(title)) return BadRequest(new { error = "Not başlığı zorunludur." });
+        if (string.IsNullOrWhiteSpace(content)) return BadRequest(new { error = "Not içeriği zorunludur." });
+
+        var row = new BranchNote
+        {
+            TenantId = tenantId,
+            BranchId = branchId,
+            UserId = userId,
+            Title = title,
+            Content = content,
+            OwnerType = ownerType,
+            OwnerId = ownerId,
+            UpdatedAt = DateTime.UtcNow
+        };
+        _db.BranchNotes.Add(row);
+        await _db.SaveChangesAsync(ct);
+        return Ok(new NoteDto(row.Id, row.Title, row.Content, row.OwnerType, row.OwnerId, row.CreatedAt, row.UpdatedAt));
+    }
+
+    private async Task<IActionResult> UpdatePartnerNoteAsync(string ownerType, Guid ownerId, Guid id, UpsertNoteReq req, CancellationToken ct)
+    {
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+        var title = (req.Title ?? "").Trim();
+        var content = (req.Content ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(title)) return BadRequest(new { error = "Not başlığı zorunludur." });
+        if (string.IsNullOrWhiteSpace(content)) return BadRequest(new { error = "Not içeriği zorunludur." });
+
+        var row = await _db.BranchNotes.FirstOrDefaultAsync(
+            x => x.Id == id && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
+                && x.OwnerType == ownerType && x.OwnerId == ownerId, ct);
+        if (row is null) return NotFound();
+
+        row.Title = title;
+        row.Content = content;
+        row.UpdatedAt = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+        return Ok(new NoteDto(row.Id, row.Title, row.Content, row.OwnerType, row.OwnerId, row.CreatedAt, row.UpdatedAt));
+    }
+
+    private async Task<IActionResult> DeletePartnerNoteAsync(string ownerType, Guid ownerId, Guid id, CancellationToken ct)
+    {
+        var tenantId = GetTenantId();
+        var branchId = GetBranchId();
+        var row = await _db.BranchNotes.FirstOrDefaultAsync(
+            x => x.Id == id && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted
+                && x.OwnerType == ownerType && x.OwnerId == ownerId, ct);
         if (row is null) return NotFound();
         row.IsDeleted = true;
         row.UpdatedAt = DateTime.UtcNow;

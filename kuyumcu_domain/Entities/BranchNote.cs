@@ -9,5 +9,9 @@ public class BranchNote : Entity, ITenantScoped
 
     public string Title { get; set; } = "";
     public string Content { get; set; } = "";
+    /// <summary>CUSTOMER, SUPPLIER veya null (genel şube notu).</summary>
+    public string? OwnerType { get; set; }
+    /// <summary>Müşteri veya tedarikçi kimliği.</summary>
+    public Guid? OwnerId { get; set; }
     public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
 }

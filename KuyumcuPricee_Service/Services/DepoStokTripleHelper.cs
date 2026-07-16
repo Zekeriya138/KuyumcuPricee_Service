@@ -30,6 +30,16 @@ public static class DepoStokTripleHelper
 
     public static string NormalizeFirma(string? firma) => (firma ?? "").Trim().ToUpperInvariant();
 
+    /// <summary>Türkçe/ASCII farklarında eşleşme için (Ç→C, İ→I vb.).</summary>
+    public static string FoldLookupKey(string? value)
+    {
+        var t = (value ?? "").Trim().ToUpperInvariant();
+        if (t.Length == 0) return "";
+        return t
+            .Replace('Ç', 'C').Replace('Ğ', 'G').Replace('İ', 'I').Replace('I', 'I')
+            .Replace('Ö', 'O').Replace('Ş', 'S').Replace('Ü', 'U');
+    }
+
     public static decimal RoundBirimMaliyet(decimal birim) =>
         Math.Round(birim, 6, MidpointRounding.AwayFromZero);
 
@@ -208,6 +218,59 @@ public static class DepoStokTripleHelper
         db.DepoStokHavuzlar.Add(row);
         if (saveImmediately)
             await db.SaveChangesAsync(ct);
+    }
+
+    /// <summary>Mal + tedarikçi + birim + ayar için havuz satırı; tam eşleşme yoksa yakın birim/folded anahtar ile dener.</summary>
+    public static async Task<DepoStokHavuz?> FindHavuzRowAsync(
+        AppDbContext db,
+        Guid tenantId,
+        Guid branchId,
+        string ayarRaw,
+        string malRaw,
+        string firmaRaw,
+        decimal birimRaw,
+        CancellationToken ct,
+        bool tracked = false)
+    {
+        var ay = NormalizeAyarKarat(ayarRaw);
+        var malN = NormalizeMal(malRaw);
+        var firmaN = NormalizeFirma(firmaRaw);
+        var birim = RoundBirimMaliyet(birimRaw);
+        if (string.IsNullOrEmpty(ay) || string.IsNullOrEmpty(malN) || string.IsNullOrEmpty(firmaN))
+            return null;
+
+        IQueryable<DepoStokHavuz> query = tracked
+            ? db.DepoStokHavuzlar.Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted)
+            : db.DepoStokHavuzlar.AsNoTracking().Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted);
+
+        var exact = await query.FirstOrDefaultAsync(x =>
+            x.Ayar == ay && x.MalTanimNorm == malN && x.TedarikciFirmaNorm == firmaN && x.BirimMaliyet == birim, ct);
+        if (exact != null) return exact;
+
+        var candidates = await query
+            .Where(x => x.Ayar == ay && x.MalTanimNorm == malN && x.TedarikciFirmaNorm == firmaN)
+            .ToListAsync(ct);
+        if (candidates.Count > 0)
+        {
+            return candidates
+                .OrderBy(x => Math.Abs(x.BirimMaliyet - birim))
+                .ThenByDescending(x => x.UnbarcodedGram)
+                .FirstOrDefault();
+        }
+
+        var malFold = FoldLookupKey(malN);
+        var firmaFold = FoldLookupKey(firmaN);
+        if (string.IsNullOrEmpty(malFold) || string.IsNullOrEmpty(firmaFold))
+            return null;
+
+        var folded = await query
+            .Where(x => x.Ayar == ay)
+            .ToListAsync(ct);
+        return folded
+            .Where(x => FoldLookupKey(x.MalTanimNorm) == malFold && FoldLookupKey(x.TedarikciFirmaNorm) == firmaFold)
+            .OrderBy(x => Math.Abs(x.BirimMaliyet - birim))
+            .ThenByDescending(x => x.UnbarcodedGram)
+            .FirstOrDefault();
     }
 
     /// <summary>Hurda ödemesi: ayar bazlı barkodsuz düşümü havuz satırlarına oransal yayılır.</summary>
