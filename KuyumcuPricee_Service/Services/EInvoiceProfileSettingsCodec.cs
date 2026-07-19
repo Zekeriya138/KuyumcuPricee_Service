@@ -316,7 +316,8 @@ public static class EInvoiceProfileSettingsCodec
         "GBP",
         "Takas",
         "Veresiye",
-        "TedarikciVeresiye"
+        "TedarikciVeresiye",
+        "IBAN"
     };
 
     public static List<(string Method, decimal AmountTl)> GetQualifyingPaymentsForDraft(

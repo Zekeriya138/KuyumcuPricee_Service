@@ -3,6 +3,7 @@ using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Metadata;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using kuyumcu_infrastructure.Persistence;
 
@@ -11,9 +12,11 @@ using kuyumcu_infrastructure.Persistence;
 namespace kuyumcu_infrasructure.Migrations
 {
     [DbContext(typeof(AppDbContext))]
-    partial class AppDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260718181733_AddBankImportTransactions")]
+    partial class AddBankImportTransactions
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder
@@ -197,65 +200,6 @@ namespace kuyumcu_infrasructure.Migrations
                     b.HasIndex("TenantId", "BranchId", "Status", "TransactionDateUtc");
 
                     b.ToTable("BankImportTransactions", (string)null);
-                });
-
-            modelBuilder.Entity("kuyumcu_domain.Entities.BankSyncProfile", b =>
-                {
-                    b.Property<Guid>("Id")
-                        .ValueGeneratedOnAdd()
-                        .HasColumnType("uniqueidentifier");
-
-                    b.Property<string>("AllowedAccountIds")
-                        .IsRequired()
-                        .HasMaxLength(128)
-                        .HasColumnType("nvarchar(128)");
-
-                    b.Property<Guid>("BranchId")
-                        .HasColumnType("uniqueidentifier");
-
-                    b.Property<DateTime>("CreatedAt")
-                        .HasColumnType("datetime2");
-
-                    b.Property<string>("ErpApiAppKey")
-                        .HasMaxLength(256)
-                        .HasColumnType("nvarchar(256)");
-
-                    b.Property<string>("ErpApiBaseUrl")
-                        .IsRequired()
-                        .HasMaxLength(512)
-                        .HasColumnType("nvarchar(512)");
-
-                    b.Property<bool>("IsDeleted")
-                        .HasColumnType("bit");
-
-                    b.Property<bool>("IsEnabled")
-                        .HasColumnType("bit");
-
-                    b.Property<int>("LookbackDays")
-                        .HasColumnType("int");
-
-                    b.Property<int>("PollIntervalMinutes")
-                        .HasColumnType("int");
-
-                    b.Property<Guid>("TenantId")
-                        .HasColumnType("uniqueidentifier");
-
-                    b.Property<string>("VomsisAppKey")
-                        .HasMaxLength(256)
-                        .HasColumnType("nvarchar(256)");
-
-                    b.Property<string>("VomsisAppSecret")
-                        .HasMaxLength(512)
-                        .HasColumnType("nvarchar(512)");
-
-                    b.HasKey("Id");
-
-                    b.HasIndex("BranchId");
-
-                    b.HasIndex("TenantId", "BranchId")
-                        .IsUnique();
-
-                    b.ToTable("BankSyncProfiles", (string)null);
                 });
 
             modelBuilder.Entity("kuyumcu_domain.Entities.Branch", b =>
@@ -3487,15 +3431,6 @@ namespace kuyumcu_infrasructure.Migrations
                 });
 
             modelBuilder.Entity("kuyumcu_domain.Entities.BankImportTransaction", b =>
-                {
-                    b.HasOne("kuyumcu_domain.Entities.Branch", null)
-                        .WithMany()
-                        .HasForeignKey("BranchId")
-                        .OnDelete(DeleteBehavior.Restrict)
-                        .IsRequired();
-                });
-
-            modelBuilder.Entity("kuyumcu_domain.Entities.BankSyncProfile", b =>
                 {
                     b.HasOne("kuyumcu_domain.Entities.Branch", null)
                         .WithMany()

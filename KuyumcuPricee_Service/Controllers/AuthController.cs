@@ -7,6 +7,7 @@ using kuyumcu_application.Abstractions;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
 using kuyumcu_infrastructure.Tenancy;
+using kuyumcu_infrastructure.Services.Sms;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -19,16 +20,19 @@ public class AuthController : ControllerBase
 {
     private readonly IAuthService _auth;
     private readonly IConfiguration _cfg;
-    private const string FallbackBusinessRegistrationPassword = "DevOnly_2026";
+    private readonly ISmsVerificationService _smsVerification;
 
-    public AuthController(IAuthService auth, IConfiguration cfg)
+    public AuthController(IAuthService auth, IConfiguration cfg, ISmsVerificationService smsVerification)
     {
         _auth = auth;
         _cfg = cfg;
+        _smsVerification = smsVerification;
     }
 
     public record LoginDto(string Username, string Password);
-    public record ResetDto(string Username, string NationalId, string NewPassword);
+    public record SendPasswordResetSmsDto(string Username);
+    public record VerifySmsCodeDto(Guid SessionId, string Code);
+    public record ResetWithSmsDto(string VerificationToken, string NewPassword);
 
     // ✅ Yeni kayıt için DTO
     public record RegisterUserReq(
@@ -38,7 +42,8 @@ public class AuthController : ControllerBase
         string Role,
         string? FullName,
         string? Email,
-        string? NationalId,   // 🔹 Şifre sıfırlama için eklendi
+        string Phone,
+        string? NationalId,
         DateTime? BirthDate   // 🔹 Şifre sıfırlama için eklendi
     );
     public record RegisterBusinessReq(
@@ -48,10 +53,8 @@ public class AuthController : ControllerBase
         string OwnerPassword,
         string OwnerNationalId,
         string OwnerPhone,
-        string DeveloperPassword);
+        string SmsVerificationToken);
     public record ResolveTenantReq(Guid TenantId, string BusinessName);
-    public record VerifyDeveloperPasswordReq(string DeveloperPassword);
-    public record ResetByDeveloperPasswordReq(string NationalId, string NewUsername, string NewPassword, string DeveloperPassword);
 
     [HttpPost("login")]
     [AllowAnonymous]
@@ -69,59 +72,110 @@ public class AuthController : ControllerBase
         return Ok(new { token, user = new { user.Id, user.Username, user.Role, user.BranchId } });
     }
 
-    [HttpPost("reset")]
+    [HttpPost("sms/send-password-reset")]
     [AllowAnonymous]
-    public async Task<IActionResult> Reset(
+    public async Task<IActionResult> SendPasswordResetSms(
         [FromHeader(Name = "X-Tenant-Id")] Guid tenantId,
-        [FromBody] ResetDto dto)
+        [FromBody] SendPasswordResetSmsDto dto,
+        CancellationToken ct)
     {
         if (tenantId == Guid.Empty)
             return BadRequest(new { error = "X-Tenant-Id header zorunludur." });
+        if (string.IsNullOrWhiteSpace(dto.Username))
+            return BadRequest(new { error = "Kullanıcı adı zorunludur." });
 
-        if (string.IsNullOrWhiteSpace(dto.Username) ||
-            string.IsNullOrWhiteSpace(dto.NationalId) ||
-            string.IsNullOrWhiteSpace(dto.NewPassword))
+        try
         {
-            return BadRequest(new { error = "Username, NationalId ve NewPassword zorunludur." });
+            var result = await _smsVerification.SendPasswordResetAsync(tenantId, dto.Username, ct);
+            if (result.SessionId == Guid.Empty)
+            {
+                return Ok(new
+                {
+                    message = "Kayıtlı telefon numarası varsa doğrulama kodu gönderildi.",
+                    sessionId = (Guid?)null,
+                    maskedPhone = (string?)null,
+                    resendAfterSeconds = result.ResendAfterSeconds
+                });
+            }
+
+            return Ok(new
+            {
+                message = "Kayıtlı telefon numarası varsa doğrulama kodu gönderildi.",
+                sessionId = result.SessionId,
+                maskedPhone = result.MaskedPhone,
+                resendAfterSeconds = result.ResendAfterSeconds
+            });
         }
-
-        if (!IsValidTckn(dto.NationalId))
-            return BadRequest(new { error = "TC kimlik numarası geçersiz." });
-
-        var ok = await _auth.ResetPasswordAsync(tenantId, dto.Username, dto.NationalId, dto.NewPassword);
-        return ok ? Ok(new { message = "Şifre güncellendi" })
-                  : BadRequest(new { error = "Bilgiler doğrulanamadı" });
+        catch (Exception ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
     }
 
-    [HttpPost("reset-by-dev-password")]
+    [HttpPost("sms/send-business-registration")]
     [AllowAnonymous]
-    public async Task<IActionResult> ResetByDeveloperPassword(
+    public async Task<IActionResult> SendBusinessRegistrationSms(CancellationToken ct)
+    {
+        try
+        {
+            var result = await _smsVerification.SendBusinessRegistrationAsync(ct);
+            return Ok(new
+            {
+                message = "Doğrulama kodu gönderildi.",
+                sessionId = result.SessionId,
+                maskedPhone = result.MaskedPhone,
+                resendAfterSeconds = result.ResendAfterSeconds
+            });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
+    }
+
+    [HttpPost("sms/verify")]
+    [AllowAnonymous]
+    public async Task<IActionResult> VerifySmsCode([FromBody] VerifySmsCodeDto dto, CancellationToken ct)
+    {
+        if (dto.SessionId == Guid.Empty || string.IsNullOrWhiteSpace(dto.Code))
+            return BadRequest(new { error = "Oturum ve doğrulama kodu zorunludur." });
+
+        try
+        {
+            var result = await _smsVerification.VerifyCodeAsync(dto.SessionId, dto.Code, ct);
+            return Ok(new
+            {
+                verificationToken = result.VerificationToken,
+                expiresAtUtc = result.ExpiresAtUtc
+            });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
+    }
+
+    [HttpPost("reset-with-sms")]
+    [AllowAnonymous]
+    public async Task<IActionResult> ResetWithSms(
         [FromHeader(Name = "X-Tenant-Id")] Guid tenantId,
-        [FromBody] ResetByDeveloperPasswordReq dto)
+        [FromBody] ResetWithSmsDto dto,
+        CancellationToken ct)
     {
         if (tenantId == Guid.Empty)
             return BadRequest(new { error = "X-Tenant-Id header zorunludur." });
-        if (string.IsNullOrWhiteSpace(dto.NationalId) ||
-            string.IsNullOrWhiteSpace(dto.NewUsername) ||
-            string.IsNullOrWhiteSpace(dto.NewPassword) ||
-            string.IsNullOrWhiteSpace(dto.DeveloperPassword))
-            return BadRequest(new { error = "NationalId, NewUsername, NewPassword ve DeveloperPassword zorunludur." });
-        if (!IsValidTckn(dto.NationalId))
-            return BadRequest(new { error = "TC kimlik numarası geçersiz." });
+        if (string.IsNullOrWhiteSpace(dto.VerificationToken) || string.IsNullOrWhiteSpace(dto.NewPassword))
+            return BadRequest(new { error = "Doğrulama token'ı ve yeni şifre zorunludur." });
+        if (dto.NewPassword.Trim().Length < 4)
+            return BadRequest(new { error = "Yeni şifre en az 4 karakter olmalıdır." });
 
-        var expectedPassword = _cfg["BusinessRegistration:DeveloperPassword"];
-        if (string.IsNullOrWhiteSpace(expectedPassword))
-            expectedPassword = FallbackBusinessRegistrationPassword;
-        if (!string.Equals((dto.DeveloperPassword ?? "").Trim(), expectedPassword, StringComparison.Ordinal))
-            return BadRequest(new { error = "Geliştirici şifresi hatalı." });
+        var target = await _smsVerification.ConsumePasswordResetTokenAsync(dto.VerificationToken, ct);
+        if (target is null || target.Value.TenantId != tenantId)
+            return BadRequest(new { error = "Doğrulama geçersiz veya süresi dolmuş." });
 
-        var ok = await _auth.ResetCredentialsByDeveloperPasswordAsync(
-            tenantId,
-            dto.NationalId,
-            dto.NewUsername,
-            dto.NewPassword);
-        return ok ? Ok(new { message = "Kullanıcı adı ve şifre güncellendi." })
-                  : BadRequest(new { error = "Bilgiler doğrulanamadı veya kullanıcı adı kullanılıyor." });
+        var ok = await _auth.ResetPasswordByUserIdAsync(tenantId, target.Value.UserId, dto.NewPassword.Trim());
+        return ok ? Ok(new { message = "Şifre güncellendi" })
+                  : BadRequest(new { error = "Şifre güncellenemedi." });
     }
 
     [HttpGet("me")]
@@ -177,12 +231,11 @@ public class AuthController : ControllerBase
         if (!IsValidPhone(ownerPhone))
             return BadRequest(new { error = "Owner telefon formatı geçersiz. Örn: 05XXXXXXXXX" });
 
-        var expectedPassword = _cfg["BusinessRegistration:DeveloperPassword"];
-        if (string.IsNullOrWhiteSpace(expectedPassword))
-            expectedPassword = FallbackBusinessRegistrationPassword;
+        if (string.IsNullOrWhiteSpace(req.SmsVerificationToken))
+            return BadRequest(new { error = "SMS doğrulaması zorunludur." });
 
-        if (!string.Equals((req.DeveloperPassword ?? "").Trim(), expectedPassword, StringComparison.Ordinal))
-            return BadRequest(new { error = "Geliştirici şifresi hatalı." });
+        if (!await _smsVerification.ConsumeBusinessRegistrationTokenAsync(req.SmsVerificationToken.Trim(), ct))
+            return BadRequest(new { error = "SMS doğrulaması geçersiz veya süresi dolmuş." });
 
         var exists = await db.Tenants
             .AsNoTracking()
@@ -276,20 +329,6 @@ public class AuthController : ControllerBase
         return Ok(new { tenantId = tenant.Id, businessName = tenant.Name });
     }
 
-    [AllowAnonymous]
-    [HttpPost("verify-dev-password")]
-    public IActionResult VerifyDeveloperPassword([FromBody] VerifyDeveloperPasswordReq req)
-    {
-        var expectedPassword = _cfg["BusinessRegistration:DeveloperPassword"];
-        if (string.IsNullOrWhiteSpace(expectedPassword))
-            expectedPassword = FallbackBusinessRegistrationPassword;
-
-        if (!string.Equals((req.DeveloperPassword ?? "").Trim(), expectedPassword, StringComparison.Ordinal))
-            return BadRequest(new { error = "Geliştirici şifresi hatalı." });
-
-        return Ok(new { valid = true });
-    }
-
     // ✅ Yeni kullanıcı ekleme (register)
     [AllowAnonymous]
     [HttpPost("register")]
@@ -321,6 +360,9 @@ public class AuthController : ControllerBase
         if (exists)
             return Conflict(new { error = "Bu kullanıcı adı zaten mevcut." });
 
+        if (!IsValidPhone(req.Phone))
+            return BadRequest(new { error = "Telefon formatı geçersiz. Örn: 05XXXXXXXXX" });
+
         // 3) NationalId kontrolü (opsiyonel)
         string? national = string.IsNullOrWhiteSpace(req.NationalId) ? null : req.NationalId.Trim();
         if (!string.IsNullOrEmpty(national) && national.Length != 11)
@@ -342,8 +384,9 @@ public class AuthController : ControllerBase
             Role = normalizedRole,
             FullName = string.IsNullOrWhiteSpace(req.FullName) ? null : req.FullName.Trim(),
             Email = string.IsNullOrWhiteSpace(req.Email) ? null : req.Email.Trim(),
-            NationalId = national,         // 🔹 eklendi
-            BirthDate = req.BirthDate,     // 🔹 eklendi
+            Phone = req.Phone.Trim(),
+            NationalId = national,
+            BirthDate = req.BirthDate,
             CanManageUsers = defaultPerms.canManageUsers,
             CanManageBranches = defaultPerms.canManageBranches,
             CanSwitchBranches = defaultPerms.canSwitchBranches,

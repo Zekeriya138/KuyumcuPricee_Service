@@ -26,6 +26,7 @@ using Kuyumcu.PriceService.Models;
 using KUYUMCU.Price_Service.Services;
 using KUYUMCU.Price_Service.Middleware;
 using kuyumcu_infrastructure.Tenancy;
+using kuyumcu_infrastructure.Services.Sms;
 
 var builder = WebApplication.CreateBuilder(args);
 var cfg = builder.Configuration;
@@ -134,6 +135,10 @@ builder.Services.AddScoped<ITenantContext>(sp => sp.GetRequiredService<TenantCon
 
 // App services (Art�k ITenantContext'i g�venle ��zebilirler)
 builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddHttpClient<NetgsmSmsSender>();
+builder.Services.AddSingleton<MockSmsSender>();
+builder.Services.AddScoped<ISmsSender, ConfigurableSmsSender>();
+builder.Services.AddScoped<ISmsVerificationService, SmsVerificationService>();
 builder.Services.AddScoped<ICustomerService, CustomerService>();
 builder.Services.AddScoped<IStockService, StockService>(); // Stock 
 builder.Services.AddScoped<IScrapService, ScrapService>();   // Hurda stok
@@ -148,6 +153,11 @@ builder.Services.AddSingleton<IJewelryTaxCalculator, JewelryTaxCalculator>();
 builder.Services.AddSingleton<IJewelryProductTypeMapper, JewelryProductTypeMapper>();
 builder.Services.AddScoped<IUblInvoiceBuilder, UblInvoiceBuilder>();
 builder.Services.AddScoped<IEInvoiceWorkflowService, EInvoiceWorkflowService>();
+builder.Services.AddScoped<IBankSyncService, BankSyncService>();
+builder.Services.AddScoped<IBankSyncProfileService, BankSyncProfileService>();
+builder.Services.AddScoped<ITaxpayerLookupService, EdmTaxpayerLookupService>();
+builder.Services.AddScoped<ICounterpartyTaxResolver, CounterpartyTaxResolverService>();
+builder.Services.AddHttpClient<VomsisApiClient>();
 builder.Services.AddScoped<IEInvoiceProviderResolver, EInvoiceProviderResolver>();
 builder.Services.AddHttpClient<EdmSoapEInvoiceProviderAdapter>((sp, client) =>
 {
@@ -336,6 +346,101 @@ END");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('IncomingEInvoices') AND name = 'ProfileId') ALTER TABLE [dbo].[IncomingEInvoices] ADD [ProfileId] nvarchar(64) NULL");
     }
     catch (Exception ex) { Console.WriteLine("EnsureIncomingEInvoices: " + ex.Message); }
+
+    // Gider pusulası tabloları — canlı ortamda migration atlanmışsa taslak oluşturma bu tablolara ihtiyaç duyar.
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanUseExpenseSlip') ALTER TABLE Users ADD CanUseExpenseSlip bit NOT NULL CONSTRAINT DF_Users_CanUseExpenseSlip DEFAULT(0)");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipDocuments]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[ExpenseSlipDocuments](
+        [Id] uniqueidentifier NOT NULL,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [SourceSaleId] uniqueidentifier NULL,
+        [DocumentNo] nvarchar(64) NOT NULL,
+        [Status] nvarchar(32) NOT NULL,
+        [Currency] nvarchar(8) NOT NULL,
+        [GrandTotal] decimal(18,2) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_GrandTotal] DEFAULT(0),
+        [BuyerName] nvarchar(256) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_BuyerName] DEFAULT(N''),
+        [BuyerTaxNumber] nvarchar(32) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_BuyerTaxNumber] DEFAULT(N''),
+        [Description] nvarchar(512) NULL,
+        [PayloadJson] nvarchar(max) NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_PayloadJson] DEFAULT(N'{}'),
+        [RawLastResponse] nvarchar(max) NULL,
+        [IntegratorDocumentId] nvarchar(128) NULL,
+        [Uuid] nvarchar(64) NULL,
+        [LastError] nvarchar(1000) NULL,
+        [RetryCount] int NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_RetryCount] DEFAULT(0),
+        [SubmittedAt] datetime2 NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_ExpenseSlipDocuments_CreatedAt] DEFAULT(sysutcdatetime()),
+        CONSTRAINT [PK_ExpenseSlipDocuments] PRIMARY KEY ([Id])
+    );
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipDocuments]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_ExpenseSlipDocuments_Branches_BranchId')
+        ALTER TABLE [dbo].[ExpenseSlipDocuments] WITH CHECK ADD CONSTRAINT [FK_ExpenseSlipDocuments_Branches_BranchId]
+            FOREIGN KEY([BranchId]) REFERENCES [dbo].[Branches]([Id]) ON DELETE NO ACTION;
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipDocuments_BranchId' AND object_id = OBJECT_ID(N'[ExpenseSlipDocuments]'))
+        CREATE INDEX [IX_ExpenseSlipDocuments_BranchId] ON [dbo].[ExpenseSlipDocuments]([BranchId]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipDocuments_TenantId_BranchId_Status_CreatedAt' AND object_id = OBJECT_ID(N'[ExpenseSlipDocuments]'))
+        CREATE INDEX [IX_ExpenseSlipDocuments_TenantId_BranchId_Status_CreatedAt]
+            ON [dbo].[ExpenseSlipDocuments]([TenantId],[BranchId],[Status],[CreatedAt]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipDocuments_TenantId_DocumentNo' AND object_id = OBJECT_ID(N'[ExpenseSlipDocuments]'))
+        CREATE UNIQUE INDEX [IX_ExpenseSlipDocuments_TenantId_DocumentNo]
+            ON [dbo].[ExpenseSlipDocuments]([TenantId],[DocumentNo]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipDocuments_Tenant_Branch_Status_CreatedAt' AND object_id = OBJECT_ID(N'[ExpenseSlipDocuments]'))
+        CREATE INDEX [IX_ExpenseSlipDocuments_Tenant_Branch_Status_CreatedAt]
+            ON [dbo].[ExpenseSlipDocuments]([TenantId],[BranchId],[Status],[CreatedAt]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipDocuments_Tenant_DocumentNo' AND object_id = OBJECT_ID(N'[ExpenseSlipDocuments]'))
+        CREATE UNIQUE INDEX [IX_ExpenseSlipDocuments_Tenant_DocumentNo]
+            ON [dbo].[ExpenseSlipDocuments]([TenantId],[DocumentNo]);
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipAuditLogs]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[ExpenseSlipAuditLogs](
+        [Id] uniqueidentifier NOT NULL,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [DocumentId] uniqueidentifier NOT NULL,
+        [Action] nvarchar(64) NOT NULL,
+        [StatusBefore] nvarchar(32) NULL,
+        [StatusAfter] nvarchar(32) NULL,
+        [IsSuccess] bit NOT NULL CONSTRAINT [DF_ExpenseSlipAuditLogs_IsSuccess] DEFAULT(0),
+        [RequestJson] nvarchar(max) NULL,
+        [ResponseRaw] nvarchar(max) NULL,
+        [ErrorMessage] nvarchar(1000) NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_ExpenseSlipAuditLogs_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_ExpenseSlipAuditLogs_CreatedAt] DEFAULT(sysutcdatetime()),
+        CONSTRAINT [PK_ExpenseSlipAuditLogs] PRIMARY KEY ([Id])
+    );
+END");
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[ExpenseSlipAuditLogs]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_ExpenseSlipAuditLogs_Branches_BranchId')
+        ALTER TABLE [dbo].[ExpenseSlipAuditLogs] WITH CHECK ADD CONSTRAINT [FK_ExpenseSlipAuditLogs_Branches_BranchId]
+            FOREIGN KEY([BranchId]) REFERENCES [dbo].[Branches]([Id]) ON DELETE NO ACTION;
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_ExpenseSlipAuditLogs_ExpenseSlipDocuments_DocumentId')
+        ALTER TABLE [dbo].[ExpenseSlipAuditLogs] WITH CHECK ADD CONSTRAINT [FK_ExpenseSlipAuditLogs_ExpenseSlipDocuments_DocumentId]
+            FOREIGN KEY([DocumentId]) REFERENCES [dbo].[ExpenseSlipDocuments]([Id]) ON DELETE CASCADE;
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipAuditLogs_BranchId' AND object_id = OBJECT_ID(N'[ExpenseSlipAuditLogs]'))
+        CREATE INDEX [IX_ExpenseSlipAuditLogs_BranchId] ON [dbo].[ExpenseSlipAuditLogs]([BranchId]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipAuditLogs_DocumentId' AND object_id = OBJECT_ID(N'[ExpenseSlipAuditLogs]'))
+        CREATE INDEX [IX_ExpenseSlipAuditLogs_DocumentId] ON [dbo].[ExpenseSlipAuditLogs]([DocumentId]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipAuditLogs_TenantId_BranchId_DocumentId_CreatedAt' AND object_id = OBJECT_ID(N'[ExpenseSlipAuditLogs]'))
+        CREATE INDEX [IX_ExpenseSlipAuditLogs_TenantId_BranchId_DocumentId_CreatedAt]
+            ON [dbo].[ExpenseSlipAuditLogs]([TenantId],[BranchId],[DocumentId],[CreatedAt]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_ExpenseSlipAuditLogs_Tenant_Branch_Document_CreatedAt' AND object_id = OBJECT_ID(N'[ExpenseSlipAuditLogs]'))
+        CREATE INDEX [IX_ExpenseSlipAuditLogs_Tenant_Branch_Document_CreatedAt]
+            ON [dbo].[ExpenseSlipAuditLogs]([TenantId],[BranchId],[DocumentId],[CreatedAt]);
+END");
+    }
+    catch (Exception ex) { Console.WriteLine("EnsureExpenseSlipTables: " + ex.Message); }
 
     // Manuel gümüş stok lotları (Stok/Depo gümüş sekmesi — alış/kasa hariç).
     try
@@ -595,6 +700,34 @@ END");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanAccessSales') ALTER TABLE Users ADD CanAccessSales bit NOT NULL CONSTRAINT DF_Users_CanAccessSales DEFAULT(1)");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Users') AND name = 'CanCreateIncomeExpense') ALTER TABLE Users ADD CanCreateIncomeExpense bit NOT NULL CONSTRAINT DF_Users_CanCreateIncomeExpense DEFAULT(1)");
         await db.Database.ExecuteSqlRawAsync(@"UPDATE Users SET Role='Admin' WHERE Role='Manager'");
+        try
+        {
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[SmsVerificationCodes]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[SmsVerificationCodes](
+        [Id] uniqueidentifier NOT NULL PRIMARY KEY,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_SmsVerificationCodes_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL,
+        [Purpose] nvarchar(64) NOT NULL,
+        [TenantId] uniqueidentifier NULL,
+        [UserId] uniqueidentifier NULL,
+        [Username] nvarchar(64) NULL,
+        [Phone] nvarchar(32) NOT NULL,
+        [CodeHash] nvarchar(128) NOT NULL,
+        [VerificationToken] nvarchar(64) NULL,
+        [ExpiresAtUtc] datetime2 NOT NULL,
+        [TokenExpiresAtUtc] datetime2 NULL,
+        [LastSentAtUtc] datetime2 NOT NULL,
+        [AttemptCount] int NOT NULL CONSTRAINT [DF_SmsVerificationCodes_AttemptCount] DEFAULT(0),
+        [IsVerified] bit NOT NULL CONSTRAINT [DF_SmsVerificationCodes_IsVerified] DEFAULT(0),
+        [IsUsed] bit NOT NULL CONSTRAINT [DF_SmsVerificationCodes_IsUsed] DEFAULT(0)
+    );
+    CREATE INDEX [IX_SmsVerificationCodes_PurposePhoneSent] ON [dbo].[SmsVerificationCodes]([Purpose], [Phone], [LastSentAtUtc]);
+    CREATE INDEX [IX_SmsVerificationCodes_VerificationToken] ON [dbo].[SmsVerificationCodes]([VerificationToken]);
+END");
+        }
+        catch (Exception ex) { Console.WriteLine("EnsureSmsVerificationCodes: " + ex.Message); }
         // Users.IsActive, UserSalaryHistories, RateDisplaySettings: EF migration 20260414150057_kjdavkjahsj ile yönetiliyor.
         // Ancak bazı ortamlarda migration atlanabildiği için RateDisplaySettings.BranchId için emniyetli/idempotent düzeltme.
         await db.Database.ExecuteSqlRawAsync(@"
@@ -819,6 +952,111 @@ FROM Branches b
 INNER JOIN FirstBranch fb ON fb.BranchId = b.Id
 WHERE b.IsDeleted = 1;
 ");
+
+        // Vomsis banka sync tabloları (migration atlanmış ortamlar için).
+        try
+        {
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BankImportTransactions]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[BankImportTransactions](
+        [Id] uniqueidentifier NOT NULL CONSTRAINT [PK_BankImportTransactions] PRIMARY KEY,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [Provider] nvarchar(32) NOT NULL,
+        [ExternalId] bigint NOT NULL,
+        [ExternalKey] nvarchar(128) NOT NULL,
+        [VomsisAccountId] int NULL,
+        [Amount] decimal(18,4) NOT NULL,
+        [Currency] nvarchar(8) NOT NULL,
+        [TransactionType] nvarchar(32) NOT NULL,
+        [Description] nvarchar(1000) NULL,
+        [CounterpartyName] nvarchar(256) NULL,
+        [CounterpartyTaxNo] nvarchar(32) NULL,
+        [CounterpartyIban] nvarchar(64) NULL,
+        [TransactionDateUtc] datetime2 NOT NULL,
+        [Status] nvarchar(32) NOT NULL,
+        [StatusMessage] nvarchar(500) NULL,
+        [MatchedCustomerId] uniqueidentifier NULL,
+        [InvoiceId] uniqueidentifier NULL,
+        [EInvoiceDocumentId] uniqueidentifier NULL,
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_BankImportTransactions_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_BankImportTransactions_CreatedAt] DEFAULT(sysutcdatetime())
+    );
+END");
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BankImportTransactions]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_BankImportTransactions_TenantId_BranchId_Provider_ExternalKey' AND object_id = OBJECT_ID(N'[BankImportTransactions]'))
+        CREATE UNIQUE INDEX [IX_BankImportTransactions_TenantId_BranchId_Provider_ExternalKey]
+            ON [dbo].[BankImportTransactions]([TenantId],[BranchId],[Provider],[ExternalKey]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_BankImportTransactions_TenantId_BranchId_Status_TransactionDateUtc' AND object_id = OBJECT_ID(N'[BankImportTransactions]'))
+        CREATE INDEX [IX_BankImportTransactions_TenantId_BranchId_Status_TransactionDateUtc]
+            ON [dbo].[BankImportTransactions]([TenantId],[BranchId],[Status],[TransactionDateUtc]);
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_BankImportTransactions_Branches_BranchId')
+        ALTER TABLE [dbo].[BankImportTransactions] WITH CHECK ADD CONSTRAINT [FK_BankImportTransactions_Branches_BranchId]
+            FOREIGN KEY([BranchId]) REFERENCES [dbo].[Branches]([Id]) ON DELETE NO ACTION;
+END");
+
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BankSyncProfiles]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[BankSyncProfiles](
+        [Id] uniqueidentifier NOT NULL CONSTRAINT [PK_BankSyncProfiles] PRIMARY KEY,
+        [TenantId] uniqueidentifier NOT NULL,
+        [BranchId] uniqueidentifier NOT NULL,
+        [IsEnabled] bit NOT NULL CONSTRAINT [DF_BankSyncProfiles_IsEnabled] DEFAULT(1),
+        [VomsisAppKey] nvarchar(256) NULL,
+        [VomsisAppSecret] nvarchar(512) NULL,
+        [ErpApiBaseUrl] nvarchar(512) NOT NULL,
+        [ErpApiAppKey] nvarchar(256) NULL,
+        [PollIntervalMinutes] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_PollIntervalMinutes] DEFAULT(5),
+        [AllowedAccountIds] nvarchar(128) NOT NULL CONSTRAINT [DF_BankSyncProfiles_AllowedAccountIds] DEFAULT(N'46'),
+        [LookbackDays] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_LookbackDays] DEFAULT(7),
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_BankSyncProfiles_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_BankSyncProfiles_CreatedAt] DEFAULT(sysutcdatetime())
+    );
+END");
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[BankSyncProfiles]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_BankSyncProfiles_TenantId_BranchId' AND object_id = OBJECT_ID(N'[BankSyncProfiles]'))
+        CREATE UNIQUE INDEX [IX_BankSyncProfiles_TenantId_BranchId] ON [dbo].[BankSyncProfiles]([TenantId],[BranchId]);
+    IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_BankSyncProfiles_Branches_BranchId')
+        ALTER TABLE [dbo].[BankSyncProfiles] WITH CHECK ADD CONSTRAINT [FK_BankSyncProfiles_Branches_BranchId]
+            FOREIGN KEY([BranchId]) REFERENCES [dbo].[Branches]([Id]) ON DELETE NO ACTION;
+END");
+
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[CounterpartyIdentityCaches]', N'U') IS NULL
+BEGIN
+    CREATE TABLE [dbo].[CounterpartyIdentityCaches](
+        [Id] uniqueidentifier NOT NULL CONSTRAINT [PK_CounterpartyIdentityCaches] PRIMARY KEY,
+        [NormalizedIban] nvarchar(64) NULL,
+        [NormalizedName] nvarchar(256) NOT NULL,
+        [TaxNo] nvarchar(32) NOT NULL,
+        [DisplayName] nvarchar(256) NULL,
+        [Source] nvarchar(32) NOT NULL,
+        [LinkedCustomerId] uniqueidentifier NULL,
+        [LinkedSupplierId] uniqueidentifier NULL,
+        [LearnedByTenantId] uniqueidentifier NULL,
+        [LastSeenAtUtc] datetime2 NOT NULL CONSTRAINT [DF_CounterpartyIdentityCaches_LastSeenAtUtc] DEFAULT(sysutcdatetime()),
+        [IsDeleted] bit NOT NULL CONSTRAINT [DF_CounterpartyIdentityCaches_IsDeleted] DEFAULT(0),
+        [CreatedAt] datetime2 NOT NULL CONSTRAINT [DF_CounterpartyIdentityCaches_CreatedAt] DEFAULT(sysutcdatetime())
+    );
+END");
+            await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[CounterpartyIdentityCaches]', N'U') IS NOT NULL
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_CounterpartyIdentityCaches_NormalizedIban' AND object_id = OBJECT_ID(N'[CounterpartyIdentityCaches]'))
+        CREATE INDEX [IX_CounterpartyIdentityCaches_NormalizedIban] ON [dbo].[CounterpartyIdentityCaches]([NormalizedIban]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_CounterpartyIdentityCaches_NormalizedName' AND object_id = OBJECT_ID(N'[CounterpartyIdentityCaches]'))
+        CREATE INDEX [IX_CounterpartyIdentityCaches_NormalizedName] ON [dbo].[CounterpartyIdentityCaches]([NormalizedName]);
+    IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = N'IX_CounterpartyIdentityCaches_NormalizedIban_TaxNo' AND object_id = OBJECT_ID(N'[CounterpartyIdentityCaches]'))
+        CREATE INDEX [IX_CounterpartyIdentityCaches_NormalizedIban_TaxNo] ON [dbo].[CounterpartyIdentityCaches]([NormalizedIban],[TaxNo]);
+END");
+        }
+        catch (Exception ex) { Console.WriteLine("EnsureBankSyncTables: " + ex.Message); }
     }
     catch (Exception ex) { Console.WriteLine("EnsureColumns: " + ex.Message); }
     var configuration = scope.ServiceProvider.GetRequiredService<IConfiguration>();

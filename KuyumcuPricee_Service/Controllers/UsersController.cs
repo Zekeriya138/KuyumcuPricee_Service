@@ -203,6 +203,8 @@ public sealed class UsersController : ControllerBase
             return BadRequest(new { error = "Kullanıcı adı ve şifre zorunludur." });
         if (!IsValidNationalId(req.NationalId))
             return BadRequest(new { error = "TC kimlik numarası zorunludur ve 11 haneli olmalıdır." });
+        if (!IsValidPhone(req.Phone))
+            return BadRequest(new { error = "Telefon zorunludur. Örn: 05XXXXXXXXX" });
 
         var username = req.Username.Trim();
         var branchExists = await _db.Branches.AsNoTracking().AnyAsync(x => x.Id == req.BranchId && x.IsActive, ct);
@@ -233,7 +235,7 @@ public sealed class UsersController : ControllerBase
             Role = normalizedRole,
             NationalId = NormalizeNationalId(req.NationalId)!,
             FullName = NormalizeNullable(req.FullName),
-            Phone = NormalizeNullable(req.Phone),
+            Phone = NormalizeNullable(req.Phone) ?? req.Phone.Trim(),
             Email = NormalizeNullable(req.Email),
             IsActive = req.IsActive,
             CanManageUsers = perms.CanManageUsers,
@@ -516,6 +518,14 @@ public sealed class UsersController : ControllerBase
     {
         var digits = NormalizeNationalId(value);
         return !string.IsNullOrWhiteSpace(digits) && digits.Length == 11;
+    }
+
+    private static bool IsValidPhone(string? value)
+    {
+        var digits = new string((value ?? "").Where(char.IsDigit).ToArray());
+        if (digits.StartsWith("90", StringComparison.Ordinal) && digits.Length == 12)
+            digits = "0" + digits[2..];
+        return System.Text.RegularExpressions.Regex.IsMatch(digits, "^05[0-9]{9}$");
     }
 
     private async Task UpsertMonthlySalaryReminderAsync(

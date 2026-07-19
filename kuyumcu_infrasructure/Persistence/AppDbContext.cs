@@ -63,6 +63,10 @@ namespace kuyumcu_infrastructure.Persistence
         public DbSet<Account> Accounts => Set<Account>();
         public DbSet<JournalEntry> JournalEntries => Set<JournalEntry>();
         public DbSet<JournalLine> JournalLines => Set<JournalLine>();
+    public DbSet<BankImportTransaction> BankImportTransactions => Set<BankImportTransaction>();
+    public DbSet<BankSyncProfile> BankSyncProfiles => Set<BankSyncProfile>();
+    public DbSet<CounterpartyIdentityCache> CounterpartyIdentityCaches => Set<CounterpartyIdentityCache>();
+    public DbSet<SmsVerificationCode> SmsVerificationCodes => Set<SmsVerificationCode>();
         protected override void OnModelCreating(ModelBuilder b)
         {
             base.OnModelCreating(b);
@@ -72,6 +76,19 @@ namespace kuyumcu_infrastructure.Persistence
                 e.ToTable("Tenants");
                 e.HasKey(x => x.Id);
                 e.Property(x => x.Name).HasMaxLength(128).IsRequired();
+            });
+
+            b.Entity<SmsVerificationCode>(e =>
+            {
+                e.ToTable("SmsVerificationCodes");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Purpose).HasMaxLength(64).IsRequired();
+                e.Property(x => x.Username).HasMaxLength(64);
+                e.Property(x => x.Phone).HasMaxLength(32).IsRequired();
+                e.Property(x => x.CodeHash).HasMaxLength(128).IsRequired();
+                e.Property(x => x.VerificationToken).HasMaxLength(64);
+                e.HasIndex(x => new { x.Purpose, x.Phone, x.LastSentAtUtc });
+                e.HasIndex(x => x.VerificationToken);
             });
             // ===== ProductItem =====
             b.Entity<ProductItem>(e =>
@@ -1060,6 +1077,58 @@ namespace kuyumcu_infrastructure.Persistence
                 e.HasIndex(x => x.Barcode);
                 e.HasIndex(x => new { x.TenantId, x.BranchId, x.ProductCode }).IsUnique();
                 e.HasQueryFilter(x => _tenant != null && x.TenantId == _tenant.TenantId);
+            });
+
+            // ===== BankImportTransaction =====
+            b.Entity<BankImportTransaction>(e =>
+            {
+                e.ToTable("BankImportTransactions");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.Provider).HasMaxLength(32).IsRequired();
+                e.Property(x => x.ExternalKey).HasMaxLength(128).IsRequired();
+                e.Property(x => x.Currency).HasMaxLength(8).IsRequired();
+                e.Property(x => x.TransactionType).HasMaxLength(32).IsRequired();
+                e.Property(x => x.Description).HasMaxLength(1000);
+                e.Property(x => x.CounterpartyName).HasMaxLength(256);
+                e.Property(x => x.CounterpartyTaxNo).HasMaxLength(32);
+                e.Property(x => x.CounterpartyIban).HasMaxLength(64);
+                e.Property(x => x.Status).HasMaxLength(32).IsRequired();
+                e.Property(x => x.StatusMessage).HasMaxLength(500);
+                e.Property(x => x.Amount).HasColumnType("decimal(18,4)");
+                e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
+                e.HasIndex(x => new { x.TenantId, x.BranchId, x.Provider, x.ExternalKey }).IsUnique();
+                e.HasIndex(x => new { x.TenantId, x.BranchId, x.Status, x.TransactionDateUtc });
+                e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
+            });
+
+            // ===== BankSyncProfile =====
+            b.Entity<BankSyncProfile>(e =>
+            {
+                e.ToTable("BankSyncProfiles");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.VomsisAppKey).HasMaxLength(256);
+                e.Property(x => x.VomsisAppSecret).HasMaxLength(512);
+                e.Property(x => x.ErpApiBaseUrl).HasMaxLength(512).IsRequired();
+                e.Property(x => x.ErpApiAppKey).HasMaxLength(256);
+                e.Property(x => x.AllowedAccountIds).HasMaxLength(128).IsRequired();
+                e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
+                e.HasIndex(x => new { x.TenantId, x.BranchId }).IsUnique();
+                e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);
+            });
+
+            // ===== CounterpartyIdentityCache (global — tenant filtresi yok) =====
+            b.Entity<CounterpartyIdentityCache>(e =>
+            {
+                e.ToTable("CounterpartyIdentityCaches");
+                e.HasKey(x => x.Id);
+                e.Property(x => x.NormalizedIban).HasMaxLength(64);
+                e.Property(x => x.NormalizedName).HasMaxLength(256).IsRequired();
+                e.Property(x => x.TaxNo).HasMaxLength(32).IsRequired();
+                e.Property(x => x.DisplayName).HasMaxLength(256);
+                e.Property(x => x.Source).HasMaxLength(32).IsRequired();
+                e.HasIndex(x => x.NormalizedIban);
+                e.HasIndex(x => x.NormalizedName);
+                e.HasIndex(x => new { x.NormalizedIban, x.TaxNo });
             });
         }
         public override Task<int> SaveChangesAsync(CancellationToken ct = default)
