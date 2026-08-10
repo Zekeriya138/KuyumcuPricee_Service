@@ -172,10 +172,8 @@ public class DepoStokController : ControllerBase
             return BadRequest(new { error = "Ayar değeri geçersiz." });
 
         var birim = DepoStokTripleHelper.RoundBirimMaliyet(req.BirimIscilikHas);
-        if (birim < 0)
-            return BadRequest(new { error = "Birim işçilik negatif olamaz." });
 
-        if (req.ToplamIscilikHas.HasValue && req.ToplamIscilikHas.Value >= 0 && req.Gram > 0)
+        if (req.ToplamIscilikHas.HasValue && req.Gram > 0)
             birim = DepoStokTripleHelper.RoundBirimMaliyet(req.ToplamIscilikHas.Value / req.Gram);
 
         var firma = string.IsNullOrWhiteSpace(req.TedarikciFirma)

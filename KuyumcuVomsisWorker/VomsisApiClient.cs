@@ -8,6 +8,8 @@ namespace KuyumcuVomsisWorker;
 
 public sealed class VomsisApiClient
 {
+    private const int MaxDateWindowDays = 7;
+
     private readonly HttpClient _http;
     private readonly IConfiguration _config;
     private readonly ILogger<VomsisApiClient> _logger;
@@ -37,8 +39,66 @@ public sealed class VomsisApiClient
     public async Task<IReadOnlyList<VomsisTransaction>> GetTransactionsAsync(DateTime beginUtc, DateTime endUtc, CancellationToken ct)
     {
         await EnsureTokenAsync(ct);
-        var begin = beginUtc.ToLocalTime().ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
-        var end = endUtc.ToLocalTime().ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+
+        var rangeBegin = beginUtc.ToLocalTime().Date;
+        var rangeEnd = endUtc.ToLocalTime().Date;
+        if (rangeEnd < rangeBegin)
+            (rangeBegin, rangeEnd) = (rangeEnd, rangeBegin);
+
+        var merged = new Dictionary<long, VomsisTransaction>();
+        var windowEnd = rangeEnd;
+
+        while (windowEnd >= rangeBegin)
+        {
+            var windowBegin = windowEnd.AddDays(-(MaxDateWindowDays - 1));
+            var batch = await FetchTransactionsWindowAsync(windowBegin, windowEnd, ct);
+            foreach (var tx in batch)
+                merged[tx.Id] = tx;
+
+            if (windowBegin <= rangeBegin)
+                break;
+
+            windowEnd = windowBegin.AddDays(-1);
+        }
+
+        return merged.Values
+            .Where(tx => IsWithinUtcRange(tx, beginUtc, endUtc))
+            .ToList();
+    }
+
+    private static bool IsWithinUtcRange(VomsisTransaction tx, DateTime beginUtc, DateTime endUtc)
+    {
+        var dt = ParseSystemDate(tx.SystemDate);
+        if (!dt.HasValue)
+            return true;
+
+        return dt.Value >= beginUtc && dt.Value <= endUtc;
+    }
+
+    private static DateTime? ParseSystemDate(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        var formats = new[]
+        {
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-ddTHH:mm:ss",
+            "dd-MM-yyyy HH:mm:ss",
+            "dd.MM.yyyy HH:mm:ss"
+        };
+        if (DateTime.TryParseExact(value, formats, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var dt))
+            return dt.ToUniversalTime();
+        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out dt))
+            return dt.ToUniversalTime();
+        return null;
+    }
+
+    private async Task<IReadOnlyList<VomsisTransaction>> FetchTransactionsWindowAsync(
+        DateTime windowBeginLocal,
+        DateTime windowEndLocal,
+        CancellationToken ct)
+    {
+        var begin = windowBeginLocal.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+        var end = windowEndLocal.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
         var url = $"api/v2/transactions?beginDate={Uri.EscapeDataString(begin)}&endDate={Uri.EscapeDataString(end)}";
 
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
@@ -128,4 +188,22 @@ public sealed class VomsisTransaction
 
     [JsonPropertyName("payer_tax_no")]
     public string? PayerTaxNo { get; set; }
+
+    [JsonPropertyName("related_vkn")]
+    public string? RelatedVkn { get; set; }
+
+    [JsonPropertyName("ilgili_vkn")]
+    public string? IlgiliVkn { get; set; }
+
+    [JsonPropertyName("related_title")]
+    public string? RelatedTitle { get; set; }
+
+    [JsonPropertyName("ilgili_unvan")]
+    public string? IlgiliUnvan { get; set; }
+
+    [JsonPropertyName("receiver_taxno")]
+    public string? ReceiverTaxno { get; set; }
+
+    [JsonPropertyName("receiver_tax_no")]
+    public string? ReceiverTaxNoAlt { get; set; }
 }

@@ -10,10 +10,12 @@ namespace KUYUMCU.Price_Service.Controllers;
 public sealed class AiController : ControllerBase
 {
     private readonly IAiService _aiService;
+    private readonly IBranchLogoService _branchLogoService;
 
-    public AiController(IAiService aiService)
+    public AiController(IAiService aiService, IBranchLogoService branchLogoService)
     {
         _aiService = aiService;
+        _branchLogoService = branchLogoService;
     }
 
     [HttpPost("chat")]
@@ -39,6 +41,23 @@ public sealed class AiController : ControllerBase
 
         return Ok(new AiChatResponse { Reply = reply.Reply, Action = reply.Action });
     }
+
+    [HttpPost("generate-branch-logo")]
+    public async Task<IActionResult> GenerateBranchLogo([FromBody] GenerateBranchLogoRequest request, CancellationToken ct)
+    {
+        if (request is null || string.IsNullOrWhiteSpace(request.BranchName))
+            return BadRequest(new { error = "branchName alanı zorunludur." });
+
+        var result = await _branchLogoService.GenerateAsync(request.BranchName.Trim(), ct);
+        if (!string.IsNullOrWhiteSpace(result.Error))
+            return BadRequest(new { error = result.Error });
+
+        return Ok(new GenerateBranchLogoResponse
+        {
+            LogoBase64 = result.LogoBase64,
+            ContentType = result.ContentType
+        });
+    }
 }
 
 public sealed class AiChatRequest
@@ -53,4 +72,15 @@ public sealed class AiChatResponse
 {
     public string Reply { get; set; } = "";
     public KUYUMCU.Price_Service.Services.AiActionResponse? Action { get; set; }
+}
+
+public sealed class GenerateBranchLogoRequest
+{
+    public string BranchName { get; set; } = "";
+}
+
+public sealed class GenerateBranchLogoResponse
+{
+    public string LogoBase64 { get; set; } = "";
+    public string ContentType { get; set; } = "image/png";
 }

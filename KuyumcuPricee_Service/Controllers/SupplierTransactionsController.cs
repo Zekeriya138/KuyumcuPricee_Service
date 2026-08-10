@@ -42,9 +42,10 @@ public sealed class SupplierTransactionsController : ControllerBase
         decimal? TargetUnitTlRate = null,
         decimal? TargetAmount = null,
         List<ZiynetUrunStokReq>? ZiynetUrunStokItems = null,
-        string? SourceLedgerSide = null);
+        string? SourceLedgerSide = null,
+        string? TargetLedgerSide = null);
     public sealed record OpeningBalanceReq(string Unit, decimal Amount);
-    public sealed record ZiynetSettlementReq(string Ad, string Tip, decimal Adet, string? CariDurum);
+    public sealed record ZiynetSettlementReq(string Ad, string Tip, decimal Adet, string? CariDurum, string? LedgerSide = null);
 
     public sealed record SupplierTransactionDto(
         Guid Id,
@@ -84,7 +85,7 @@ public sealed class SupplierTransactionsController : ControllerBase
             ZiynetUrunStokMarker.FromReqItems(req.ZiynetUrunStokItems));
         req = req with { Description = effectiveDescription };
 
-        var hasZiynetSettlement = txType == "PAYMENT" && req.ZiynetItems is { Count: > 0 };
+        var hasZiynetSettlement = req.ZiynetItems?.Any(z => z is not null && z.Adet > 0m && !string.IsNullOrWhiteSpace(z.Ad)) == true;
         if (txType != "OPENING_BALANCE" && req.SourceAmount <= 0 && !hasZiynetSettlement)
             return BadRequest(new { error = "Miktar 0'dan büyük olmalıdır." });
 
@@ -106,6 +107,10 @@ public sealed class SupplierTransactionsController : ControllerBase
                 return BadRequest(new { error = $"Hedef birim kuru bulunamadı: {targetUnit}" });
 
             sourceAmount = decimal.Round(req.SourceAmount, 6);
+            if (req.SourceUnitTlRate is > 0m)
+                sourceTlRate = req.SourceUnitTlRate.Value;
+            if (req.TargetUnitTlRate is > 0m)
+                targetTlRate = req.TargetUnitTlRate.Value;
             targetAmount = req.IsConvertEnabled
                 ? decimal.Round((sourceAmount * sourceTlRate) / targetTlRate, 6)
                 : sourceAmount;
@@ -230,13 +235,25 @@ public sealed class SupplierTransactionsController : ControllerBase
                 if (BalanceConversionZiynetHelper.UnitsEqual(srcU, tgtU))
                     return BadRequest(new { error = "Dönüşüm için kaynak ve hedef birim farklı olmalıdır." });
 
-                // Kaynak→TL ve TL→hedef için ayrı alış/satış yönü (tedarikçi mantığı).
-                var sourceBalance = srcU.IsZiynet
-                    ? await GetSupplierZiynetNetAsync(tenantId, supplier.Id, branchId, srcU.ZiynetAd, srcU.ZiynetTip, ct)
-                    : GetBalanceByUnit(bal, srcU.CurrencyUnit);
+                var srcAmt = decimal.Round(req.SourceAmount, 6, MidpointRounding.AwayFromZero);
+                if (srcAmt <= 0m)
+                    return BadRequest(new { error = "Dönüştürülecek miktar 0'dan büyük olmalıdır." });
+
+                var (grossBorc, grossAlacak) = await GetSupplierConversionGrossAsync(tenantId, supplier.Id, branchId, srcU, ct);
                 var ledgerSide = CustomerFinanceHelper.NormalizeLedgerSide(req.SourceLedgerSide);
                 if (string.IsNullOrEmpty(ledgerSide))
-                    ledgerSide = sourceBalance < 0m ? CustomerFinanceHelper.LedgerBorc : CustomerFinanceHelper.LedgerAlacak;
+                    ledgerSide = ResolveAutoLedgerSide(grossBorc, grossAlacak, srcAmt);
+
+                if (CustomerFinanceHelper.IsLedgerAlacak(ledgerSide))
+                {
+                    if (grossAlacak + 0.0005m < srcAmt)
+                        return BadRequest(new { error = "Kaynak alacak miktarı yetersiz." });
+                }
+                else if (grossBorc + 0.0005m < srcAmt)
+                {
+                    return BadRequest(new { error = "Kaynak borç miktarı yetersiz." });
+                }
+
                 var (useBuySrc, useBuyTgt) = CustomerFinanceHelper.IsLedgerAlacak(ledgerSide)
                     ? (true, false)
                     : (false, true);
@@ -252,16 +269,37 @@ public sealed class SupplierTransactionsController : ControllerBase
                 if (tgtRate <= 0m)
                     return BadRequest(new { error = $"Hedef birim kuru bulunamadı: {BalanceConversionZiynetHelper.FormatUnitLabel(tgtU)}" });
 
-                var srcAmt = decimal.Round(req.SourceAmount, 6, MidpointRounding.AwayFromZero);
-                if (srcAmt <= 0m)
-                    return BadRequest(new { error = "Dönüştürülecek miktar 0'dan büyük olmalıdır." });
                 var tgtAmt = req.TargetAmount is > 0m
                     ? decimal.Round(req.TargetAmount.Value, 6, MidpointRounding.AwayFromZero)
                     : decimal.Round((srcAmt * srcRate) / tgtRate, 6, MidpointRounding.AwayFromZero);
 
-                var srcDelta = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, srcAmt).BalanceDelta;
-                var tgtDelta = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, tgtAmt).BalanceDelta;
+                var targetLedgerSide = CustomerFinanceHelper.NormalizeLedgerSide(req.TargetLedgerSide);
+                if (string.IsNullOrEmpty(targetLedgerSide))
+                    targetLedgerSide = ledgerSide;
+
+                var (tgtGrossBorc, tgtGrossAlacak) = await GetSupplierConversionGrossAsync(tenantId, supplier.Id, branchId, tgtU, ct);
+                var targetIsOpposite = CustomerFinanceHelper.IsLedgerBorc(ledgerSide)
+                    ? tgtGrossAlacak > 0m
+                    : tgtGrossBorc > 0m;
+
+                if (targetIsOpposite)
+                {
+                    if (CustomerFinanceHelper.IsLedgerAlacak(targetLedgerSide))
+                    {
+                        if (tgtGrossAlacak + 0.0005m < tgtAmt)
+                            return BadRequest(new { error = "Hedef alacak miktarı yetersiz." });
+                    }
+                    else if (tgtGrossBorc + 0.0005m < tgtAmt)
+                    {
+                        return BadRequest(new { error = "Hedef borç miktarı yetersiz." });
+                    }
+                }
+
                 var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
+                var srcDelta = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, srcAmt).BalanceDelta;
+                var tgtDelta = targetIsOpposite
+                    ? CustomerFinanceHelper.BuildReductionLeg(targetLedgerSide, tgtAmt).BalanceDelta
+                    : CustomerFinanceHelper.BuildAdditionLeg(targetLedgerSide, tgtAmt).BalanceDelta;
 
                 ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate, batchId);
                 lastEntity = ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate, batchId);
@@ -269,82 +307,64 @@ public sealed class SupplierTransactionsController : ControllerBase
             }
             else
             {
-                var signed = txType == "PAYMENT" ? -targetAmount : targetAmount;
-                ApplyBalanceDelta(bal, targetUnit, signed);
-
-                lastEntity = new SupplierTransaction
+                var batchEntities = new List<SupplierTransaction>();
+                if (sourceAmount > 0m)
                 {
-                    TenantId = tenantId,
-                    SupplierId = supplier.Id,
-                    BranchId = branchId,
-                    TxType = txType,
-                    SourceUnit = sourceUnit,
-                    SourceAmount = sourceAmount,
-                    TargetUnit = targetUnit,
-                    TargetAmount = targetAmount,
-                    IsConverted = req.IsConvertEnabled,
-                    SourceUnitTlRate = sourceTlRate,
-                    TargetUnitTlRate = targetTlRate,
-                    Description = string.IsNullOrWhiteSpace(req.Description) ? null : req.Description.Trim(),
-                    TxDate = txDate,
-                    BatchId = batchId
-                };
-                await ApplyCashMovementAsync(req, tenantId, branchId, txType, sourceUnit, lastEntity.TxDate, supplier.Id, batchId, ct);
+                    var existing = await _db.SupplierTransactions.AsNoTracking()
+                        .Where(x => x.TenantId == tenantId && x.SupplierId == supplier.Id && x.BranchId == branchId
+                                    && !x.IsDeleted && !x.IsReversed)
+                        .ToListAsync(ct);
+                    var (grossBorc, grossAlacak) = SupplierFinanceHelper.ComputeDovizGross(existing, targetUnit);
+                    var tgtAmt = req.TargetAmount is > 0m
+                        ? decimal.Round(req.TargetAmount.Value, 6, MidpointRounding.AwayFromZero)
+                        : targetAmount;
 
-                if (txType == "PAYMENT" && req.ZiynetItems is { Count: > 0 })
+                    ApplySupplierDovizSettlement(
+                        bal, tenantId, supplier.Id, branchId, txType, targetUnit, tgtAmt,
+                        sourceUnit, sourceAmount, sourceTlRate, targetTlRate, req.IsConvertEnabled,
+                        req.TargetLedgerSide, grossBorc, grossAlacak, req.Description, txDate, batchId,
+                        batchEntities);
+                    lastEntity = batchEntities.LastOrDefault();
+                    await ApplyCashMovementAsync(req, tenantId, branchId, txType, sourceUnit, txDate, supplier.Id, batchId, ct);
+                }
+
+                if (req.ZiynetItems is { Count: > 0 })
                 {
+                    var existing = await _db.SupplierTransactions.AsNoTracking()
+                        .Where(x => x.TenantId == tenantId && x.SupplierId == supplier.Id && x.BranchId == branchId
+                                    && !x.IsDeleted && !x.IsReversed)
+                        .ToListAsync(ct);
                     foreach (var ziynet in req.ZiynetItems
                                  .Where(z => z is not null && z.Adet > 0m && !string.IsNullOrWhiteSpace(z.Ad)))
                     {
                         var adet = decimal.Round(ziynet.Adet, 3, MidpointRounding.AwayFromZero);
                         var ad = (ziynet.Ad ?? "").Trim();
                         var tip = NormalizeZiynetTip(ziynet.Tip);
-                        if (adet <= 0m || string.IsNullOrWhiteSpace(ad))
-                            continue;
+                        if (adet <= 0m || string.IsNullOrWhiteSpace(ad)) continue;
 
-                        // Has altın: adet defteri yerine HAS döviz bakiyesinden düş.
                         if (IsHasAltinZiynetAd(ad))
                         {
-                            ApplyBalanceDelta(bal, "HAS", -adet);
-                            _db.SupplierTransactions.Add(new SupplierTransaction
-                            {
-                                TenantId = tenantId,
-                                SupplierId = supplier.Id,
-                                BranchId = branchId,
-                                TxType = "PAYMENT",
-                                SourceUnit = "HAS",
-                                SourceAmount = adet,
-                                TargetUnit = "HAS",
-                                TargetAmount = -adet,
-                                IsConverted = false,
-                                SourceUnitTlRate = 1m,
-                                TargetUnitTlRate = 1m,
-                                Description = $"Has altın ödemesi (SUPPLIER_PAYMENT:{supplier.Id}, Tutar: {adet.ToString("0.###", CultureInfo.InvariantCulture)} gr)",
-                                TxDate = txDate,
-                                BatchId = batchId
-                            });
+                            var (gBorc, gAlacak) = SupplierFinanceHelper.ComputeDovizGross(existing, "HAS");
+                            ApplySupplierDovizSettlement(
+                                bal, tenantId, supplier.Id, branchId, txType, "HAS", adet,
+                                "HAS", adet, 1m, 1m, false,
+                                ziynet.LedgerSide, gBorc, gAlacak,
+                                $"Has altın {(txType == "COLLECTION" ? "tahsilatı" : "ödemesi")} (SUPPLIER_{txType}:{supplier.Id})",
+                                txDate, batchId, batchEntities);
                             continue;
                         }
 
-                        _db.SupplierTransactions.Add(new SupplierTransaction
-                        {
-                            TenantId = tenantId,
-                            SupplierId = supplier.Id,
-                            BranchId = branchId,
-                            TxType = "ZIYNET",
-                            SourceUnit = "ADET",
-                            SourceAmount = adet,
-                            TargetUnit = "ADET",
-                            TargetAmount = -adet,
-                            IsConverted = false,
-                            SourceUnitTlRate = 1m,
-                            TargetUnitTlRate = 1m,
-                            Description = BuildSupplierZiynetDescription(ad, tip, -adet, $"SUPPLIER_PAYMENT:{supplier.Id}"),
-                            TxDate = txDate,
-                            BatchId = batchId
-                        });
+                        var (zBorc, zAlacak) = SupplierFinanceHelper.ComputeZiynetGrossFromTransactions(existing, ad, tip);
+                        ApplySupplierZiynetSettlement(
+                            bal, tenantId, supplier.Id, branchId, txType, ad, tip, adet,
+                            ziynet.LedgerSide, zBorc, zAlacak, req.Description, txDate, batchId, batchEntities);
                     }
+                    lastEntity = batchEntities.LastOrDefault() ?? lastEntity;
                 }
+
+                foreach (var entity in batchEntities)
+                    _db.SupplierTransactions.Add(entity);
+                lastEntityAdded = batchEntities.Count > 0;
             }
 
             bal.UpdatedAt = DateTime.UtcNow;
@@ -380,6 +400,210 @@ public sealed class SupplierTransactionsController : ControllerBase
             throw;
         }
     }
+
+    private void ApplySupplierDovizSettlement(
+        SupplierBalance bal,
+        Guid tenantId,
+        Guid supplierId,
+        Guid branchId,
+        string txType,
+        string targetUnit,
+        decimal tgtAmt,
+        string sourceUnit,
+        decimal sourceAmount,
+        decimal sourceTlRate,
+        decimal targetTlRate,
+        bool isConverted,
+        string? targetLedgerSide,
+        decimal grossBorc,
+        decimal grossAlacak,
+        string? description,
+        DateTime txDate,
+        Guid batchId,
+        List<SupplierTransaction> entities)
+    {
+        if (tgtAmt <= 0m) return;
+
+        var mode = NormalizeSettlementMode(targetLedgerSide, txType, grossBorc, grossAlacak);
+        var note = string.IsNullOrWhiteSpace(description) ? null : description.Trim();
+        var remaining = tgtAmt;
+
+        if (txType == "COLLECTION")
+        {
+            if (mode is "SPLIT_BORC" or "BORC")
+            {
+                var offset = mode == "SPLIT_BORC" ? Math.Min(grossBorc, remaining) : remaining;
+                if (offset > 0m)
+                {
+                    entities.Add(BuildSettlementTx(tenantId, supplierId, branchId, txType, sourceUnit, sourceAmount,
+                        targetUnit, offset, isConverted, sourceTlRate, targetTlRate, note, txDate, batchId,
+                        SupplierFinanceHelper.RefSettleBorc));
+                    remaining -= offset;
+                }
+            }
+            if (remaining > 0m && mode != "BORC")
+            {
+                entities.Add(BuildSettlementTx(tenantId, supplierId, branchId, txType, sourceUnit, sourceAmount,
+                    targetUnit, remaining, isConverted, sourceTlRate, targetTlRate, note, txDate, batchId, null));
+            }
+            ApplyBalanceDelta(bal, targetUnit, tgtAmt);
+        }
+        else
+        {
+            if (mode is "SPLIT_ALACAK" or "ALACAK")
+            {
+                var offset = mode == "SPLIT_ALACAK" ? Math.Min(grossAlacak, remaining) : remaining;
+                if (offset > 0m)
+                {
+                    entities.Add(BuildSettlementTx(tenantId, supplierId, branchId, txType, sourceUnit, sourceAmount,
+                        targetUnit, -offset, isConverted, sourceTlRate, targetTlRate, note, txDate, batchId,
+                        SupplierFinanceHelper.RefSettleAlacak));
+                    remaining -= offset;
+                }
+            }
+            if (remaining > 0m && mode != "ALACAK")
+            {
+                entities.Add(BuildSettlementTx(tenantId, supplierId, branchId, txType, sourceUnit, sourceAmount,
+                    targetUnit, -remaining, isConverted, sourceTlRate, targetTlRate, note, txDate, batchId, null));
+            }
+            ApplyBalanceDelta(bal, targetUnit, -tgtAmt);
+        }
+    }
+
+    private void ApplySupplierZiynetSettlement(
+        SupplierBalance bal,
+        Guid tenantId,
+        Guid supplierId,
+        Guid branchId,
+        string txType,
+        string ad,
+        string tip,
+        decimal adet,
+        string? ledgerSide,
+        decimal grossBorc,
+        decimal grossAlacak,
+        string? description,
+        DateTime txDate,
+        Guid batchId,
+        List<SupplierTransaction> entities)
+    {
+        var mode = NormalizeSettlementMode(ledgerSide, txType, grossBorc, grossAlacak);
+        var remaining = adet;
+        var note = string.IsNullOrWhiteSpace(description) ? null : description.Trim();
+
+        if (txType == "COLLECTION")
+        {
+            if (mode is "SPLIT_BORC" or "BORC")
+            {
+                var offset = mode == "SPLIT_BORC" ? Math.Min(grossBorc, remaining) : remaining;
+                if (offset > 0m)
+                {
+                    entities.Add(BuildZiynetSettlementTx(tenantId, supplierId, branchId, ad, tip, offset, txDate, batchId,
+                        SupplierFinanceHelper.RefSettleBorc, note, $"SUPPLIER_{txType}:{supplierId}"));
+                    remaining -= offset;
+                }
+            }
+            if (remaining > 0m && mode != "BORC")
+            {
+                entities.Add(BuildZiynetSettlementTx(tenantId, supplierId, branchId, ad, tip, remaining, txDate, batchId,
+                    null, note, $"SUPPLIER_{txType}:{supplierId}"));
+            }
+        }
+        else
+        {
+            if (mode is "SPLIT_ALACAK" or "ALACAK")
+            {
+                var offset = mode == "SPLIT_ALACAK" ? Math.Min(grossAlacak, remaining) : remaining;
+                if (offset > 0m)
+                {
+                    entities.Add(BuildZiynetSettlementTx(tenantId, supplierId, branchId, ad, tip, -offset, txDate, batchId,
+                        SupplierFinanceHelper.RefSettleAlacak, note, $"SUPPLIER_{txType}:{supplierId}"));
+                    remaining -= offset;
+                }
+            }
+            if (remaining > 0m && mode != "ALACAK")
+            {
+                entities.Add(BuildZiynetSettlementTx(tenantId, supplierId, branchId, ad, tip, -remaining, txDate, batchId,
+                    null, note, $"SUPPLIER_{txType}:{supplierId}"));
+            }
+        }
+    }
+
+    private static string NormalizeSettlementMode(string? ledgerSide, string txType, decimal grossBorc, decimal grossAlacak)
+    {
+        var side = (ledgerSide ?? "").Trim().ToUpperInvariant();
+        if (side is "SPLIT_BORC" or "SPLIT_ALACAK" or "BORC" or "ALACAK") return side;
+
+        if (txType == "COLLECTION")
+        {
+            if (grossBorc > 0m && grossAlacak <= 0m) return "SPLIT_BORC";
+            if (grossAlacak > 0m && grossBorc <= 0m) return "ALACAK";
+            return grossBorc > 0m ? "SPLIT_BORC" : "ALACAK";
+        }
+
+        if (grossAlacak > 0m && grossBorc <= 0m) return "SPLIT_ALACAK";
+        if (grossBorc > 0m && grossAlacak <= 0m) return "BORC";
+        return grossAlacak > 0m ? "SPLIT_ALACAK" : "BORC";
+    }
+
+    private static SupplierTransaction BuildSettlementTx(
+        Guid tenantId, Guid supplierId, Guid branchId, string txType,
+        string sourceUnit, decimal sourceAmount, string targetUnit, decimal signedTargetAmount,
+        bool isConverted, decimal sourceTlRate, decimal targetTlRate,
+        string? description, DateTime txDate, Guid batchId, string? refType)
+    {
+        var desc = description;
+        if (isConverted
+            && !string.Equals(sourceUnit, targetUnit, StringComparison.OrdinalIgnoreCase)
+            && sourceAmount > 0m
+            && Math.Abs(signedTargetAmount) > 0m)
+        {
+            desc = CariIslemKarsilikHelper.AppendCrossUnitNote(
+                description, sourceAmount, sourceUnit, Math.Abs(signedTargetAmount), targetUnit);
+        }
+
+        return new()
+        {
+            TenantId = tenantId,
+            SupplierId = supplierId,
+            BranchId = branchId,
+            TxType = txType,
+            SourceUnit = sourceUnit,
+            SourceAmount = sourceAmount,
+            TargetUnit = targetUnit,
+            TargetAmount = signedTargetAmount,
+            IsConverted = isConverted,
+            SourceUnitTlRate = sourceTlRate,
+            TargetUnitTlRate = targetTlRate,
+            Description = desc,
+            TxDate = txDate,
+            BatchId = batchId,
+            RefType = refType
+        };
+    }
+
+    private static SupplierTransaction BuildZiynetSettlementTx(
+        Guid tenantId, Guid supplierId, Guid branchId,
+        string ad, string tip, decimal signedAdet,
+        DateTime txDate, Guid batchId, string? refType, string? note, string marker)
+        => new()
+        {
+            TenantId = tenantId,
+            SupplierId = supplierId,
+            BranchId = branchId,
+            TxType = "ZIYNET",
+            SourceUnit = "ADET",
+            SourceAmount = Math.Abs(signedAdet),
+            TargetUnit = "ADET",
+            TargetAmount = signedAdet,
+            IsConverted = false,
+            SourceUnitTlRate = 1m,
+            TargetUnitTlRate = 1m,
+            Description = BuildSupplierZiynetDescription(ad, tip, signedAdet, marker),
+            TxDate = txDate,
+            BatchId = batchId,
+            RefType = refType
+        };
 
     private async Task ApplyCashMovementAsync(
         CreateSupplierTransactionReq req,
@@ -671,6 +895,33 @@ public sealed class SupplierTransactionsController : ControllerBase
         }
         _db.SupplierTransactions.Add(entity);
         return entity;
+    }
+
+    private static string ResolveAutoLedgerSide(decimal grossBorc, decimal grossAlacak, decimal amount)
+    {
+        var canAlacak = grossAlacak >= amount - 0.0005m && grossAlacak > 0m;
+        var canBorc = grossBorc >= amount - 0.0005m && grossBorc > 0m;
+        if (canAlacak && !canBorc) return CustomerFinanceHelper.LedgerAlacak;
+        if (canBorc && !canAlacak) return CustomerFinanceHelper.LedgerBorc;
+        if (grossAlacak > grossBorc) return CustomerFinanceHelper.LedgerAlacak;
+        if (grossBorc > grossAlacak) return CustomerFinanceHelper.LedgerBorc;
+        return CustomerFinanceHelper.LedgerAlacak;
+    }
+
+    private async Task<(decimal Borc, decimal Alacak)> GetSupplierConversionGrossAsync(
+        Guid tenantId, Guid supplierId, Guid branchId,
+        BalanceConversionZiynetHelper.ConversionUnit unit, CancellationToken ct)
+    {
+        var existing = await _db.SupplierTransactions.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.SupplierId == supplierId && x.BranchId == branchId
+                        && !x.IsDeleted && !x.IsReversed)
+            .ToListAsync(ct);
+
+        if (unit.IsZiynet)
+            return SupplierFinanceHelper.ComputeZiynetGrossFromTransactions(
+                existing, unit.ZiynetAd, unit.ZiynetTip ?? "Yeni");
+
+        return SupplierFinanceHelper.ComputeDovizGross(existing, unit.CurrencyUnit);
     }
 
     private async Task<decimal> GetSupplierZiynetNetAsync(

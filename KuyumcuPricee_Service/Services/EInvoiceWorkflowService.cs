@@ -3,11 +3,14 @@ using System.Linq;
 using System.Globalization;
 using System.Text.RegularExpressions;
 using kuyumcu_application.Abstractions;
+using kuyumcu_application;
 using kuyumcu_domain.Entities;
 using kuyumcu_domain.Enums;
 using kuyumcu_infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace KUYUMCU.Price_Service.Services;
 
@@ -16,6 +19,8 @@ public interface IEInvoiceWorkflowService
     Task<EInvoiceDocument> QueueInvoiceAsync(Invoice invoice, Customer? customer, CancellationToken ct);
     Task<EInvoiceDocument?> QueueManualSendAsync(Guid tenantId, Guid invoiceId, ManualEInvoiceDraft? manualDraft, CancellationToken ct);
     Task<EInvoiceDocument?> TryProcessPendingImmediatelyAsync(Guid tenantId, Guid invoiceId, CancellationToken ct);
+    Task RefreshOutboxPayloadIfNeededAsync(EInvoiceDocument doc, EInvoiceOutbox outbox, CancellationToken ct);
+    void ScheduleImmediateProcessing(Guid tenantId, Guid invoiceId);
     Task<ManualEInvoiceDraft?> BuildManualDraftAsync(Guid tenantId, Guid invoiceId, CancellationToken ct);
     Task<bool> CancelDocumentAsync(Guid tenantId, Guid documentId, string reason, CancellationToken ct);
     Task<WebhookProcessResult> ProcessWebhookAsync(Guid tenantId, Guid branchId, string providerCode, string signature, string payload, Dictionary<string, string> headers, CancellationToken ct);
@@ -47,19 +52,31 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
     private readonly IUblInvoiceBuilder _ublBuilder;
     private readonly ExchangeRateService _rates;
     private readonly IConfiguration _config;
+    private readonly IServiceScopeFactory _scopeFactory;
+    private readonly ILogger<EInvoiceWorkflowService> _logger;
+    private readonly EInvoiceImmediateProcessQueue _immediateQueue;
+    private readonly ITaxpayerLookupService? _taxpayerLookup;
 
     public EInvoiceWorkflowService(
         AppDbContext db,
         IEInvoiceProviderResolver providerResolver,
         IUblInvoiceBuilder ublBuilder,
         ExchangeRateService rates,
-        IConfiguration config)
+        IConfiguration config,
+        IServiceScopeFactory scopeFactory,
+        ILogger<EInvoiceWorkflowService> logger,
+        EInvoiceImmediateProcessQueue immediateQueue,
+        ITaxpayerLookupService? taxpayerLookup = null)
     {
         _db = db;
         _providerResolver = providerResolver;
         _ublBuilder = ublBuilder;
         _rates = rates;
         _config = config;
+        _scopeFactory = scopeFactory;
+        _logger = logger;
+        _immediateQueue = immediateQueue;
+        _taxpayerLookup = taxpayerLookup;
     }
 
     public async Task<EInvoiceDocument> QueueInvoiceAsync(Invoice invoice, Customer? customer, CancellationToken ct)
@@ -97,20 +114,74 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             throw new InvalidOperationException("Tahsilat tutarı 0'dan büyük olmalıdır.");
 
         var buyerTax = NormalizeTaxNo(input.BuyerTaxNumber);
+        var buyerName = BankMovementParser.SanitizeCounterpartyDisplayName(input.BuyerName, buyerTax)
+            ?? input.BuyerName?.Trim()
+            ?? "";
+        string? receiverAlias = null;
+        var buyerEmail = input.BuyerEmail?.Trim();
         var docType = !string.IsNullOrWhiteSpace(input.DocumentTypeOverride)
             ? (string.Equals(input.DocumentTypeOverride, "EFatura", StringComparison.OrdinalIgnoreCase) ? "EFatura" : "EArsiv")
             : (buyerTax.Length == 10 ? "EFatura" : "EArsiv");
 
+        if (string.IsNullOrWhiteSpace(input.DocumentTypeOverride) &&
+            IsValidCollectionTaxNo(buyerTax) &&
+            _taxpayerLookup is not null)
+        {
+            try
+            {
+                var lookup = await _taxpayerLookup.VerifyTaxNoAsync(input.TenantId, input.BranchId, buyerTax, ct);
+                if (lookup is not null)
+                {
+                    docType = lookup.IsEInvoiceTaxpayer ? "EFatura" : "EArsiv";
+                    if (!string.IsNullOrWhiteSpace(lookup.Title))
+                    {
+                        var lookupTitle = BankMovementParser.SanitizeCounterpartyDisplayName(lookup.Title, buyerTax)
+                            ?? lookup.Title.Trim();
+                        if (!string.IsNullOrWhiteSpace(lookupTitle))
+                            buyerName = lookupTitle;
+                    }
+                    else
+                    {
+                        buyerName = BankMovementParser.SanitizeCounterpartyDisplayName(buyerName, buyerTax) ?? buyerName;
+                    }
+
+                    receiverAlias = lookup.ReceiverAlias?.Trim();
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Tahsilat taslağı mükellef sorgusu sonuç döndürmedi ({TaxNo}). E-Fatura ayarları ve entegratör bilgilerini kontrol edin.",
+                        buyerTax);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Tahsilat taslağı mükellef sorgusu başarısız ({TaxNo})", buyerTax);
+            }
+        }
+        else
+        {
+            buyerName = BankMovementParser.SanitizeCounterpartyDisplayName(buyerName, buyerTax) ?? buyerName;
+        }
+
+        if (string.IsNullOrWhiteSpace(buyerName))
+            buyerName = BankMovementParser.SanitizeCounterpartyDisplayName(input.BuyerName, buyerTax)
+                ?? "Karşı Taraf";
+
+        if (docType == "EFatura" && string.IsNullOrWhiteSpace(receiverAlias))
+            _logger.LogWarning("Tahsilat taslağı e-Fatura için alıcı etiketi boş ({TaxNo})", buyerTax);
+
         var meta = new CollectionDraftMeta(
             Version: 2,
-            input.BuyerName ?? "",
+            buyerName,
             buyerTax,
             input.BuyerAddress,
             input.BuyerCity,
             input.BuyerDistrict,
-            input.BuyerEmail,
+            buyerEmail,
             docType,
-            input.Description);
+            input.Description,
+            receiverAlias);
 
         var invoice = new Invoice
         {
@@ -160,11 +231,11 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
                 && versionProp.TryGetInt32(out var version)
                 && version >= 2)
             {
-                return JsonSerializer.Deserialize<CollectionDraftMeta>(json);
+                return JsonSerializer.Deserialize<CollectionDraftMeta>(json, CollectionMetaJsonOptions);
             }
 
             // Eski (v1) kayıtlar: alıcı bilgilerini taşır, kalemler işlem anında yeniden hesaplanır.
-            var legacy = JsonSerializer.Deserialize<CollectionDraftMetaLegacy>(json);
+            var legacy = JsonSerializer.Deserialize<CollectionDraftMetaLegacy>(json, CollectionMetaJsonOptions);
             if (legacy is null) return null;
             return new CollectionDraftMeta(
                 2,
@@ -180,6 +251,11 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         catch { return null; }
     }
 
+    private static readonly JsonSerializerOptions CollectionMetaJsonOptions = new()
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
     private sealed record CollectionDraftMeta(
         int Version,
         string BuyerName,
@@ -189,7 +265,93 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         string? BuyerDistrict,
         string? BuyerEmail,
         string DocumentType,
-        string? Description);
+        string? Description,
+        string? ReceiverAlias = null);
+
+    private static bool IsValidCollectionTaxNo(string taxNo)
+        => !string.IsNullOrWhiteSpace(taxNo) &&
+           taxNo.Length is 10 or 11 &&
+           !string.Equals(taxNo, CounterpartyTaxResolverService.NihaiTuketiciTckn, StringComparison.Ordinal);
+
+    private async Task<CollectionDraftMeta> RefreshCollectionDraftMetaAsync(
+        Guid tenantId,
+        Guid branchId,
+        CollectionDraftMeta meta,
+        CancellationToken ct)
+    {
+        if (_taxpayerLookup is null || !IsValidCollectionTaxNo(NormalizeTaxNo(meta.BuyerTaxNumber)))
+            return meta;
+
+        var buyerTax = NormalizeTaxNo(meta.BuyerTaxNumber)!;
+        var needsRefresh = string.IsNullOrWhiteSpace(meta.ReceiverAlias) ||
+                           string.Equals(meta.DocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase);
+        if (!needsRefresh)
+            return meta;
+
+        try
+        {
+            var lookup = await _taxpayerLookup.VerifyTaxNoAsync(tenantId, branchId, buyerTax, ct);
+            if (lookup is null)
+                return meta;
+
+            var docType = lookup.IsEInvoiceTaxpayer ? "EFatura" : meta.DocumentType;
+            var buyerName = meta.BuyerName;
+            if (!string.IsNullOrWhiteSpace(lookup.Title))
+            {
+                var lookupTitle = BankMovementParser.SanitizeCounterpartyDisplayName(lookup.Title, buyerTax)
+                    ?? lookup.Title.Trim();
+                if (!string.IsNullOrWhiteSpace(lookupTitle))
+                    buyerName = lookupTitle;
+            }
+
+            var receiverAlias = lookup.ReceiverAlias?.Trim() ?? meta.ReceiverAlias;
+            if (string.Equals(docType, meta.DocumentType, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(buyerName, meta.BuyerName, StringComparison.Ordinal) &&
+                string.Equals(receiverAlias, meta.ReceiverAlias, StringComparison.Ordinal))
+                return meta;
+
+            return meta with
+            {
+                BuyerName = buyerName,
+                DocumentType = docType,
+                ReceiverAlias = receiverAlias
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Tahsilat taslağı mükellef bilgisi yenilenemedi ({TaxNo})", buyerTax);
+            return meta;
+        }
+    }
+
+    private async Task PersistCollectionDraftMetaAsync(
+        Guid tenantId,
+        Guid invoiceId,
+        Guid documentId,
+        CollectionDraftMeta meta,
+        CancellationToken ct)
+    {
+        var invoice = await _db.Invoices
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == invoiceId, ct);
+        if (invoice is null) return;
+
+        var existing = TryDeserializeCollectionMeta(invoice.CollectionMetaJson);
+        if (existing is null) return;
+
+        if (string.Equals(existing.BuyerName, meta.BuyerName, StringComparison.Ordinal) &&
+            string.Equals(existing.DocumentType, meta.DocumentType, StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(existing.ReceiverAlias, meta.ReceiverAlias, StringComparison.Ordinal))
+            return;
+
+        invoice.CollectionMetaJson = JsonSerializer.Serialize(meta, CollectionMetaJsonOptions);
+
+        var doc = await _db.EInvoiceDocuments
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == documentId, ct);
+        if (doc is not null && !string.IsNullOrWhiteSpace(meta.DocumentType))
+            doc.DocumentType = meta.DocumentType;
+
+        await _db.SaveChangesAsync(ct);
+    }
 
     private async Task<List<ManualEInvoiceLineDraft>> BuildCollectionSpecialMatrahLinesAsync(
         Guid tenantId,
@@ -219,10 +381,8 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         var specialCraftedVatRatePercent = EInvoiceProfileSettingsCodec.NormalizeVatPercent(settings.SpecialMatrahCraftedVatRatePercent);
         var specialCraftedVatRateRatio = EInvoiceProfileSettingsCodec.VatPercentToRatio(settings.SpecialMatrahCraftedVatRatePercent);
 
-        var matchedRule = EInvoiceProfileSettingsCodec.ResolveWorkmanshipRule(
+        var matchedRule = EInvoiceProfileSettingsCodec.ResolveCollectionWorkmanshipRule(
             settings.WorkmanshipRules,
-            EInvoiceProfileSettingsCodec.WorkmanshipProductTypeCollection,
-            EInvoiceProfileSettingsCodec.WorkmanshipCollectionSelector,
             amount);
 
         var saleGross = amount;
@@ -333,21 +493,75 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
 
         doc.Status = "Queued";
         doc.LastError = null;
-        var payload = await _db.EInvoiceOutboxes.AsNoTracking()
-            .Where(x => x.TenantId == tenantId && x.DocumentId == doc.Id)
-            .OrderByDescending(x => x.CreatedAt)
-            .Select(x => x.PayloadJson)
-            .FirstOrDefaultAsync(ct);
 
         if (manualDraft is not null)
         {
-            doc.DocumentType = string.Equals(manualDraft.DocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase) ? "EArsiv" : "EFatura";
-            payload = await BuildPayloadJsonFromDraftAsync(invoice, doc, manualDraft, ct);
+            var normalizedType = string.Equals(manualDraft.DocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase)
+                ? "EArsiv"
+                : "EFatura";
+            manualDraft = manualDraft with { DocumentType = normalizedType };
+            doc.DocumentType = normalizedType;
         }
-        else if (string.IsNullOrWhiteSpace(payload) || payload == "{}")
+
+        var profile = await _db.EInvoiceProfiles
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == doc.BranchId, ct);
+        var prefix = GibInvoiceNumber.ResolvePrefixForDocumentType(
+            doc.DocumentType,
+            profile?.DefaultInvoicePrefix,
+            profile?.DefaultArchivePrefix);
+        var issueDate = invoice.InvoiceDate.ToLocalTime().Date;
+        var isUyumsoft = string.Equals(profile?.ProviderCode, "uyumsoft", StringComparison.OrdinalIgnoreCase);
+        if (isUyumsoft)
         {
-            payload = await BuildPayloadJsonAsync(invoice, customer, doc.InvoiceNumber, doc.DocumentType, ct);
+            var adapter = _providerResolver.Resolve("uyumsoft");
+            var lastKnown = await ResolveUyumsoftLastKnownSerialForSendAsync(
+                adapter,
+                _db,
+                profile,
+                tenantId,
+                doc.BranchId,
+                doc.DocumentType,
+                issueDate,
+                _config,
+                ct);
+            if (lastKnown <= 0)
+            {
+                doc.LastError = "Uyumsoft sıra numarası alınamadı. E-Fatura ayarlarından bağlantı testi yapın; sistem portal son numarayı otomatik okur.";
+            }
+            else
+            {
+                doc.InvoiceNumber = GibInvoiceNumber.BuildFromSerial(prefix, issueDate, lastKnown + 1);
+            }
         }
+        else
+        {
+            doc.InvoiceNumber = GibInvoiceNumber.Build(prefix, issueDate, invoice.Id);
+        }
+
+        var staleOutboxes = await _db.EInvoiceOutboxes
+            .Where(x => x.TenantId == tenantId && x.DocumentId == doc.Id && x.Status == "Pending")
+            .ToListAsync(ct);
+        foreach (var stale in staleOutboxes)
+        {
+            stale.Status = "Done";
+            stale.ProcessedAt = DateTime.UtcNow;
+            stale.LastError = "Yeni gönderim isteği ile değiştirildi.";
+            stale.LockedAt = null;
+        }
+
+        string payload;
+        if (manualDraft is not null)
+        {
+            payload = await BuildPayloadJsonFromDraftAsync(invoice, doc, manualDraft, profile, ct);
+        }
+        else
+        {
+            payload = await BuildPayloadJsonAsync(invoice, customer, doc.InvoiceNumber, doc.DocumentType, profile, ct);
+        }
+
+        if (!isUyumsoft)
+            payload = GibInvoiceNumber.PatchPayloadJson(payload, doc.InvoiceNumber, invoice.Id, issueDate, prefix) ?? payload;
 
         _db.EInvoiceOutboxes.Add(new EInvoiceOutbox
         {
@@ -361,6 +575,7 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             NextAttemptAt = DateTime.UtcNow
         });
         await _db.SaveChangesAsync(ct);
+        ScheduleImmediateProcessing(tenantId, invoiceId);
         return doc;
     }
 
@@ -373,11 +588,21 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         var customer = doc.CustomerId.HasValue
             ? await _db.Customers.AsNoTracking().FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == doc.CustomerId.Value, ct)
             : null;
+        var profile = await _db.EInvoiceProfiles.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == invoice.BranchId, ct);
+        var (companyCity, companyDistrict) = ParseCityDistrictFromAddress(profile?.CompanyAddress);
 
         // Tahsilat kaynaklı (satışsız) faturalar: özel matrah + şube işçilik kuralları ile oluşturulur.
         var collectionMeta = TryDeserializeCollectionMeta(invoice.CollectionMetaJson);
         if (collectionMeta is not null)
         {
+            collectionMeta = await RefreshCollectionDraftMetaAsync(
+                tenantId,
+                invoice.BranchId,
+                collectionMeta,
+                ct);
+            await PersistCollectionDraftMetaAsync(tenantId, invoiceId, doc.Id, collectionMeta, ct);
+
             var collectionLines = await BuildCollectionSpecialMatrahLinesAsync(
                 tenantId,
                 invoice.BranchId,
@@ -391,19 +616,19 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
                 string.IsNullOrWhiteSpace(collectionMeta.BuyerName) ? (customer?.FullName?.Trim() ?? string.Empty) : collectionMeta.BuyerName,
                 string.IsNullOrWhiteSpace(collectionMeta.BuyerTaxNumber) ? NormalizeTaxNo(customer?.NationalId) : collectionMeta.BuyerTaxNumber!,
                 collectionMeta.BuyerAddress ?? customer?.Address,
-                collectionMeta.BuyerCity ?? customer?.City,
-                collectionMeta.BuyerDistrict ?? customer?.District,
-                ResolvePostalCodeFromText(collectionMeta.BuyerAddress ?? customer?.Address),
+                CoalesceText(collectionMeta.BuyerCity, customer?.City, companyCity),
+                CoalesceText(collectionMeta.BuyerDistrict, customer?.District, companyDistrict),
+                ResolvePostalCodeFromText(collectionMeta.BuyerAddress ?? customer?.Address ?? profile?.CompanyAddress),
                 invoice.InvoiceDate.ToLocalTime().ToString("dd.MM.yyyy"),
                 invoice.InvoiceDate.ToLocalTime().ToString("HH:mm:ss"),
-                collectionMeta.BuyerEmail ?? customer?.Email,
+                !string.IsNullOrWhiteSpace(collectionMeta.ReceiverAlias)
+                    ? collectionMeta.ReceiverAlias
+                    : collectionMeta.BuyerEmail ?? customer?.Email,
                 "TRY",
                 collectionLines);
         }
         // İşçilik kuralları/KDV oranları yerel hesaplama ayarlarıdır; profil varsa IsActive durumundan
         // bağımsız uygulanır (şube başına tek profil garantili olduğu için ayrım gerekmez).
-        var profile = await _db.EInvoiceProfiles.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == invoice.BranchId, ct);
         var profileSettings = EInvoiceProfileSettingsCodec.Decode(profile?.IntegratorCompanyCode);
 
         var saleItems = invoice.SaleId.HasValue
@@ -782,13 +1007,13 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
 
         var storedDraft = await TryLoadStoredDraftFromOutboxAsync(tenantId, doc.Id, ct);
         return new ManualEInvoiceDraft(
-            CoalesceText(storedDraft?.DocumentType, doc.DocumentType),
+            CoalesceText(doc.DocumentType, storedDraft?.DocumentType),
             CoalesceText(storedDraft?.BuyerName, customer?.FullName),
             CoalesceText(storedDraft?.BuyerTaxNumber, NormalizeTaxNo(customer?.NationalId)),
             CoalesceText(storedDraft?.BuyerAddress, customer?.Address),
-            CoalesceText(storedDraft?.BuyerCity, customer?.City),
-            CoalesceText(storedDraft?.BuyerDistrict, customer?.District),
-            CoalesceText(storedDraft?.BuyerPostalCode, ResolvePostalCodeFromText(storedDraft?.BuyerAddress ?? customer?.Address)),
+            CoalesceText(storedDraft?.BuyerCity, customer?.City, companyCity),
+            CoalesceText(storedDraft?.BuyerDistrict, customer?.District, companyDistrict),
+            CoalesceText(storedDraft?.BuyerPostalCode, ResolvePostalCodeFromText(storedDraft?.BuyerAddress ?? customer?.Address ?? profile?.CompanyAddress)),
             CoalesceText(storedDraft?.IssueDateText, invoice.InvoiceDate.ToLocalTime().ToString("dd.MM.yyyy")),
             CoalesceText(storedDraft?.IssueTimeText, invoice.InvoiceDate.ToLocalTime().ToString("HH:mm:ss")),
             CoalesceText(storedDraft?.BuyerEmail, customer?.Email),
@@ -796,23 +1021,75 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             lines);
     }
 
+    public void ScheduleImmediateProcessing(Guid tenantId, Guid invoiceId)
+    {
+        _immediateQueue.Enqueue(tenantId, invoiceId);
+    }
+
+    public async Task RefreshOutboxPayloadIfNeededAsync(EInvoiceDocument doc, EInvoiceOutbox outbox, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(outbox.PayloadJson) || string.IsNullOrWhiteSpace(doc.DocumentType))
+            return;
+        if (!IsPayloadUblProfileMismatch(doc.DocumentType, outbox.PayloadJson))
+            return;
+
+        var invoice = await _db.Invoices
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.Id == doc.InvoiceId, ct);
+        if (invoice is null)
+            return;
+
+        var draft = await BuildManualDraftAsync(doc.TenantId, doc.InvoiceId, ct);
+        if (draft is null)
+            return;
+
+        var normalizedType = string.Equals(doc.DocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase)
+            ? "EArsiv"
+            : "EFatura";
+        draft = draft with { DocumentType = normalizedType };
+
+        var profile = await _db.EInvoiceProfiles
+            .AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.BranchId == doc.BranchId, ct);
+
+        var freshPayload = await BuildPayloadJsonFromDraftAsync(invoice, doc, draft, profile, ct);
+        if (!string.Equals(profile?.ProviderCode, "uyumsoft", StringComparison.OrdinalIgnoreCase))
+        {
+            var prefix = GibInvoiceNumber.ResolvePrefixForDocumentType(
+                doc.DocumentType,
+                profile?.DefaultInvoicePrefix,
+                profile?.DefaultArchivePrefix);
+            freshPayload = GibInvoiceNumber.PatchPayloadJson(
+                freshPayload,
+                doc.InvoiceNumber,
+                invoice.Id,
+                invoice.InvoiceDate.ToLocalTime().Date,
+                prefix) ?? freshPayload;
+        }
+
+        outbox.PayloadJson = freshPayload;
+        await _db.SaveChangesAsync(ct);
+    }
+
     public async Task<EInvoiceDocument?> TryProcessPendingImmediatelyAsync(Guid tenantId, Guid invoiceId, CancellationToken ct)
     {
-        var doc = await _db.EInvoiceDocuments.FirstOrDefaultAsync(x => x.TenantId == tenantId && x.InvoiceId == invoiceId, ct);
+        var doc = await _db.EInvoiceDocuments
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.InvoiceId == invoiceId, ct);
         if (doc is null) return null;
 
         var now = DateTime.UtcNow;
-        var lockStealAfterSeconds = 20;
+        var staleLockBefore = now.AddSeconds(-30);
         var outbox = await _db.EInvoiceOutboxes
+            .IgnoreQueryFilters()
             .Where(x => x.TenantId == tenantId &&
                         x.DocumentId == doc.Id &&
                         x.Status == "Pending" &&
-                        (x.NextAttemptAt <= now || x.RetryCount == 0))
+                        (x.NextAttemptAt <= now || x.RetryCount == 0) &&
+                        (x.LockedAt == null || x.LockedAt < staleLockBefore))
             .OrderByDescending(x => x.CreatedAt)
             .FirstOrDefaultAsync(ct);
         if (outbox is null) return doc;
-        if (outbox.LockedAt.HasValue && outbox.LockedAt.Value > now.AddSeconds(-lockStealAfterSeconds))
-            return doc;
 
         outbox.LockedAt = now;
         await _db.SaveChangesAsync(ct);
@@ -826,7 +1103,10 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             var providerCode = string.IsNullOrWhiteSpace(profile?.ProviderCode) ? "edm" : profile.ProviderCode;
             var adapter = _providerResolver.Resolve(providerCode);
 
-            var (buyerName, buyerTaxNo) = ParsePayload(outbox.PayloadJson);
+            await RefreshOutboxPayloadIfNeededAsync(doc, outbox, ct);
+
+            var payloadJson = PatchPayloadWithSoleProprietorName(outbox.PayloadJson, profile?.SoleProprietorName);
+            var (buyerName, buyerTaxNo) = ParsePayload(payloadJson);
             var sendReq = new EInvoiceSendRequest(
                 doc.TenantId,
                 doc.BranchId,
@@ -838,11 +1118,11 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
                 doc.Currency,
                 buyerName,
                 buyerTaxNo,
-                outbox.PayloadJson,
+                payloadJson,
                 profile?.IntegratorUsername,
                 profile?.IntegratorSecretRef);
 
-            var sendResult = await adapter.SendOutgoingAsync(sendReq, ct);
+            var sendResult = await adapter.SendOutgoingAsync(sendReq, CancellationToken.None);
             if (!sendResult.IsSuccess)
             {
                 outbox.RetryCount++;
@@ -860,11 +1140,24 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
                 doc.IntegratorDocumentId = sendResult.IntegratorDocumentId ?? doc.IntegratorDocumentId;
                 doc.Uuid = sendResult.Uuid ?? doc.Uuid;
                 doc.Ettn = sendResult.Ettn ?? doc.Ettn;
+                if (!string.IsNullOrWhiteSpace(sendResult.Ettn))
+                    doc.InvoiceNumber = sendResult.Ettn;
                 doc.RawLastResponse = sendResult.RawResponse;
                 doc.LastError = null;
-                doc.SubmittedAt ??= DateTime.UtcNow;
+                if (doc.Status is "Sent" or "Delivered")
+                    doc.SubmittedAt ??= DateTime.UtcNow;
                 if (doc.Status == "Delivered")
                     doc.DeliveredAt ??= DateTime.UtcNow;
+
+                if (string.Equals(providerCode, "uyumsoft", StringComparison.OrdinalIgnoreCase))
+                {
+                    await UpdateProfileSeriesSerialAsync(
+                        _db,
+                        doc.TenantId,
+                        doc.BranchId,
+                        sendResult.Ettn ?? doc.InvoiceNumber,
+                        ct);
+                }
 
                 outbox.Status = "Done";
                 outbox.ProcessedAt = DateTime.UtcNow;
@@ -1014,22 +1307,36 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         var profile = await _db.EInvoiceProfiles
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId, ct);
-        var prefix = docType == "EFatura" ? profile?.DefaultInvoicePrefix : profile?.DefaultArchivePrefix;
+        var prefix = GibInvoiceNumber.ResolvePrefixForDocumentType(docType, profile?.DefaultInvoicePrefix, profile?.DefaultArchivePrefix);
         return BuildInvoiceNumber(prefix, date, id);
     }
 
-    private async Task<string> BuildPayloadJsonAsync(Invoice invoice, Customer? customer, string invoiceNo, string docType, CancellationToken ct)
+    private async Task<string> BuildPayloadJsonAsync(
+        Invoice invoice,
+        Customer? customer,
+        string invoiceNo,
+        string docType,
+        EInvoiceProfile? profile,
+        CancellationToken ct)
     {
-        var profile = await _db.EInvoiceProfiles
+        profile ??= await _db.EInvoiceProfiles
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == invoice.TenantId && x.BranchId == invoice.BranchId, ct);
         var ubl = await _ublBuilder.BuildOutgoingAsync(invoice, customer, profile, invoiceNo, docType, ct);
+        var seriesPrefix = GibInvoiceNumber.ResolvePrefixForDocumentType(
+            docType,
+            profile?.DefaultInvoicePrefix,
+            profile?.DefaultArchivePrefix);
 
         var payloadObj = new
         {
             invoiceId = invoice.Id,
             invoiceNo,
             invoiceDateUtc = invoice.InvoiceDate,
+            documentType = docType,
+            seriesPrefix,
+            invoiceSeriesPrefix = profile?.DefaultInvoicePrefix,
+            archiveSeriesPrefix = profile?.DefaultArchivePrefix,
             tenantId = invoice.TenantId,
             branchId = invoice.BranchId,
             grandTotal = invoice.GrandTotal,
@@ -1039,6 +1346,7 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             receiverVkn = ubl.BuyerTaxNumber,
             receiverAlias = ubl.BuyerAlias,
             buyerEmail = ubl.BuyerAlias,
+            soleProprietorName = profile?.SoleProprietorName,
             ublBase64 = ubl.UblBase64,
             ublXml = ubl.UblXml,
             customer = customer is null ? null : new
@@ -1055,18 +1363,31 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         return JsonSerializer.Serialize(payloadObj);
     }
 
-    private async Task<string> BuildPayloadJsonFromDraftAsync(Invoice invoice, EInvoiceDocument doc, ManualEInvoiceDraft draft, CancellationToken ct)
+    private async Task<string> BuildPayloadJsonFromDraftAsync(
+        Invoice invoice,
+        EInvoiceDocument doc,
+        ManualEInvoiceDraft draft,
+        EInvoiceProfile? profile,
+        CancellationToken ct)
     {
-        var profile = await _db.EInvoiceProfiles
+        profile ??= await _db.EInvoiceProfiles
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == invoice.TenantId && x.BranchId == invoice.BranchId, ct);
         var ubl = await _ublBuilder.BuildOutgoingFromDraftAsync(invoice, profile, doc.InvoiceNumber, draft, ct);
+        var seriesPrefix = GibInvoiceNumber.ResolvePrefixForDocumentType(
+            doc.DocumentType,
+            profile?.DefaultInvoicePrefix,
+            profile?.DefaultArchivePrefix);
 
         var payloadObj = new
         {
             invoiceId = invoice.Id,
             invoiceNo = doc.InvoiceNumber,
             invoiceDateUtc = invoice.InvoiceDate,
+            documentType = doc.DocumentType,
+            seriesPrefix,
+            invoiceSeriesPrefix = profile?.DefaultInvoicePrefix,
+            archiveSeriesPrefix = profile?.DefaultArchivePrefix,
             tenantId = invoice.TenantId,
             branchId = invoice.BranchId,
             grandTotal = invoice.GrandTotal,
@@ -1076,6 +1397,7 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             receiverVkn = ubl.BuyerTaxNumber,
             receiverAlias = ubl.BuyerAlias,
             buyerEmail = draft.BuyerEmail,
+            soleProprietorName = profile?.SoleProprietorName,
             ublBase64 = ubl.UblBase64,
             ublXml = ubl.UblXml,
             draft
@@ -1085,10 +1407,7 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
     }
 
     private static string BuildInvoiceNumber(string? prefix, DateTime date, Guid id)
-    {
-        var p = string.IsNullOrWhiteSpace(prefix) ? "INV" : prefix.Trim().ToUpperInvariant();
-        return $"{p}-{date:yyyyMMdd}-{id.ToString("N")[..8]}";
-    }
+        => GibInvoiceNumber.Build(prefix, date.ToLocalTime().Date, id);
 
     private static string ResolveDocumentType(Customer? customer)
     {
@@ -1110,6 +1429,23 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         if (string.IsNullOrWhiteSpace(text)) return null;
         var match = Regex.Match(text, @"\b\d{5}\b");
         return match.Success ? match.Value : null;
+    }
+
+    private static (string? City, string? District) ParseCityDistrictFromAddress(string? address)
+    {
+        if (string.IsNullOrWhiteSpace(address))
+            return (null, null);
+
+        var text = address.Trim();
+        var slashMatch = Regex.Match(text, @"([^\s/]+)\s*/\s*([^\s/]+)\s*$", RegexOptions.IgnoreCase);
+        if (slashMatch.Success)
+        {
+            var district = slashMatch.Groups[1].Value.Trim().ToUpperInvariant();
+            var city = slashMatch.Groups[2].Value.Trim().ToUpperInvariant();
+            return (city, district);
+        }
+
+        return (null, null);
     }
 
     private static readonly JsonSerializerOptions PayloadJsonOptions = new()
@@ -1156,6 +1492,110 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
                 return value.Trim();
         }
         return string.Empty;
+    }
+
+    private static bool IsPayloadUblProfileMismatch(string? documentType, string payloadJson)
+    {
+        if (string.IsNullOrWhiteSpace(documentType))
+            return false;
+
+        var isEArchive = string.Equals(documentType, "EArsiv", StringComparison.OrdinalIgnoreCase);
+        var expectedProfileId = isEArchive ? "EARSIVFATURA" : "TEMELFATURA";
+        var ublXml = ExtractUblXmlFromPayload(payloadJson);
+        if (string.IsNullOrWhiteSpace(ublXml))
+            return false;
+
+        var match = Regex.Match(
+            ublXml,
+            @"<(?:cbc:)?ProfileID\b[^>]*>(?<id>[^<]+)</(?:cbc:)?ProfileID>",
+            RegexOptions.IgnoreCase,
+            TimeSpan.FromSeconds(2));
+        if (!match.Success)
+            return true;
+
+        return !string.Equals(match.Groups["id"].Value.Trim(), expectedProfileId, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? ExtractUblXmlFromPayload(string payloadJson)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            if (TryFindJsonString(doc.RootElement, "ublXml", out var xml) && !string.IsNullOrWhiteSpace(xml))
+                return xml;
+            if (TryFindJsonString(doc.RootElement, "ublBase64", out var base64) && !string.IsNullOrWhiteSpace(base64))
+            {
+                var bytes = Convert.FromBase64String(base64);
+                return System.Text.Encoding.UTF8.GetString(bytes);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static bool TryFindJsonString(JsonElement element, string name, out string? value)
+    {
+        value = null;
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in element.EnumerateObject())
+            {
+                if (string.Equals(prop.Name, name, StringComparison.OrdinalIgnoreCase) &&
+                    prop.Value.ValueKind == JsonValueKind.String)
+                {
+                    value = prop.Value.GetString();
+                    return !string.IsNullOrWhiteSpace(value);
+                }
+
+                if ((prop.Value.ValueKind == JsonValueKind.Object || prop.Value.ValueKind == JsonValueKind.Array) &&
+                    TryFindJsonString(prop.Value, name, out value))
+                    return true;
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                if (TryFindJsonString(item, name, out value))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    internal static string PatchPayloadWithSoleProprietorName(string payloadJson, string? soleProprietorName)
+    {
+        if (string.IsNullOrWhiteSpace(soleProprietorName) || string.IsNullOrWhiteSpace(payloadJson))
+            return payloadJson;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payloadJson);
+            if (doc.RootElement.TryGetProperty("soleProprietorName", out var existing) &&
+                !string.IsNullOrWhiteSpace(existing.GetString()))
+                return payloadJson;
+
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream))
+            {
+                writer.WriteStartObject();
+                foreach (var prop in doc.RootElement.EnumerateObject())
+                    prop.WriteTo(writer);
+                writer.WriteString("soleProprietorName", soleProprietorName.Trim());
+                writer.WriteEndObject();
+            }
+
+            return System.Text.Encoding.UTF8.GetString(stream.ToArray());
+        }
+        catch
+        {
+            return payloadJson;
+        }
     }
 
     private static (string BuyerName, string BuyerTaxNo) ParsePayload(string payloadJson)
@@ -1292,6 +1732,81 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         return gross;
     }
 
+    internal static async Task<int> ResolveUyumsoftLastKnownSerialForSendAsync(
+        IEInvoiceProviderAdapter adapter,
+        AppDbContext db,
+        EInvoiceProfile? profile,
+        Guid tenantId,
+        Guid branchId,
+        string documentType,
+        DateTime issueDate,
+        IConfiguration? config,
+        CancellationToken ct)
+    {
+        var prefix = GibInvoiceNumber.ResolvePrefixForDocumentType(
+            documentType,
+            profile?.DefaultInvoicePrefix,
+            profile?.DefaultArchivePrefix);
+        var localNumbers = await db.EInvoiceDocuments
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .Where(x => x.TenantId == tenantId
+                        && x.InvoiceNumber.StartsWith(prefix)
+                        && (x.Status == "IntegratorDraft"
+                            || x.Status == "Sent"
+                            || x.Status == "Delivered"))
+            .Select(x => x.InvoiceNumber)
+            .ToListAsync(ct);
+        var bootstrap = ReadUyumsoftBootstrapSerial(config, prefix, issueDate.Year);
+        var localMax = GibInvoiceNumber.GetMaxSerial(prefix, issueDate.Year, localNumbers, bootstrap);
+        var lastKnown = Math.Max(bootstrap, localMax);
+
+        if (!string.Equals(profile?.ProviderCode, "uyumsoft", StringComparison.OrdinalIgnoreCase))
+            return lastKnown;
+
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            timeoutCts.CancelAfter(TimeSpan.FromSeconds(12));
+            var syncResult = await adapter.QuerySeriesCounterAsync(
+                profile?.IntegratorUsername,
+                profile?.IntegratorSecretRef,
+                prefix,
+                issueDate.Year,
+                GibInvoiceNumber.IsEArchiveDocumentType(documentType),
+                timeoutCts.Token);
+            if (syncResult.IsSuccess && syncResult.LastSerial.HasValue)
+            {
+                lastKnown = syncResult.LastSerial.Value;
+                await UpdateProfileSeriesSerialAsync(
+                    db,
+                    tenantId,
+                    branchId,
+                    GibInvoiceNumber.BuildFromSerial(prefix, issueDate, syncResult.LastSerial.Value),
+                    ct);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Portal sorgusu zaman aşımına uğradı; bootstrap + yerel başarılı kayıtlar kullanılır.
+        }
+
+        return lastKnown;
+    }
+
+    internal static int ReadUyumsoftBootstrapSerial(IConfiguration? config, string prefix, int year)
+    {
+        if (config is null || year <= 0)
+            return 0;
+
+        var underscoreKey = $"{prefix}_{year}";
+        var serial = config.GetValue<int?>($"EInvoice:Uyumsoft:SeriesBootstrap:{underscoreKey}");
+        if (serial > 0)
+            return serial.Value;
+
+        return config.GetValue<int?>($"EInvoice:Uyumsoft:SeriesBootstrap:{prefix}:{year}") ?? 0;
+    }
+
     internal static string NormalizeStatus(string? providerStatus, string fallback)
     {
         var value = (providerStatus ?? string.Empty).Trim().ToLowerInvariant();
@@ -1299,6 +1814,8 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         {
             "queued" => "Queued",
             "sent" => "Sent",
+            "integratordraft" => "IntegratorDraft",
+            "draft" => "IntegratorDraft",
             "delivered" => "Delivered",
             "rejected" => "Rejected",
             "cancelpending" => "CancelPending",
@@ -1306,5 +1823,52 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             "failed" => "Failed",
             _ => fallback
         };
+    }
+
+    internal static int ResolveUyumsoftLastKnownSeriesSerial(
+        EInvoiceProfile? profile,
+        string prefix,
+        int year,
+        IEnumerable<string?> localInvoiceNumbers,
+        int anchorSerial = 0)
+    {
+        var settings = EInvoiceProfileSettingsCodec.Decode(profile?.IntegratorCompanyCode);
+        var profileSerial = EInvoiceProfileSettingsCodec.GetSeriesLastSerial(settings, prefix, year);
+        var lastKnown = Math.Max(profileSerial, anchorSerial);
+
+        foreach (var number in localInvoiceNumbers)
+        {
+            if (!GibInvoiceNumber.TryExtractSerialParts(number, out var numberPrefix, out var numberYear, out var serial))
+                continue;
+            if (!string.Equals(numberPrefix, prefix, StringComparison.OrdinalIgnoreCase) || numberYear != year)
+                continue;
+            if (GibInvoiceNumber.IsLikelyGeneratedSerial(serial, lastKnown > 0 ? lastKnown : anchorSerial))
+                continue;
+            if (serial > lastKnown)
+                lastKnown = serial;
+        }
+
+        return lastKnown;
+    }
+
+    internal static async Task UpdateProfileSeriesSerialAsync(
+        AppDbContext db,
+        Guid tenantId,
+        Guid branchId,
+        string? invoiceNumber,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(invoiceNumber))
+            return;
+
+        var profile = await db.EInvoiceProfiles
+            .IgnoreQueryFilters()
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId, ct);
+        if (profile is null)
+            return;
+
+        var settings = EInvoiceProfileSettingsCodec.Decode(profile.IntegratorCompanyCode);
+        EInvoiceProfileSettingsCodec.SetSeriesLastSerial(settings, invoiceNumber);
+        profile.IntegratorCompanyCode = EInvoiceProfileSettingsCodec.Encode(settings);
     }
 }

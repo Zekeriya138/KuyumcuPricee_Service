@@ -16,13 +16,17 @@ namespace KUYUMCU.Price_Service.Controllers;
 [Authorize]
 public class BranchesController : ControllerBase
 {
+    private const string FallbackBusinessRegistrationPassword = "DevOnly_2026";
+
     private readonly AppDbContext _db;
     private readonly ITenantContext _tenant;
+    private readonly IConfiguration _cfg;
 
-    public BranchesController(AppDbContext db, ITenantContext tenant)
+    public BranchesController(AppDbContext db, ITenantContext tenant, IConfiguration cfg)
     {
         _db = db;
         _tenant = tenant;
+        _cfg = cfg;
     }
 
     // --- küçük yardımcı ---
@@ -69,7 +73,10 @@ public class BranchesController : ControllerBase
         [MaxLength(32)] public string? Phone { get; set; }
         [EmailAddress, MaxLength(128)]
         public string? Email { get; set; }
+        public string? LogoBase64 { get; set; }
         public bool IsActive { get; set; } = true;
+        /// <summary>Yeni şube oluşturmak için BusinessRegistration:DeveloperPassword ile aynı şifre.</summary>
+        public string? DeveloperPassword { get; set; }
     }
 
     public sealed class BranchUpdateReq
@@ -82,20 +89,20 @@ public class BranchesController : ControllerBase
         [MaxLength(32)] public string? Phone { get; set; }
         [EmailAddress, MaxLength(128)]
         public string? Email { get; set; }
+        public string? LogoBase64 { get; set; }
         public bool IsActive { get; set; } = true;
     }
 
     public sealed record BranchDto(
-        Guid Id, string Name, string? Code, string? City, string? Address, string? Phone, string? Email, bool IsActive
+        Guid Id, string Name, string? Code, string? City, string? Address, string? Phone, string? Email, bool IsActive, string? LogoBase64
     );
 
     private static BranchDto ToDto(Branch b)
-        => new(b.Id, b.Name, b.Code, b.City, b.Address, b.Phone, b.Email, b.IsActive);
+        => new(b.Id, b.Name, b.Code, b.City, b.Address, b.Phone, b.Email, b.IsActive, b.LogoBase64);
 
     // ===== LIST =====
-    // ===== LIST =====
     [HttpGet]
-    [AllowAnonymous]   // 🔹 BUNU EKLE
+    [AllowAnonymous]
     public async Task<IActionResult> List([FromQuery] bool? onlyActive, [FromQuery] bool? forManagement, CancellationToken ct)
     {
         var tid = GetTenantId();
@@ -115,8 +122,23 @@ public class BranchesController : ControllerBase
         }
 
         if (onlyActive == true) q = q.Where(x => x.IsActive);
-        var items = await q.OrderBy(x => x.Name).ToListAsync(ct);
-        return Ok(items.Select(ToDto));
+
+        // LogoBase64 listelerde taşınmaz; büyük görseller yalnızca GET api/branches/{id} ile alınır.
+        var items = await q
+            .OrderBy(x => x.Name)
+            .Select(x => new BranchDto(
+                x.Id,
+                x.Name,
+                x.Code,
+                x.City,
+                x.Address,
+                x.Phone,
+                x.Email,
+                x.IsActive,
+                null))
+            .ToListAsync(ct);
+
+        return Ok(items);
     }
 
     //[HttpGet]
@@ -139,11 +161,29 @@ public class BranchesController : ControllerBase
         return b is null ? NotFound() : Ok(ToDto(b));
     }
 
+    public sealed class VerifyDeveloperPasswordReq
+    {
+        public string? DeveloperPassword { get; set; }
+    }
+
+    /// <summary>Yeni şube formu açılmadan önce geliştirici şifresini doğrular.</summary>
+    [HttpPost("verify-developer-password")]
+    public IActionResult VerifyDeveloperPassword([FromBody] VerifyDeveloperPasswordReq req)
+    {
+        if (!CanManageBranchesPerm()) return Forbid();
+        if (!IsValidDeveloperPassword(req.DeveloperPassword))
+            return BadRequest(new { error = "Geliştirici şifresi hatalı." });
+        return Ok(new { ok = true });
+    }
+
     // ===== CREATE =====
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] BranchCreateReq req, CancellationToken ct)
     {
         if (!CanManageBranchesPerm()) return Forbid();
+        if (!IsValidDeveloperPassword(req.DeveloperPassword))
+            return BadRequest(new { error = "Geliştirici şifresi hatalı veya eksik. Yeni şube oluşturmak için geliştirici şifresi zorunludur." });
+
         var tid = GetTenantId();
 
         var b = new Branch
@@ -155,6 +195,7 @@ public class BranchesController : ControllerBase
             Address = req.Address?.Trim(),
             Phone = req.Phone?.Trim(),
             Email = req.Email?.Trim(),
+            LogoBase64 = NormalizeLogo(req.LogoBase64),
             IsActive = req.IsActive
         };
 
@@ -179,6 +220,7 @@ public class BranchesController : ControllerBase
         b.Address = req.Address?.Trim();
         b.Phone = req.Phone?.Trim();
         b.Email = req.Email?.Trim();
+        b.LogoBase64 = NormalizeLogo(req.LogoBase64);
         b.IsActive = req.IsActive;
 
         await _db.SaveChangesAsync(ct);
@@ -334,5 +376,23 @@ public class BranchesController : ControllerBase
     {
         return User?.Identity?.IsAuthenticated == true
                && (User.IsInRole("Owner") || HasPermissionClaim("perm_manage_branches"));
+    }
+
+    private bool IsValidDeveloperPassword(string? password)
+    {
+        var expected = _cfg["BusinessRegistration:DeveloperPassword"];
+        if (string.IsNullOrWhiteSpace(expected))
+            expected = FallbackBusinessRegistrationPassword;
+        return string.Equals((password ?? "").Trim(), expected, StringComparison.Ordinal);
+    }
+
+    private static string? NormalizeLogo(string? logoBase64)
+    {
+        if (string.IsNullOrWhiteSpace(logoBase64)) return null;
+        var trimmed = logoBase64.Trim();
+        var comma = trimmed.IndexOf(',');
+        if (comma >= 0 && trimmed[..comma].Contains("base64", StringComparison.OrdinalIgnoreCase))
+            trimmed = trimmed[(comma + 1)..];
+        return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
     }
 }

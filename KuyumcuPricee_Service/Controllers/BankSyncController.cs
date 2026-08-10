@@ -41,7 +41,6 @@ public sealed class BankSyncController : ControllerBase
         }
     }
 
-    /// <summary>VM worker: Vomsis hareketlerini ERP'ye aktarır (x-app-key + X-Tenant-Id + X-Branch-Id).</summary>
     [HttpPost("vomsis/import")]
     [AllowAnonymous]
     public async Task<IActionResult> ImportVomsis([FromBody] VomsisImportReq req, CancellationToken ct)
@@ -56,6 +55,28 @@ public sealed class BankSyncController : ControllerBase
 
         var result = await _bankSync.ImportVomsisTransactionsAsync(tid, bid, req.Transactions, ct);
         return Ok(result);
+    }
+
+    /// <summary>VM worker: manuel sync talebini tamamlandı olarak işaretler.</summary>
+    [HttpPost("vomsis/sync-complete")]
+    [AllowAnonymous]
+    public async Task<IActionResult> CompleteManualSync([FromBody] VomsisSyncCompleteReq req, CancellationToken ct)
+    {
+        if (req is null || req.BranchId == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+
+        var tid = _tenant.TenantId;
+        var bid = req.BranchId;
+        if (tid == Guid.Empty || bid == Guid.Empty)
+            return BadRequest(new { error = "TenantId ve BranchId zorunludur." });
+
+        await _profile.CompleteManualSyncAsync(tid, bid, new BankSyncPullResult
+        {
+            FetchedFromVomsis = req.FetchedFromVomsis,
+            Imported = req.Imported,
+            SummaryMessage = req.SummaryMessage
+        }, ct);
+        return Ok(new { success = true });
     }
 
     [HttpGet("transactions")]
@@ -80,17 +101,62 @@ public sealed class BankSyncController : ControllerBase
     [Authorize]
     public async Task<IActionResult> MatchAndDraft(Guid id, [FromBody] MatchBankImportReq req, CancellationToken ct)
     {
-        if (req?.CustomerId is null || req.CustomerId == Guid.Empty)
-            return BadRequest(new { error = "CustomerId zorunludur." });
-
         var tid = _tenant.TenantId;
-        var bid = req.BranchId ?? _tenant.BranchId ?? Guid.Empty;
+        var bid = req?.BranchId ?? _tenant.BranchId ?? Guid.Empty;
         if (bid == Guid.Empty)
             return BadRequest(new { error = "BranchId zorunludur." });
 
-        var result = await _bankSync.MatchAndCreateDraftAsync(tid, bid, id, req.CustomerId.Value, ct);
+        var options = new CreateBankImportDraftOptions
+        {
+            CustomerId = req?.CustomerId is Guid cid && cid != Guid.Empty ? cid : null,
+            SupplierId = req?.SupplierId is Guid sid && sid != Guid.Empty ? sid : null,
+            ManualTaxNo = req?.ManualTaxNo,
+            ManualBuyerName = req?.ManualBuyerName,
+            UseNihaiTuketici = req?.UseNihaiTuketici == true
+        };
+
+        var result = await _bankSync.CreateDraftAsync(tid, bid, id, options, ct);
         if (!result.Success)
             return BadRequest(new { error = result.Message, status = result.Status });
+        return Ok(result);
+    }
+
+    [HttpPost("transactions/{id:guid}/create-draft")]
+    [Authorize]
+    public async Task<IActionResult> CreateDraft(Guid id, [FromBody] CreateBankImportDraftReq? req, CancellationToken ct)
+    {
+        var tid = _tenant.TenantId;
+        var bid = req?.BranchId ?? _tenant.BranchId ?? Guid.Empty;
+        if (bid == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+
+        var options = new CreateBankImportDraftOptions
+        {
+            CustomerId = req?.CustomerId,
+            SupplierId = req?.SupplierId,
+            ManualTaxNo = req?.ManualTaxNo,
+            ManualBuyerName = req?.ManualBuyerName,
+            UseNihaiTuketici = req?.UseNihaiTuketici == true
+        };
+
+        var result = await _bankSync.CreateDraftAsync(tid, bid, id, options, ct);
+        if (!result.Success)
+            return BadRequest(new { error = result.Message, status = result.Status });
+        return Ok(result);
+    }
+
+    [HttpPost("transactions/{id:guid}/refresh-vomsis-tax")]
+    [Authorize]
+    public async Task<IActionResult> RefreshVomsisTax(Guid id, [FromBody] RefreshVomsisTaxReq? req, CancellationToken ct)
+    {
+        var tid = _tenant.TenantId;
+        var bid = req?.BranchId ?? _tenant.BranchId ?? Guid.Empty;
+        if (bid == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+
+        var result = await _bankSync.RefreshVomsisTaxAsync(tid, bid, id, ct);
+        if (!result.Success)
+            return BadRequest(result);
         return Ok(result);
     }
 
@@ -120,6 +186,30 @@ public sealed class BankSyncController : ControllerBase
 
         var dto = await _profile.GetProfileAsync(tid, bid, ct);
         return Ok(dto);
+    }
+
+    [HttpPut("auto-instruction")]
+    [Authorize]
+    public async Task<IActionResult> SaveAutoInstruction([FromBody] SaveBankAutoInstructionReq req, CancellationToken ct)
+    {
+        if (req is null) return BadRequest(new { error = "İstek boş olamaz." });
+        var tid = _tenant.TenantId;
+        var bid = req.BranchId != Guid.Empty ? req.BranchId : (_tenant.BranchId ?? Guid.Empty);
+        if (bid == Guid.Empty)
+            return BadRequest(new { error = "BranchId zorunludur." });
+        if (_tenant.BranchId.HasValue && _tenant.BranchId.Value != Guid.Empty && bid != _tenant.BranchId.Value)
+            return BadRequest(new { error = "İşlem şubesi, oturum şubesi ile aynı olmalıdır." });
+
+        req.BranchId = bid;
+        try
+        {
+            var dto = await _profile.SaveAutoInstructionAsync(tid, req, ct);
+            return Ok(dto);
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { error = ex.Message });
+        }
     }
 
     [HttpPut("profile")]
@@ -168,15 +258,42 @@ public sealed class BankSyncController : ControllerBase
         public List<VomsisTransactionImportDto> Transactions { get; set; } = new();
     }
 
+    public sealed class VomsisSyncCompleteReq
+    {
+        public Guid BranchId { get; set; }
+        public int FetchedFromVomsis { get; set; }
+        public int Imported { get; set; }
+        public string? SummaryMessage { get; set; }
+    }
+
     public sealed class MatchBankImportReq
     {
         public Guid? BranchId { get; set; }
         public Guid? CustomerId { get; set; }
+        public Guid? SupplierId { get; set; }
+        public string? ManualTaxNo { get; set; }
+        public string? ManualBuyerName { get; set; }
+        public bool UseNihaiTuketici { get; set; }
+    }
+
+    public sealed class CreateBankImportDraftReq
+    {
+        public Guid? BranchId { get; set; }
+        public Guid? CustomerId { get; set; }
+        public Guid? SupplierId { get; set; }
+        public string? ManualTaxNo { get; set; }
+        public string? ManualBuyerName { get; set; }
+        public bool UseNihaiTuketici { get; set; }
     }
 
     public sealed class RejectBankImportReq
     {
         public Guid? BranchId { get; set; }
         public string? Reason { get; set; }
+    }
+
+    public sealed class RefreshVomsisTaxReq
+    {
+        public Guid? BranchId { get; set; }
     }
 }

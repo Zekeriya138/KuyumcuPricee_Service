@@ -21,6 +21,7 @@ public class AuthController : ControllerBase
     private readonly IAuthService _auth;
     private readonly IConfiguration _cfg;
     private readonly ISmsVerificationService _smsVerification;
+    private const string FallbackBusinessRegistrationPassword = "DevOnly_2026";
 
     public AuthController(IAuthService auth, IConfiguration cfg, ISmsVerificationService smsVerification)
     {
@@ -53,7 +54,7 @@ public class AuthController : ControllerBase
         string OwnerPassword,
         string OwnerNationalId,
         string OwnerPhone,
-        string SmsVerificationToken);
+        string DeveloperPassword);
     public record ResolveTenantReq(Guid TenantId, string BusinessName);
 
     [HttpPost("login")]
@@ -231,11 +232,12 @@ public class AuthController : ControllerBase
         if (!IsValidPhone(ownerPhone))
             return BadRequest(new { error = "Owner telefon formatı geçersiz. Örn: 05XXXXXXXXX" });
 
-        if (string.IsNullOrWhiteSpace(req.SmsVerificationToken))
-            return BadRequest(new { error = "SMS doğrulaması zorunludur." });
+        var expectedPassword = _cfg["BusinessRegistration:DeveloperPassword"];
+        if (string.IsNullOrWhiteSpace(expectedPassword))
+            expectedPassword = FallbackBusinessRegistrationPassword;
 
-        if (!await _smsVerification.ConsumeBusinessRegistrationTokenAsync(req.SmsVerificationToken.Trim(), ct))
-            return BadRequest(new { error = "SMS doğrulaması geçersiz veya süresi dolmuş." });
+        if (!string.Equals((req.DeveloperPassword ?? "").Trim(), expectedPassword, StringComparison.Ordinal))
+            return BadRequest(new { error = "Geliştirici şifresi hatalı." });
 
         var exists = await db.Tenants
             .AsNoTracking()

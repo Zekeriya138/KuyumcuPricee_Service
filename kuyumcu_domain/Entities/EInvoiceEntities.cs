@@ -6,6 +6,8 @@ public class EInvoiceProfile : Entity, ITenantScoped
     public Guid BranchId { get; set; }
     public string ProviderCode { get; set; } = "edm";
     public string CompanyName { get; set; } = "";
+    /// <summary>Şahıs firması (TCKN) için fatura üstünde firma adının altında gösterilecek ad soyad.</summary>
+    public string? SoleProprietorName { get; set; }
     public string CompanyAddress { get; set; } = "";
     public string TaxNumber { get; set; } = "";
     public string TaxOffice { get; set; } = "";

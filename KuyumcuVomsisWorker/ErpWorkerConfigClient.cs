@@ -1,4 +1,3 @@
-using System.Net.Http.Headers;
 using System.Net.Http.Json;
 
 namespace KuyumcuVomsisWorker;
@@ -16,12 +15,27 @@ public sealed class ErpWorkerConfigClient
         _logger = logger;
     }
 
-    public async Task<RemoteWorkerConfig?> FetchAsync(CancellationToken ct)
+    public Task<RemoteWorkerConfig?> FetchAsync(CancellationToken ct)
+        => FetchAsync(request: null, ct);
+
+    public async Task<RemoteWorkerConfig?> FetchAsync(VomsisSyncRunRequest? request, CancellationToken ct)
     {
-        var baseUrl = _config["Bootstrap:ErpApiBaseUrl"] ?? _config["ErpApi:BaseUrl"];
-        var appKey = _config["Bootstrap:ErpApiAppKey"] ?? _config["ErpApi:AppKey"];
-        var tenantId = _config["Bootstrap:TenantId"] ?? _config["Sync:TenantId"];
-        var branchId = _config["Bootstrap:BranchId"] ?? _config["Sync:BranchId"];
+        var baseUrl = FirstNonEmpty(
+            request?.ErpApiBaseUrl,
+            _config["Bootstrap:ErpApiBaseUrl"],
+            _config["ErpApi:BaseUrl"]);
+        var appKey = FirstNonEmpty(
+            _config["Bootstrap:ErpApiAppKey"],
+            _config["ErpApi:AppKey"]);
+        var tenantId = FirstNonEmpty(
+            request?.TenantId?.ToString(),
+            _config["Bootstrap:TenantId"],
+            _config["Sync:TenantId"]);
+        var branchId = FirstNonEmpty(
+            request?.BranchId?.ToString(),
+            _config["Bootstrap:BranchId"],
+            _config["Sync:BranchId"]);
+
         if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(appKey) ||
             string.IsNullOrWhiteSpace(tenantId) || string.IsNullOrWhiteSpace(branchId))
         {
@@ -52,6 +66,14 @@ public sealed class ErpWorkerConfigClient
 
         return await resp.Content.ReadFromJsonAsync<RemoteWorkerConfig>(cancellationToken: ct);
     }
+
+    private static string? FirstNonEmpty(params string?[] values)
+    {
+        foreach (var v in values)
+            if (!string.IsNullOrWhiteSpace(v))
+                return v.Trim();
+        return null;
+    }
 }
 
 public sealed class RemoteWorkerConfig
@@ -66,4 +88,5 @@ public sealed class RemoteWorkerConfig
     public int PollIntervalMinutes { get; set; } = 5;
     public int[] AllowedAccountIds { get; set; } = [];
     public int LookbackDays { get; set; } = 7;
+    public DateTime? ManualSyncRequestedUtc { get; set; }
 }

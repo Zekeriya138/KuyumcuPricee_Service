@@ -17,6 +17,7 @@ public class Branch : Entity, ITenantScoped
     public string? Address { get; set; }        // <<< eklendi
     public string? Phone { get; set; }          // <<< eklendi
     public string? Email { get; set; }          // opsiyonel
+    public string? LogoBase64 { get; set; }     // PNG/JPEG base64 (PDF ve raporlar)
     public bool IsActive { get; set; } = true;  // aktif/pasif
     public Tenant Tenant { get; set; } = null!;
                                       

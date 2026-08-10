@@ -234,6 +234,7 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.Address).HasMaxLength(256);   // <<< eklendi
                 e.Property(x => x.Phone).HasMaxLength(32);     // <<< eklendi
                 e.Property(x => x.Email).HasMaxLength(128);
+                e.Property(x => x.LogoBase64).HasColumnType("nvarchar(max)");
 
                 e.Property(x => x.IsActive).HasDefaultValue(true);
                 e.HasOne(x => x.Tenant).WithMany(t => t.Branches)
@@ -467,6 +468,7 @@ namespace kuyumcu_infrastructure.Persistence
                 e.HasKey(x => x.Id);
                 e.Property(x => x.ProviderCode).HasMaxLength(64).IsRequired();
                 e.Property(x => x.CompanyName).HasMaxLength(200).IsRequired();
+                e.Property(x => x.SoleProprietorName).HasMaxLength(200);
                 e.Property(x => x.CompanyAddress).HasMaxLength(300).IsRequired();
                 e.Property(x => x.TaxNumber).HasMaxLength(32).IsRequired();
                 e.Property(x => x.TaxOffice).HasMaxLength(128).IsRequired();
@@ -1111,6 +1113,7 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.ErpApiBaseUrl).HasMaxLength(512).IsRequired();
                 e.Property(x => x.ErpApiAppKey).HasMaxLength(256);
                 e.Property(x => x.AllowedAccountIds).HasMaxLength(128).IsRequired();
+                e.Property(x => x.LastWorkerSyncMessage).HasMaxLength(500);
                 e.HasOne<Branch>().WithMany().HasForeignKey(x => x.BranchId).OnDelete(DeleteBehavior.Restrict);
                 e.HasIndex(x => new { x.TenantId, x.BranchId }).IsUnique();
                 e.HasQueryFilter(x => !x.IsDeleted && x.TenantId == _tenant.TenantId);

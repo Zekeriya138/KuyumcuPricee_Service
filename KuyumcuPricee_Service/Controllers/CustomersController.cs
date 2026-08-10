@@ -190,6 +190,7 @@ public class CustomersController : ControllerBase
                     mapped.Grup,
                     mapped.Kalem,
                     mapped.Deger,
+                    mapped.IslemKarsiligi,
                     birim,
                     sonMiktar,
                     mapped.CariDurum,
@@ -223,6 +224,7 @@ public class CustomersController : ControllerBase
             x.Log.DisplayGrup,
             x.Log.DisplayKalem,
             x.Log.DisplayDeger,
+            "",
             "",
             "-",
             "Geri Alındı",
@@ -356,6 +358,7 @@ public class CustomersController : ControllerBase
         string Grup,
         string Kalem,
         string Deger,
+        string IslemKarsiligi,
         string Birim,
         string SonMiktar,
         string CariDurum,
@@ -377,6 +380,7 @@ public class CustomersController : ControllerBase
         string Grup,
         string Kalem,
         string Deger,
+        string IslemKarsiligi,
         string Birim,
         string SonMiktar,
         string CariDurum,
@@ -505,8 +509,9 @@ public class CustomersController : ControllerBase
                 "Satış İşlemi",
                 "İşlem kaydı",
                 "",
+                "",
                 "-",
-                "İşlem",
+                "Satış",
                 $"Satış belgesi (Ref: {sale.Id}, Ödeme: {sale.PaymentType ?? "-"})",
                 userNames.TryGetValue(sale.UserId, out var sn) ? sn : ""));
         }
@@ -522,8 +527,9 @@ public class CustomersController : ControllerBase
                 "Alış İşlemi",
                 "İşlem kaydı",
                 "",
+                "",
                 "-",
-                "İşlem",
+                "Alış",
                 $"Alış belgesi (Ref: {purchase.Id}, Ödeme: {purchase.PaymentMethod})",
                 userNames.TryGetValue(purchase.UserId, out var pn) ? pn : ""));
         }
@@ -740,12 +746,16 @@ public class CustomersController : ControllerBase
             x.GroupCode ?? "",
             ResolveRecentKalem(x),
             FormatRecentValue(x),
+            ResolveCustomerIslemKarsiligi(x),
             birim,
             sonMiktar,
             ResolveRecentCariDurum(x),
             ResolveRecentAciklama(x),
             x.KullaniciAdi ?? "");
     }
+
+    private static string ResolveCustomerIslemKarsiligi(CustomerTransaction x)
+        => CariIslemKarsilikHelper.ResolveCustomerCounterpart(x);
 
     private async Task<HashSet<Guid>> LoadBlockedSaleIdsAsync(Guid tenantId, CancellationToken ct)
     {
@@ -857,36 +867,37 @@ public class CustomersController : ControllerBase
     private static string ResolveRecentCariDurum(CustomerTransaction x)
     {
         var refType = (x.RefType ?? "").Trim().ToUpperInvariant();
+        var itemName = (x.ItemName ?? "").Trim().ToUpperInvariant();
         var mevcut = (x.CariDurum ?? "").Trim();
         var isEmanet = IsEmanetKaydi(x);
 
-        if (string.Equals(x.GroupCode, "AUDIT", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals((x.ItemName ?? "").Trim(), "ZIYNET_DUSUM", StringComparison.OrdinalIgnoreCase) &&
-            !string.Equals((x.ItemName ?? "").Trim(), "ZIYNET_URUN_STOK", StringComparison.OrdinalIgnoreCase))
-            return "İşlem";
-
-        if (string.Equals(x.GroupCode, "AUDIT", StringComparison.OrdinalIgnoreCase) &&
-            string.Equals((x.ItemName ?? "").Trim(), "ZIYNET_DUSUM", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(x.GroupCode, "AUDIT", StringComparison.OrdinalIgnoreCase))
         {
-            if (refType is "PAYMENT" or "ODEME")
-                return "Ödeme";
-            if (refType is "COLLECTION" or "TAHSILAT")
-                return "Tahsilat";
-            return x.Direction >= 0 ? "Tahsilat" : "Ödeme";
+            if (itemName == "SALE_EVENT") return "Satış";
+            if (itemName == "PURCHASE_EVENT") return "Alış";
+            if (itemName == "ZIYNET_DUSUM")
+            {
+                if (refType is "PAYMENT" or "ODEME") return "Ödeme";
+                if (refType is "COLLECTION" or "TAHSILAT") return "Tahsilat";
+                return x.Direction >= 0 ? "Tahsilat" : "Ödeme";
+            }
+            if (itemName == "ZIYNET_URUN_STOK") return "Ziynet";
         }
+
+        if (refType == "SALE") return "Satış";
+        if (refType == "PURCHASE") return "Alış";
+        if (refType == "OPENING_BALANCE") return "Açılış Bakiye Girişi";
+        if (refType == "BALANCE_CONVERSION") return "Bakiye Dönüştürme";
+        if (refType == "TRANSFER") return "Transfer";
+        if (refType is "MANUAL" or "MANUAL_SETTLE")
+            return x.Direction >= 0 ? "Tahsilat" : "Ödeme";
+        if (refType == CustomerFinanceHelper.RefSettleBorc)
+            return "Tahsilat";
+        if (refType == CustomerFinanceHelper.RefSettleAlacak)
+            return "Ödeme";
 
         if (isEmanet)
             return x.Direction >= 0 ? "Emanet (Alacaklı)" : "Emanet (Borçlu)";
-
-        // MusteriIslemWindow (manuel) akışında eylem metni göster.
-        if (refType == "OPENING_BALANCE")
-            return "Açılış Bakiye Girişi";
-        if (refType == "BALANCE_CONVERSION")
-            return "Bakiye Dönüştürme";
-        if (refType == "TRANSFER")
-            return "Transfer";
-        if (refType is "MANUAL" or "MANUAL_SETTLE")
-            return x.Direction >= 0 ? "Tahsilat" : "Ödeme";
 
         if (string.Equals(mevcut, "Tahsilat", StringComparison.OrdinalIgnoreCase))
             return "Tahsilat";
@@ -899,11 +910,6 @@ public class CustomersController : ControllerBase
         if (string.Equals(mevcut, "Borclu", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(mevcut, "Borçlu", StringComparison.OrdinalIgnoreCase))
             return "Borçlu";
-
-        // Satış/alış veresiye gibi finans hareketlerinde borç-alacak dili korunur.
-        if (string.Equals(x.GroupCode, "DOVIZ", StringComparison.OrdinalIgnoreCase) &&
-            (refType == "SALE" || refType == "PURCHASE"))
-            return x.Direction >= 0 ? "Alacaklı" : "Borçlu";
 
         return string.IsNullOrWhiteSpace(mevcut) ? "Finans" : mevcut;
     }

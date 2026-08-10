@@ -4,9 +4,11 @@ using System.Security;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using kuyumcu_application;
 using kuyumcu_domain.Entities;
 using kuyumcu_domain.Enums;
 using kuyumcu_infrastructure.Persistence;
+using kuyumcu_infrastructure.Services;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
@@ -95,17 +97,13 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == invoice.BranchId && x.TenantId == invoice.TenantId, ct);
 
-        var sellerName = profile?.CompanyName?.Trim();
-        if (string.IsNullOrWhiteSpace(sellerName))
-            sellerName = branch?.Name?.Trim();
-        if (string.IsNullOrWhiteSpace(sellerName))
-            sellerName = "Firma";
-
+        var sellerName = ResolveSellerCompanyName(profile, branch);
         var sellerTax = DigitsOnly(profile?.TaxNumber);
         if (string.IsNullOrWhiteSpace(sellerTax))
             sellerTax = "1111111111";
+        var sellerPersonName = ResolveSellerPersonName(profile, sellerTax);
 
-        var buyerName = string.IsNullOrWhiteSpace(customer?.FullName) ? "Nihai Tuketici" : customer!.FullName.Trim();
+        var buyerName = ToInvoiceDisplayName(string.IsNullOrWhiteSpace(customer?.FullName) ? "Nihai Tuketici" : customer!.FullName);
         var buyerTax = DigitsOnly(customer?.NationalId);
         if (string.IsNullOrWhiteSpace(buyerTax))
             buyerTax = "11111111111";
@@ -127,6 +125,7 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
             documentType,
             sellerName,
             sellerTax,
+            sellerPersonName,
             customer?.Address,
             customer?.City,
             customer?.District,
@@ -148,17 +147,13 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == invoice.BranchId && x.TenantId == invoice.TenantId, ct);
 
-        var sellerName = profile?.CompanyName?.Trim();
-        if (string.IsNullOrWhiteSpace(sellerName))
-            sellerName = branch?.Name?.Trim();
-        if (string.IsNullOrWhiteSpace(sellerName))
-            sellerName = "Firma";
-
+        var sellerName = ResolveSellerCompanyName(profile, branch);
         var sellerTax = DigitsOnly(profile?.TaxNumber);
         if (string.IsNullOrWhiteSpace(sellerTax))
             sellerTax = "1111111111";
+        var sellerPersonName = ResolveSellerPersonName(profile, sellerTax);
 
-        var buyerName = string.IsNullOrWhiteSpace(draft.BuyerName) ? "Nihai Tuketici" : draft.BuyerName.Trim();
+        var buyerName = ToInvoiceDisplayName(string.IsNullOrWhiteSpace(draft.BuyerName) ? "Nihai Tuketici" : draft.BuyerName);
         var buyerTax = DigitsOnly(draft.BuyerTaxNumber);
         if (string.IsNullOrWhiteSpace(buyerTax))
             buyerTax = "11111111111";
@@ -172,6 +167,7 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
             draft.DocumentType,
             sellerName,
             sellerTax,
+            sellerPersonName,
             draft.BuyerAddress,
             draft.BuyerCity,
             draft.BuyerDistrict,
@@ -189,6 +185,7 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         string documentType,
         string sellerName,
         string sellerTax,
+        string? sellerPersonName,
         string? buyerAddress,
         string? buyerCity,
         string? buyerDistrict,
@@ -198,10 +195,15 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         string? buyerAlias,
         IReadOnlyList<UblLine> lineElements)
     {
+        var localInvoiceDate = invoice.InvoiceDate.ToLocalTime();
+        var issueDate = localInvoiceDate.Date;
+        var issueTime = localInvoiceDate.ToString("HH:mm:ss", CultureInfo.InvariantCulture);
         var invoiceUuid = Guid.NewGuid().ToString();
-        var issueDate = invoice.InvoiceDate.Date;
-        var issueTime = invoice.InvoiceDate.ToLocalTime().ToString("HH:mm:ss", CultureInfo.InvariantCulture);
-        var ublInvoiceId = BuildUblInvoiceId(invoiceNumber, issueDate, invoice.Id);
+        var seriesPrefix = GibInvoiceNumber.ResolvePrefixForDocumentType(
+            documentType,
+            profile?.DefaultInvoicePrefix,
+            profile?.DefaultArchivePrefix);
+        var ublInvoiceId = GibInvoiceNumber.Resolve(invoiceNumber, issueDate, invoice.Id, seriesPrefix);
         var currency = invoice.CurrencyOrDefault();
         if (lineElements.Count > 0)
             currency = lineElements[0].Currency;
@@ -227,8 +229,7 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         <cbc:TaxExemptionReason>KDV istisna</cbc:TaxExemptionReason>";
         }
 
-        var xml = $@"<?xml version=""1.0"" encoding=""UTF-8""?>
-<Invoice xmlns=""urn:oasis:names:specification:ubl:schema:xsd:Invoice-2""
+        var xml = $@"<Invoice xmlns=""urn:oasis:names:specification:ubl:schema:xsd:Invoice-2""
          xmlns:ext=""urn:oasis:names:specification:ubl:schema:xsd:CommonExtensionComponents-2""
          xmlns:cac=""urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2""
          xmlns:cbc=""urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2"">
@@ -250,19 +251,20 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
   <cac:AccountingSupplierParty>
     <cac:Party>
       <cac:PartyIdentification><cbc:ID schemeID=""{Xml(ResolveTaxSchemeId(sellerTax))}"">{Xml(sellerTax)}</cbc:ID></cac:PartyIdentification>
-      <cac:PartyName><cbc:Name>{Xml(sellerName)}</cbc:Name></cac:PartyName>
+      <cac:PartyName><cbc:Name>{Xml(string.IsNullOrWhiteSpace(sellerName) ? "UNVAN" : sellerName)}</cbc:Name></cac:PartyName>
       {BuildSellerPostalAddressXml(profile)}
       <cac:PartyTaxScheme>
         <cbc:CompanyID schemeID=""{Xml(ResolveTaxSchemeId(sellerTax))}"">{Xml(sellerTax)}</cbc:CompanyID>
-        <cac:TaxScheme><cbc:Name>{Xml(profile?.TaxOffice ?? "VERGI DAIRESI")}</cbc:Name></cac:TaxScheme>
+        <cac:TaxScheme><cbc:Name>{Xml(ToInvoiceDisplayName(profile?.TaxOffice ?? "VERGI DAIRESI"))}</cbc:Name></cac:TaxScheme>
       </cac:PartyTaxScheme>
-      {BuildPersonXmlIfTckn(sellerTax, sellerName)}
+      {BuildSellerPartyLegalEntityXml(sellerTax, sellerPersonName)}
+      {BuildPersonXmlIfTckn(sellerTax, sellerPersonName)}
     </cac:Party>
   </cac:AccountingSupplierParty>
   <cac:AccountingCustomerParty>
     <cac:Party>
       <cac:PartyIdentification><cbc:ID schemeID=""{Xml(ResolveTaxSchemeId(buyerTax))}"">{Xml(buyerTax)}</cbc:ID></cac:PartyIdentification>
-      <cac:PartyName><cbc:Name>{Xml(buyerName)}</cbc:Name></cac:PartyName>
+      {BuildPartyNameXml(buyerTax, buyerName)}
       {BuildPostalAddressXml(buyerAddress, buyerCity, buyerDistrict, buyerPostalCode)}
       <cac:PartyTaxScheme>
         <cbc:CompanyID schemeID=""{Xml(ResolveTaxSchemeId(buyerTax))}"">{Xml(buyerTax)}</cbc:CompanyID>
@@ -295,7 +297,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
 {string.Join(Environment.NewLine, normalizedLines.Select(BuildLineXml))}
 </Invoice>";
 
-        xml = NormalizeForEdmSchema(xml, currency, normalizedLines.Count);
+        // EDM'ye özel şema düzeltmeleri ortak UBL'ye uygulanmaz; EDM adaptörü kendi tarafında yapar.
+        // Uyumsoft XmlSerializer <?xml declaration veya yeniden yazılmış namespace'lerde (1,2) hatası verir.
 
         return new UblBuildResult(
             xml,
@@ -989,49 +992,12 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
     private static string Xml(string? text) => SecurityElement.Escape(text ?? string.Empty) ?? string.Empty;
     private static string Fmt(decimal value) => value.ToString("0.##", CultureInfo.InvariantCulture);
 
-    private static string NormalizeForEdmSchema(string xml, string currency, int lineCount)
-    {
-        try
-        {
-            var doc = XDocument.Parse(xml);
-            var root = doc.Root;
-            if (root is null) return xml;
-
-            // Bazı EDM validator sürümlerinde yanlış namespace/sırada gelen Signature elemanı şema hatası üretir.
-            var signatureNodes = root.Elements().Where(e => e.Name.LocalName == "Signature").ToList();
-            foreach (var node in signatureNodes)
-                node.Remove();
-
-            var cbcNs = (XNamespace)"urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2";
-            var hasTaxCurrency = root.Elements().Any(e => e.Name == cbcNs + "TaxCurrencyCode");
-            var hasLineCount = root.Elements().Any(e => e.Name == cbcNs + "LineCountNumeric");
-
-            var docCurrency = root.Elements().FirstOrDefault(e => e.Name == cbcNs + "DocumentCurrencyCode");
-            if (docCurrency is not null && !hasTaxCurrency)
-                docCurrency.AddAfterSelf(new XElement(cbcNs + "TaxCurrencyCode", currency));
-
-            if (!hasLineCount)
-            {
-                var buyerRef = root.Elements().FirstOrDefault(e => e.Name == cbcNs + "BuyerReference");
-                if (buyerRef is not null)
-                    buyerRef.AddAfterSelf(new XElement(cbcNs + "LineCountNumeric", lineCount <= 0 ? 1 : lineCount));
-                else
-                {
-                    var taxCurrency = root.Elements().FirstOrDefault(e => e.Name == cbcNs + "TaxCurrencyCode");
-                    if (taxCurrency is not null)
-                        taxCurrency.AddAfterSelf(new XElement(cbcNs + "LineCountNumeric", lineCount <= 0 ? 1 : lineCount));
-                }
-            }
-
-            return doc.Declaration is null
-                ? doc.ToString(SaveOptions.DisableFormatting)
-                : doc.Declaration + doc.ToString(SaveOptions.DisableFormatting);
-        }
-        catch
-        {
-            return xml;
-        }
-    }
+    /// <summary>
+    /// EDM validator uyumu — <see cref="EdmUblSchemaNormalizer"/> kullanın.
+    /// Geriye dönük uyumluluk için bırakıldı.
+    /// </summary>
+    public static string NormalizeForEdmSchema(string xml, string? currency = null, int? lineCount = null)
+        => EdmUblSchemaNormalizer.Normalize(xml, currency, lineCount);
 
     private static string BuildSellerPostalAddressXml(EInvoiceProfile? profile)
     {
@@ -1164,19 +1130,71 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         return text;
     }
 
-    private static string BuildPersonXmlIfTckn(string? taxNo, string buyerName)
+    /// <summary>
+    /// TCKN (şahıs) için Person; gönderici tarafında firma adının altında ad soyad gösterilir.
+    /// Alıcı şahıs ise PartyName yazılmaz, yalnızca Person kullanılır (çift görünüm engellenir).
+    /// </summary>
+    private static string BuildPersonXmlIfTckn(string? taxNo, string? personName)
     {
-        if (DigitsOnly(taxNo).Length != 11)
+        if (DigitsOnly(taxNo).Length != 11 || string.IsNullOrWhiteSpace(personName))
             return string.Empty;
-        var parts = (buyerName ?? string.Empty)
-            .Trim()
-            .Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+        var display = ToInvoiceDisplayName(personName);
+        var parts = display.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var firstName = parts.Length > 0 ? parts[0] : "AD";
         var familyName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : "SOYAD";
         return $@"<cac:Person>
       <cbc:FirstName>{Xml(firstName)}</cbc:FirstName>
       <cbc:FamilyName>{Xml(familyName)}</cbc:FamilyName>
     </cac:Person>";
+    }
+
+    private static string BuildPartyNameXml(string? taxNo, string partyName)
+    {
+        if (DigitsOnly(taxNo).Length == 11)
+            return string.Empty;
+
+        var name = ToInvoiceDisplayName(partyName);
+        return $@"<cac:PartyName><cbc:Name>{Xml(name)}</cbc:Name></cac:PartyName>";
+    }
+
+    /// <summary>Şahıs firması göndericisi için tescil adı (EDM/GİB uyumu).</summary>
+    private static string BuildSellerPartyLegalEntityXml(string? taxNo, string? personName)
+    {
+        if (DigitsOnly(taxNo).Length != 11 || string.IsNullOrWhiteSpace(personName))
+            return string.Empty;
+
+        var display = ToInvoiceDisplayName(personName);
+        return $@"<cac:PartyLegalEntity>
+      <cbc:RegistrationName>{Xml(display)}</cbc:RegistrationName>
+    </cac:PartyLegalEntity>";
+    }
+
+    private static string ResolveSellerCompanyName(EInvoiceProfile? profile, kuyumcu_domain.Entities.Branch? branch)
+    {
+        var name = profile?.CompanyName?.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+            name = branch?.Name?.Trim();
+        if (string.IsNullOrWhiteSpace(name))
+            name = "Firma";
+        return ToInvoiceDisplayName(name);
+    }
+
+    private static string? ResolveSellerPersonName(EInvoiceProfile? profile, string sellerTax)
+    {
+        if (DigitsOnly(sellerTax).Length != 11)
+            return null;
+
+        var name = profile?.SoleProprietorName?.Trim();
+        return string.IsNullOrWhiteSpace(name) ? null : ToInvoiceDisplayName(name);
+    }
+
+    private static string ToInvoiceDisplayName(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return "UNVAN";
+
+        return value.Trim().ToUpper(CultureInfo.GetCultureInfo("tr-TR"));
     }
 
     private static string ResolveTaxSchemeId(string? taxNo)
@@ -1199,20 +1217,11 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         ["IĞDIR"] = 76, ["YALOVA"] = 77, ["KARABÜK"] = 78, ["KILIS"] = 79, ["OSMANIYE"] = 80, ["DÜZCE"] = 81
     };
 
-    private static string BuildUblInvoiceId(string sourceInvoiceNo, DateTime issueDate, Guid invoiceId)
-    {
-        var prefix = new string((sourceInvoiceNo ?? "AUR")
-            .Where(char.IsLetter)
-            .Take(3)
-            .ToArray())
-            .ToUpperInvariant();
-        if (prefix.Length < 3)
-            prefix = (prefix + "AUR")[..3];
+    public static string BuildGibDocumentNumber(string? prefix, DateTime issueDate, Guid invoiceId)
+        => GibInvoiceNumber.Build(prefix, issueDate, invoiceId);
 
-        var raw = BitConverter.ToUInt32(invoiceId.ToByteArray(), 0) % 1_000_000_000;
-        var serial9 = raw.ToString("000000000", CultureInfo.InvariantCulture);
-        return $"{prefix}{issueDate:yyyy}{serial9}";
-    }
+    public static bool IsValidGibDocumentNumber(string? value, DateTime issueDate)
+        => GibInvoiceNumber.IsValid(value, issueDate);
 
     private decimal ResolveGoldLineBaseAmount(
         decimal quantity,

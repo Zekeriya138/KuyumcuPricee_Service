@@ -11,6 +11,39 @@ public interface IEInvoiceProviderAdapter
     Task<EInvoiceWebhookVerificationResult> VerifyWebhookAsync(EInvoiceWebhookVerificationRequest request, CancellationToken ct);
 
     /// <summary>
+    /// VKN/TCKN mükellef sorgusu. Desteklemeyen sağlayıcılar varsayılan olarak hata döner.
+    /// </summary>
+    Task<IntegratorTaxpayerQueryResult> QueryTaxpayerAsync(string? username, string? password, string taxNumber, CancellationToken ct)
+        => Task.FromResult(new IntegratorTaxpayerQueryResult(false, null, null, null, null, "Bu sağlayıcı mükellef sorgusunu desteklemiyor."));
+
+    /// <summary>
+    /// Ünvan / ad soyad ile mükellef araması. TCKN/VKN bilinmediğinde kullanılır.
+    /// Desteklemeyen sağlayıcılar varsayılan olarak hata döner.
+    /// </summary>
+    Task<IntegratorTaxpayerSearchResult> SearchTaxpayersByTitleAsync(
+        string? username,
+        string? password,
+        string title,
+        CancellationToken ct)
+        => Task.FromResult(IntegratorTaxpayerSearchResult.Fail("Bu sağlayıcı ünvan ile mükellef aramasını desteklemiyor. TCKN/VKN girin."));
+
+    /// <summary>GİB mükellef listesi önbelleğini arka planda ısıtır (EDM ünvan araması için).</summary>
+    Task WarmTaxpayerSearchCacheAsync(string? username, string? password, CancellationToken ct)
+        => Task.CompletedTask;
+
+    /// <summary>
+    /// Entegratör portalındaki son seri numarasını sorgular (Uyumsoft gibi).
+    /// </summary>
+    Task<IntegratorSeriesCounterResult> QuerySeriesCounterAsync(
+        string? username,
+        string? password,
+        string prefix,
+        int year,
+        bool isEArchive,
+        CancellationToken ct)
+        => Task.FromResult(new IntegratorSeriesCounterResult(false, null, null, null, "Bu sağlayıcı seri sayacı sorgusunu desteklemiyor."));
+
+    /// <summary>
     /// Entegratörün gelen kutusundaki (gelen) e-Faturaları döner.
     /// Varsayılan olarak desteklenmez; yalnızca destekleyen sağlayıcılar (ör. EDM) override eder.
     /// </summary>
@@ -147,5 +180,46 @@ public sealed record EInvoiceWebhookVerificationResult(
     string? EventType,
     string? DocumentId,
     string? ProviderStatus,
+    string? ErrorMessage
+);
+
+public sealed record IntegratorTaxpayerQueryResult(
+    bool IsSuccess,
+    bool? IsEInvoiceTaxpayer,
+    string? Title,
+    string? ReceiverAlias,
+    string? RawResponse,
+    string? Message
+);
+
+public sealed record IntegratorTaxpayerCandidate(
+    string TaxNo,
+    string? Title,
+    string? ReceiverAlias,
+    bool IsEInvoiceTaxpayer
+);
+
+public sealed record IntegratorTaxpayerSearchResult(
+    bool IsSuccess,
+    IReadOnlyList<IntegratorTaxpayerCandidate> Candidates,
+    string? RawResponse,
+    string? Message
+)
+{
+    public static IntegratorTaxpayerSearchResult Fail(string message)
+        => new(false, Array.Empty<IntegratorTaxpayerCandidate>(), null, message);
+
+    public static IntegratorTaxpayerSearchResult Ok(
+        IReadOnlyList<IntegratorTaxpayerCandidate> candidates,
+        string? rawResponse,
+        string message)
+        => new(true, candidates, rawResponse, message);
+}
+
+public sealed record IntegratorSeriesCounterResult(
+    bool IsSuccess,
+    int? LastSerial,
+    string? NextInvoiceNumber,
+    string? RawResponse,
     string? ErrorMessage
 );

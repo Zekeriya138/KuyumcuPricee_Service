@@ -1,8 +1,10 @@
 using System.Text.Json;
 using System.Collections.Concurrent;
+using kuyumcu_application;
 using kuyumcu_application.Abstractions;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
+using kuyumcu_infrastructure.Tenancy;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 
@@ -15,12 +17,18 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<EInvoiceOutboxWorker> _logger;
     private readonly IConfiguration _cfg;
+    private readonly EInvoiceImmediateProcessQueue _immediateQueue;
 
-    public EInvoiceOutboxWorker(IServiceScopeFactory scopeFactory, ILogger<EInvoiceOutboxWorker> logger, IConfiguration cfg)
+    public EInvoiceOutboxWorker(
+        IServiceScopeFactory scopeFactory,
+        ILogger<EInvoiceOutboxWorker> logger,
+        IConfiguration cfg,
+        EInvoiceImmediateProcessQueue immediateQueue)
     {
         _scopeFactory = scopeFactory;
         _logger = logger;
         _cfg = cfg;
+        _immediateQueue = immediateQueue;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -29,6 +37,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
         {
             try
             {
+                await ProcessImmediateQueueAsync(stoppingToken);
                 await ProcessBatchAsync(stoppingToken);
                 await PollQueuedStatusesAsync(stoppingToken);
                 await ProcessExpenseSlipBatchAsync(stoppingToken);
@@ -40,7 +49,27 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
                 _logger.LogError(ex, "E-invoice outbox worker failed.");
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(20), stoppingToken);
+            await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
+        }
+    }
+
+    private async Task ProcessImmediateQueueAsync(CancellationToken ct)
+    {
+        while (_immediateQueue.TryDequeue(out var job))
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var tenant = scope.ServiceProvider.GetRequiredService<TenantContext>();
+                tenant.TenantId = job.TenantId;
+
+                var workflow = scope.ServiceProvider.GetRequiredService<IEInvoiceWorkflowService>();
+                await workflow.TryProcessPendingImmediatelyAsync(job.TenantId, job.InvoiceId, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Acil e-fatura gönderimi başarısız. InvoiceId={InvoiceId}", job.InvoiceId);
+            }
         }
     }
 
@@ -49,6 +78,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
         using var scope = _scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var providerResolver = scope.ServiceProvider.GetRequiredService<IEInvoiceProviderResolver>();
+        var workflow = scope.ServiceProvider.GetRequiredService<IEInvoiceWorkflowService>();
 
         var now = DateTime.UtcNow;
         var lockTimeoutSeconds = Math.Clamp(_cfg.GetValue<int?>("EInvoice:Outbox:LockTimeoutSeconds") ?? 180, 30, 3600);
@@ -71,7 +101,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
 
         foreach (var outbox in items)
         {
-            await ProcessItemAsync(db, providerResolver, outbox, ct);
+            await ProcessItemAsync(db, providerResolver, workflow, outbox, ct);
         }
     }
 
@@ -196,6 +226,7 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
     private static async Task ProcessItemAsync(
         AppDbContext db,
         IEInvoiceProviderResolver providerResolver,
+        IEInvoiceWorkflowService workflow,
         EInvoiceOutbox outbox,
         CancellationToken ct)
     {
@@ -221,7 +252,10 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
             var providerCode = string.IsNullOrWhiteSpace(profile?.ProviderCode) ? "edm" : profile.ProviderCode;
             var adapter = providerResolver.Resolve(providerCode);
 
-            var payload = ParsePayload(outbox.PayloadJson);
+            await workflow.RefreshOutboxPayloadIfNeededAsync(doc, outbox, ct);
+
+            var payloadJson = EInvoiceWorkflowService.PatchPayloadWithSoleProprietorName(outbox.PayloadJson, profile?.SoleProprietorName);
+            var payload = ParsePayload(payloadJson);
             var sendReq = new EInvoiceSendRequest(
                 doc.TenantId,
                 doc.BranchId,
@@ -233,11 +267,11 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
                 doc.Currency,
                 payload.BuyerName,
                 payload.BuyerTaxNo,
-                outbox.PayloadJson,
+                payloadJson,
                 profile?.IntegratorUsername,
                 profile?.IntegratorSecretRef);
 
-            var sendResult = await adapter.SendOutgoingAsync(sendReq, ct);
+            var sendResult = await adapter.SendOutgoingAsync(sendReq, CancellationToken.None);
             if (!sendResult.IsSuccess)
             {
                 MarkFailure(outbox, doc, sendResult.ErrorMessage ?? "Provider send failed.");
@@ -248,9 +282,12 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
                 doc.IntegratorDocumentId = sendResult.IntegratorDocumentId ?? doc.IntegratorDocumentId;
                 doc.Uuid = sendResult.Uuid ?? doc.Uuid;
                 doc.Ettn = sendResult.Ettn ?? doc.Ettn;
+                if (!string.IsNullOrWhiteSpace(sendResult.Ettn))
+                    doc.InvoiceNumber = sendResult.Ettn;
                 doc.RawLastResponse = sendResult.RawResponse;
                 doc.LastError = null;
-                doc.SubmittedAt ??= DateTime.UtcNow;
+                if (doc.Status is "Sent" or "Delivered")
+                    doc.SubmittedAt ??= DateTime.UtcNow;
                 if (doc.Status == "Delivered")
                     doc.DeliveredAt = DateTime.UtcNow;
 
@@ -259,6 +296,16 @@ public sealed class EInvoiceOutboxWorker : BackgroundService
                     .FirstOrDefaultAsync(x => x.TenantId == doc.TenantId && x.Id == doc.InvoiceId, ct);
                 if (invoice is not null)
                     invoice.IsExported = true;
+
+                if (string.Equals(providerCode, "uyumsoft", StringComparison.OrdinalIgnoreCase))
+                {
+                    await EInvoiceWorkflowService.UpdateProfileSeriesSerialAsync(
+                        db,
+                        doc.TenantId,
+                        doc.BranchId,
+                        sendResult.Ettn ?? doc.InvoiceNumber,
+                        ct);
+                }
 
                 outbox.Status = "Done";
                 outbox.ProcessedAt = DateTime.UtcNow;

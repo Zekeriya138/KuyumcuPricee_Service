@@ -148,6 +148,7 @@ public class SuppliersController : ControllerBase
         string Grup,
         string Kalem,
         string Deger,
+        string IslemKarsiligi,
         string Birim,
         string SonMiktar,
         string CariDurum,
@@ -169,6 +170,7 @@ public class SuppliersController : ControllerBase
         string Grup,
         string Kalem,
         string Deger,
+        string IslemKarsiligi,
         string Birim,
         string SonMiktar,
         string CariDurum,
@@ -359,6 +361,7 @@ public class SuppliersController : ControllerBase
                     mapped.Grup,
                     mapped.Kalem,
                     mapped.Deger,
+                    mapped.IslemKarsiligi,
                     mapped.Birim,
                     mapped.SonMiktar,
                     mapped.CariDurum,
@@ -395,6 +398,7 @@ public class SuppliersController : ControllerBase
             x.Log.DisplayGrup,
             x.Log.DisplayKalem,
             x.Log.DisplayDeger,
+            "",
             "",
             "-",
             "Geri Alındı",
@@ -504,8 +508,9 @@ public class SuppliersController : ControllerBase
                 "Alış İşlemi",
                 $"{Math.Abs(purchase.GrandTotal):N2} TL",
                 "",
+                "",
                 "-",
-                "İşlem",
+                "Alış",
                 $"Alış belgesi (PURCHASE {purchase.Id}, Ödeme: {purchase.PaymentMethod})",
                 userNames.TryGetValue(purchase.UserId, out var pn) ? pn : ""));
         }
@@ -515,25 +520,8 @@ public class SuppliersController : ControllerBase
             .Take(300)
             .ToList();
 
-        var ziynet = tx
-            .Select(TryParseZiynetMove)
-            .Where(x => x is not null)
-            .Select(x => x!)
-            .GroupBy(x => $"{(x.Ad ?? "").Trim().ToUpperInvariant()}|{(x.Tip ?? "").Trim().ToUpperInvariant()}")
-            .Select(g =>
-            {
-                var first = g.First();
-                var gross = SupplierFinanceHelper.ComputeZiynetGross(g.Select(v => v.Adet));
-                return new SupplierZiynetRowDto(
-                    first.Ad,
-                    string.IsNullOrWhiteSpace(first.Tip) ? "Yeni" : first.Tip.Trim(),
-                    decimal.Round(g.Sum(v => v.Adet), 3, MidpointRounding.AwayFromZero),
-                    gross.Borc,
-                    gross.Alacak);
-            })
-            .Where(x => x.Borc != 0m || x.Alacak != 0m)
-            .OrderBy(x => x.Ad)
-            .ThenBy(x => x.Tip)
+        var ziynet = SupplierFinanceHelper.BuildZiynetFinanceRows(tx)
+            .Select(x => new SupplierZiynetRowDto(x.Ad, x.Tip, x.Adet, x.Borc, x.Alacak))
             .ToList();
 
         return Ok(new SupplierFinanceDto(doviz, sonIslemler, ziynet));
@@ -608,12 +596,16 @@ public class SuppliersController : ControllerBase
             grup,
             kalem,
             FormatSupplierRecentValue(x),
+            ResolveSupplierIslemKarsiligi(x),
             birim,
             sonMiktar,
             ResolveSupplierCariDurum(x),
             ResolveSupplierRecentAciklama(x),
             x.KullaniciAdi ?? "");
     }
+
+    private static string ResolveSupplierIslemKarsiligi(SupplierTransaction x)
+        => CariIslemKarsilikHelper.ResolveSupplierCounterpart(x);
 
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] CreateSupplierDto dto, CancellationToken ct = default)
@@ -844,16 +836,20 @@ public class SuppliersController : ControllerBase
     private static string ResolveSupplierCariDurum(SupplierTransaction x)
     {
         var txType = (x.TxType ?? "").Trim().ToUpperInvariant();
+        var refType = (x.RefType ?? "").Trim().ToUpperInvariant();
         var desc = (x.Description ?? "").Trim();
 
-        // Alış/satış veresiye kayıtlarında cari taraf (alacak/borç) gösterilsin.
+        if (refType == "PURCHASE" || desc.Contains("alis belgesi", StringComparison.OrdinalIgnoreCase))
+            return "Alış";
+        if (refType == "SALE" || desc.Contains("satis belgesi", StringComparison.OrdinalIgnoreCase))
+            return "Satış";
+
         var veresiyeKaydi =
             desc.Contains("veresiye", StringComparison.OrdinalIgnoreCase) ||
             desc.Contains("cari", StringComparison.OrdinalIgnoreCase);
         if (veresiyeKaydi)
             return txType == "COLLECTION" ? "Alacaklı" : "Borçlu";
 
-        // SupplierIslemWindow manuel akışında eylem metni gösterilsin.
         if (txType == "OPENING_BALANCE") return "Açılış Bakiye Girişi";
         if (txType == "BALANCE_CONVERSION") return "Bakiye Dönüştürme";
         if (txType == "TRANSFER") return "Transfer";
@@ -861,36 +857,5 @@ public class SuppliersController : ControllerBase
         if (txType == "COLLECTION") return "Tahsilat";
         if (txType == "ZIYNET") return "Ziynet";
         return "Finans";
-    }
-
-    private sealed record SupplierZiynetMove(string Ad, string Tip, decimal Adet);
-
-    private static SupplierZiynetMove? TryParseZiynetMove(SupplierTransaction tx)
-    {
-        var desc = (tx.Description ?? "").Trim();
-        if (string.IsNullOrWhiteSpace(desc)) return null;
-        if (!desc.Contains("[ZIYNET]|", StringComparison.OrdinalIgnoreCase)) return null;
-
-        string ad = "";
-        string tip = "Yeni";
-        decimal adet = 0m;
-        var parts = desc.Split('|', StringSplitOptions.RemoveEmptyEntries);
-        foreach (var rawPart in parts)
-        {
-            var part = rawPart.Trim();
-            if (part.StartsWith("AD=", StringComparison.OrdinalIgnoreCase))
-                ad = part.Substring(3).Trim();
-            else if (part.StartsWith("TIP=", StringComparison.OrdinalIgnoreCase))
-                tip = part.Substring(4).Trim();
-            else if (part.StartsWith("ADET=", StringComparison.OrdinalIgnoreCase))
-                decimal.TryParse(part.Substring(5).Trim().Replace(",", "."), NumberStyles.Any, CultureInfo.InvariantCulture, out adet);
-        }
-
-        if (adet == 0m)
-            adet = tx.TargetAmount;
-
-        if (string.IsNullOrWhiteSpace(ad) || adet == 0m)
-            return null;
-        return new SupplierZiynetMove(ad, string.IsNullOrWhiteSpace(tip) ? "Yeni" : tip, adet);
     }
 }

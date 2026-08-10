@@ -27,7 +27,8 @@ public sealed record CreateSaleReqV2(
     /// <summary>Ödeme kaleminde <c>TedarikciVeresiye</c> varsa zorunlu: tedarikçi cari hareketi bu tedarikçiye yazılır.</summary>
     Guid? SupplierIdForTedarikciVeresiye = null,
     /// <summary>EMANET satışta müşteri cari hareketini SalesV2 içinde yazma (WPF ProcessCustomerTransaction ile yazar).</summary>
-    bool SkipEmanetCustomerLedger = false)
+    bool SkipEmanetCustomerLedger = false,
+    List<TakasHurdaItemReq>? TakasHurdaItems = null)
 {
     /// <summary>Emanet döviz birim → BORC|ALACAK hedef brüt sütun.</summary>
     public Dictionary<string, string>? EmanetDovizLedgerByUnit { get; init; }
@@ -50,6 +51,16 @@ public sealed record TakasHammaddeReq(
     string Ayar,
     decimal Gram,
     decimal BirimMaliyet
+);
+
+public sealed record TakasHurdaItemReq(
+    string MalTanimi,
+    string Ayar,
+    decimal Milyem,
+    decimal Gram,
+    decimal BirimIscilikHas,
+    decimal OdenecekToplamHas,
+    decimal TutarTl
 );
 
 public sealed record UpdateSaleItemReq(

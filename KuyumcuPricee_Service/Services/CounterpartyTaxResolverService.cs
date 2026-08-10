@@ -18,7 +18,8 @@ public sealed record TaxpayerLookupResult(
     string TaxNo,
     string? Title,
     bool IsEInvoiceTaxpayer,
-    string Source);
+    string Source,
+    string? ReceiverAlias = null);
 
 public interface ICounterpartyTaxResolver
 {
@@ -108,7 +109,7 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
         if (IsAcceptableTaxNo(fromFields))
         {
             var edm = await TryEdmVerifyAsync(input.TenantId, input.BranchId, fromFields, ct);
-            var display = edm?.Title ?? name;
+            var display = BankMovementParser.SanitizeCounterpartyDisplayName(edm?.Title ?? name, fromFields) ?? name;
             return CounterpartyResolveResult.Ok(
                 fromFields, display, null, null,
                 edm is not null ? CounterpartyIdentitySources.Edm : CounterpartyIdentitySources.Description,
@@ -381,12 +382,12 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
     }
 }
 
-public sealed class EdmTaxpayerLookupService : ITaxpayerLookupService
+public sealed class IntegratorTaxpayerLookupService : ITaxpayerLookupService
 {
     private readonly AppDbContext _db;
     private readonly IEInvoiceProviderResolver _providerResolver;
 
-    public EdmTaxpayerLookupService(AppDbContext db, IEInvoiceProviderResolver providerResolver)
+    public IntegratorTaxpayerLookupService(AppDbContext db, IEInvoiceProviderResolver providerResolver)
     {
         _db = db;
         _providerResolver = providerResolver;
@@ -396,20 +397,25 @@ public sealed class EdmTaxpayerLookupService : ITaxpayerLookupService
         Guid tenantId, Guid branchId, string taxNo, CancellationToken ct)
     {
         var profile = await _db.EInvoiceProfiles.AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && x.IsActive, ct);
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId, ct);
         if (profile is null) return null;
-
-        var adapter = _providerResolver.Resolve(string.IsNullOrWhiteSpace(profile.ProviderCode) ? "edm" : profile.ProviderCode);
-        if (adapter is not kuyumcu_infrastructure.Services.EdmSoapEInvoiceProviderAdapter edm)
+        if (string.IsNullOrWhiteSpace(profile.IntegratorUsername) || string.IsNullOrWhiteSpace(profile.IntegratorSecretRef))
             return null;
 
-        var result = await edm.QueryTaxpayerAsync(profile.IntegratorUsername, profile.IntegratorSecretRef, taxNo, ct);
+        var providerCode = string.IsNullOrWhiteSpace(profile.ProviderCode) ? "edm" : profile.ProviderCode;
+        var adapter = _providerResolver.Resolve(providerCode);
+        var result = await adapter.QueryTaxpayerAsync(profile.IntegratorUsername, profile.IntegratorSecretRef, taxNo, ct);
         if (!result.IsSuccess) return null;
+
+        var source = string.Equals(providerCode, "uyumsoft", StringComparison.OrdinalIgnoreCase)
+            ? CounterpartyIdentitySources.Uyumsoft
+            : CounterpartyIdentitySources.Edm;
 
         return new TaxpayerLookupResult(
             taxNo,
             result.Title,
             result.IsEInvoiceTaxpayer == true,
-            CounterpartyIdentitySources.Edm);
+            source,
+            result.ReceiverAlias);
     }
 }

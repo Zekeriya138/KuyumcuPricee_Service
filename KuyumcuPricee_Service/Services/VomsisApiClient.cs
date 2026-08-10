@@ -8,6 +8,8 @@ namespace KUYUMCU.Price_Service.Services;
 
 public sealed class VomsisApiClient
 {
+    private const int MaxDateWindowDays = 7;
+
     private readonly HttpClient _http;
     private readonly IConfiguration _config;
     private readonly ILogger<VomsisApiClient> _logger;
@@ -41,8 +43,56 @@ public sealed class VomsisApiClient
     public async Task<IReadOnlyList<VomsisTransaction>> GetTransactionsAsync(DateTime beginUtc, DateTime endUtc, CancellationToken ct)
     {
         await EnsureTokenAsync(ct);
-        var begin = beginUtc.ToLocalTime().ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
-        var end = endUtc.ToLocalTime().ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+
+        var rangeBegin = beginUtc.ToLocalTime().Date;
+        var rangeEnd = endUtc.ToLocalTime().Date;
+        if (rangeEnd < rangeBegin)
+            (rangeBegin, rangeEnd) = (rangeEnd, rangeBegin);
+
+        var merged = new Dictionary<long, VomsisTransaction>();
+        var windowEnd = rangeEnd;
+
+        while (windowEnd >= rangeBegin)
+        {
+            var windowBegin = windowEnd.AddDays(-(MaxDateWindowDays - 1));
+
+            var batch = await FetchTransactionsWindowAsync(windowBegin, windowEnd, ct);
+            foreach (var tx in batch)
+                merged[tx.Id] = tx;
+
+            if (windowBegin <= rangeBegin)
+                break;
+
+            windowEnd = windowBegin.AddDays(-1);
+        }
+
+        var filtered = merged.Values
+            .Where(tx => IsWithinUtcRange(tx, beginUtc, endUtc))
+            .ToList();
+
+        _logger.LogInformation(
+            "Vomsis: {Begin:yyyy-MM-dd}..{End:yyyy-MM-dd} aralığında {Count} hareket alındı.",
+            rangeBegin, rangeEnd, filtered.Count);
+
+        return filtered;
+    }
+
+    private static bool IsWithinUtcRange(VomsisTransaction tx, DateTime beginUtc, DateTime endUtc)
+    {
+        var dt = VomsisTransactionMapper.ToImportDto(tx).TransactionDateUtc;
+        if (!dt.HasValue)
+            return true;
+
+        return dt.Value >= beginUtc && dt.Value <= endUtc;
+    }
+
+    private async Task<IReadOnlyList<VomsisTransaction>> FetchTransactionsWindowAsync(
+        DateTime windowBeginLocal,
+        DateTime windowEndLocal,
+        CancellationToken ct)
+    {
+        var begin = windowBeginLocal.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
+        var end = windowEndLocal.ToString("dd-MM-yyyy", CultureInfo.InvariantCulture);
         var url = $"api/v2/transactions?beginDate={Uri.EscapeDataString(begin)}&endDate={Uri.EscapeDataString(end)}";
 
         using var req = new HttpRequestMessage(HttpMethod.Get, url);
@@ -57,6 +107,93 @@ public sealed class VomsisApiClient
             throw new InvalidOperationException("Vomsis transactions yanıtı başarısız: " + body);
 
         return parsed.Transactions ?? [];
+    }
+
+    /// <summary>
+    /// Vomsis dekont/bildirim formundaki İLGİLİ VKN/TCKN alanları liste yanıtında boş olabilir;
+    /// transaction detail endpoint'inden tamamlanır.
+    /// </summary>
+    public async Task<VomsisTransaction?> GetTransactionDetailAsync(long transactionId, CancellationToken ct)
+    {
+        await EnsureTokenAsync(ct);
+
+        var url = $"api/v2/transactions/{transactionId.ToString(CultureInfo.InvariantCulture)}";
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+        using var resp = await _http.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            _logger.LogWarning(
+                "Vomsis transaction detail HTTP {Code} for id {Id}: {Body}",
+                (int)resp.StatusCode,
+                transactionId,
+                body.Length > 300 ? body[..300] : body);
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("status", out var statusEl) &&
+                !string.Equals(statusEl.GetString(), "success", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning("Vomsis transaction detail başarısız (id={Id}): {Body}", transactionId, body);
+                return null;
+            }
+
+            var txElement = ResolveTransactionElement(root);
+            if (txElement is null)
+                return null;
+
+            var tx = JsonSerializer.Deserialize<VomsisTransaction>(txElement.Value.GetRawText(), JsonOptions);
+            if (tx is null)
+                return null;
+
+            var taxFromJson = VomsisTaxFieldHelper.ExtractTaxNoFromJson(txElement.Value.GetRawText());
+            if (!string.IsNullOrWhiteSpace(taxFromJson))
+                tx.SenderTaxno = VomsisTaxFieldHelper.ResolveTaxNo(tx.SenderTaxno, tx.PayerTaxNo, taxFromJson) ?? taxFromJson;
+
+            var titleFromJson = VomsisTaxFieldHelper.ExtractTitleFromJson(txElement.Value.GetRawText());
+            if (!string.IsNullOrWhiteSpace(titleFromJson))
+            {
+                tx.RelatedTitle ??= titleFromJson;
+                tx.SenderTitle ??= titleFromJson;
+            }
+
+            var branchFromJson = VomsisTaxFieldHelper.ExtractBranchNameFromJson(txElement.Value.GetRawText());
+            if (!string.IsNullOrWhiteSpace(branchFromJson))
+            {
+                tx.BranchName ??= branchFromJson;
+                tx.SubeAdi ??= branchFromJson;
+            }
+
+            return tx;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Vomsis transaction detail parse hatası (id={Id})", transactionId);
+            return null;
+        }
+    }
+
+    private static JsonElement? ResolveTransactionElement(JsonElement root)
+    {
+        if (root.TryGetProperty("transaction", out var transaction))
+            return transaction;
+        if (root.TryGetProperty("data", out var data))
+        {
+            if (data.ValueKind == JsonValueKind.Object)
+                return data;
+            if (data.TryGetProperty("transaction", out var nested))
+                return nested;
+        }
+
+        if (root.TryGetProperty("id", out _) || root.TryGetProperty("key", out _))
+            return root;
+
+        return null;
     }
 
     private async Task EnsureTokenAsync(CancellationToken ct)
@@ -134,24 +271,95 @@ public sealed class VomsisTransaction
 
     [JsonPropertyName("payer_tax_no")]
     public string? PayerTaxNo { get; set; }
+
+    [JsonPropertyName("related_vkn")]
+    public string? RelatedVkn { get; set; }
+
+    [JsonPropertyName("ilgili_vkn")]
+    public string? IlgiliVkn { get; set; }
+
+    [JsonPropertyName("related_title")]
+    public string? RelatedTitle { get; set; }
+
+    [JsonPropertyName("ilgili_unvan")]
+    public string? IlgiliUnvan { get; set; }
+
+    [JsonPropertyName("receiver_taxno")]
+    public string? ReceiverTaxno { get; set; }
+
+    [JsonPropertyName("receiver_tax_no")]
+    public string? ReceiverTaxNoAlt { get; set; }
+
+    [JsonPropertyName("branch_name")]
+    public string? BranchName { get; set; }
+
+    [JsonPropertyName("sube_adi")]
+    public string? SubeAdi { get; set; }
 }
 
 public static class VomsisTransactionMapper
 {
-    public static VomsisTransactionImportDto ToImportDto(VomsisTransaction tx) => new()
+    public static VomsisTransactionImportDto ToImportDto(VomsisTransaction tx)
     {
-        ExternalId = tx.Id,
-        ExternalKey = string.IsNullOrWhiteSpace(tx.Key) ? tx.Id.ToString(CultureInfo.InvariantCulture) : tx.Key.Trim(),
-        VomsisAccountId = tx.BankAccountId,
-        Amount = tx.Amount,
-        Currency = NormalizeCurrency(tx.FecName),
-        Type = tx.Type,
-        Description = tx.Description,
-        TransactionDateUtc = ParseSystemDate(tx.SystemDate),
-        SenderName = Coalesce(tx.SenderName, tx.SenderTitle),
-        SenderTaxNo = Coalesce(tx.SenderTaxno, tx.PayerTaxNo),
-        SenderIban = tx.SenderIban
-    };
+        var branchName = ResolveBranchName(tx);
+        var (branchCity, branchDistrict) = VomsisTaxFieldHelper.ParseCityDistrictFromBranchName(branchName);
+        return new VomsisTransactionImportDto
+        {
+            ExternalId = tx.Id,
+            ExternalKey = string.IsNullOrWhiteSpace(tx.Key) ? tx.Id.ToString(CultureInfo.InvariantCulture) : tx.Key.Trim(),
+            VomsisAccountId = tx.BankAccountId,
+            Amount = tx.Amount,
+            Currency = NormalizeCurrency(tx.FecName),
+            Type = tx.Type,
+            Description = tx.Description,
+            TransactionDateUtc = ParseSystemDate(tx.SystemDate),
+            SenderName = Coalesce(tx.RelatedTitle, tx.IlgiliUnvan, tx.SenderName)?.Trim(),
+            SenderTitle = Coalesce(tx.RelatedTitle, tx.IlgiliUnvan, tx.SenderTitle)?.Trim(),
+            SenderTaxNo = ResolveTaxNo(tx),
+            SenderIban = tx.SenderIban,
+            BankBranchName = branchName,
+            BankBranchCity = branchCity,
+            BankBranchDistrict = branchDistrict
+        };
+    }
+
+    public static VomsisTransactionImportDto MergeDetailIntoImportDto(VomsisTransactionImportDto current, VomsisTransaction detail)
+    {
+        var mergedTax = ResolveTaxNo(detail) ?? current.SenderTaxNo;
+        var mergedTitle = Coalesce(detail.RelatedTitle, detail.IlgiliUnvan, detail.SenderTitle, detail.SenderName, current.SenderTitle, current.SenderName);
+        var mergedBranchName = Coalesce(ResolveBranchName(detail), current.BankBranchName);
+        var (branchCity, branchDistrict) = VomsisTaxFieldHelper.ParseCityDistrictFromBranchName(mergedBranchName);
+        return new VomsisTransactionImportDto
+        {
+            ExternalId = current.ExternalId,
+            ExternalKey = current.ExternalKey,
+            VomsisAccountId = current.VomsisAccountId,
+            Amount = current.Amount,
+            Currency = current.Currency,
+            Type = current.Type,
+            Description = Coalesce(detail.Description, current.Description),
+            TransactionDateUtc = current.TransactionDateUtc,
+            SenderTaxNo = mergedTax,
+            SenderTitle = mergedTitle?.Trim(),
+            SenderName = Coalesce(mergedTitle, current.SenderName)?.Trim(),
+            SenderIban = Coalesce(detail.SenderIban, current.SenderIban),
+            BankBranchName = mergedBranchName,
+            BankBranchCity = Coalesce(branchCity, current.BankBranchCity),
+            BankBranchDistrict = Coalesce(branchDistrict, current.BankBranchDistrict)
+        };
+    }
+
+    private static string? ResolveBranchName(VomsisTransaction tx)
+        => Coalesce(tx.BranchName, tx.SubeAdi);
+
+    private static string? ResolveTaxNo(VomsisTransaction tx)
+        => VomsisTaxFieldHelper.ResolveTaxNo(
+            tx.SenderTaxno,
+            tx.PayerTaxNo,
+            tx.RelatedVkn,
+            tx.IlgiliVkn,
+            tx.ReceiverTaxno,
+            tx.ReceiverTaxNoAlt);
 
     private static string NormalizeCurrency(string? fecName)
     {

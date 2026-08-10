@@ -259,12 +259,16 @@ public sealed class SalesV2Controller : ControllerBase
             .Sum(x => x.Amount);
         if (takasToplam > 0)
         {
-            if (!req.CustomerId.HasValue || req.CustomerId.Value == Guid.Empty)
-                return BadRequest(new { error = "Takas işlemi için müşteri seçilmelidir." });
-            if (req.TakasHammadde is null || req.TakasHammadde.Gram <= 0 || string.IsNullOrWhiteSpace(req.TakasHammadde.Ayar))
-                return BadRequest(new { error = "Takas seçildiğinde takas hammadde bilgisi (ayar/gram) zorunludur." });
-            if (req.TakasHammadde.BirimMaliyet <= 0)
-                return BadRequest(new { error = "Takas için birim maliyet 0'dan büyük olmalıdır." });
+            var hasDetailedHurda = req.TakasHurdaItems?.Any(x => x.Gram > 0m) == true;
+            if (!hasDetailedHurda)
+            {
+                if (req.TakasHammadde is null)
+                    return BadRequest(new { error = "Takas seçildiğinde hurda bilgisi zorunludur." });
+                if (req.TakasHammadde.Gram <= 0 || string.IsNullOrWhiteSpace(req.TakasHammadde.Ayar))
+                    return BadRequest(new { error = "Takas hammadde bilgisi geçersiz (ayar/gram)." });
+                if (req.TakasHammadde.BirimMaliyet <= 0)
+                    return BadRequest(new { error = "Takas için birim maliyet 0'dan büyük olmalıdır." });
+            }
         }
         sale.PaymentType = payments.OrderByDescending(x => x.Amount).First().Method;
 
@@ -735,12 +739,77 @@ public sealed class SalesV2Controller : ControllerBase
                     ct);
             }
 
-            if (takasToplam > 0 && req.TakasHammadde is not null)
+            if (takasToplam > 0 && req.TakasHurdaItems is { Count: > 0 })
             {
-                var takasMusteriAdi = await _db.Customers.AsNoTracking()
-                    .Where(c => c.Id == sale.CustomerId!.Value && c.TenantId == tenantId && !c.IsDeleted)
-                    .Select(c => c.FullName)
-                    .FirstOrDefaultAsync(ct);
+                string? takasMusteriAdi = null;
+                if (sale.CustomerId.HasValue)
+                {
+                    takasMusteriAdi = await _db.Customers.AsNoTracking()
+                        .Where(c => c.Id == sale.CustomerId.Value && c.TenantId == tenantId && !c.IsDeleted)
+                        .Select(c => c.FullName)
+                        .FirstOrDefaultAsync(ct);
+                }
+                var satisNoKisa = sale.Id.ToString("N")[..8].ToUpperInvariant();
+                var takasNote = $"Takas hurda alis | Musteri: {(string.IsNullOrWhiteSpace(takasMusteriAdi) ? "-" : takasMusteriAdi)} | Satis No: {satisNoKisa}";
+
+                var scrapLines = req.TakasHurdaItems
+                    .Where(x => x.Gram > 0m)
+                    .Select(x => new CustomerScrapPurchaseLineDto(
+                        x.MalTanimi ?? "",
+                        x.Ayar ?? "",
+                        x.Milyem,
+                        x.Gram,
+                        x.BirimIscilikHas,
+                        x.OdenecekToplamHas,
+                        x.TutarTl))
+                    .ToList();
+
+                var takasScrap = await _scrap.RecordCustomerScrapPurchaseLinesAsync(
+                    tenantId,
+                    sale.BranchId,
+                    sale.UserId,
+                    sale.CustomerId,
+                    scrapLines,
+                    (int)kuyumcu_domain.Enums.PurchasePaymentMethod.Emanet,
+                    takasNote,
+                    ct);
+                if (!takasScrap.ok)
+                    return BadRequest(new { error = takasScrap.error ?? "Takas hurdası kaydedilemedi." });
+
+                foreach (var line in req.TakasHurdaItems.Where(x => x.Gram > 0m))
+                {
+                    var ayar = (line.Ayar ?? "").Trim().ToUpperInvariant();
+                    if (string.IsNullOrWhiteSpace(ayar)) continue;
+                    var unitCost = line.Gram > 0m ? Math.Round(line.TutarTl / line.Gram, 6, MidpointRounding.AwayFromZero) : 0m;
+                    var depo = await _db.DepoStoklar
+                        .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == sale.BranchId && x.Ayar == ayar && !x.IsDeleted, ct);
+                    if (depo is null)
+                    {
+                        depo = new DepoStok
+                        {
+                            TenantId = tenantId,
+                            BranchId = sale.BranchId,
+                            Ayar = ayar,
+                            TotalGram = 0m,
+                            BarcodedGram = 0m,
+                            UnbarcodedGram = 0m,
+                            OrtalamaMaliyet = unitCost
+                        };
+                        _db.DepoStoklar.Add(depo);
+                    }
+                    depo.Add(line.Gram, unitCost);
+                }
+            }
+            else if (takasToplam > 0 && req.TakasHammadde is not null)
+            {
+                string? takasMusteriAdi = null;
+                if (sale.CustomerId.HasValue)
+                {
+                    takasMusteriAdi = await _db.Customers.AsNoTracking()
+                        .Where(c => c.Id == sale.CustomerId.Value && c.TenantId == tenantId && !c.IsDeleted)
+                        .Select(c => c.FullName)
+                        .FirstOrDefaultAsync(ct);
+                }
                 var satisNoKisa = sale.Id.ToString("N")[..8].ToUpperInvariant();
                 var takasNote = $"Takas hurda alis | Musteri: {(string.IsNullOrWhiteSpace(takasMusteriAdi) ? "-" : takasMusteriAdi)} | Satis No: {satisNoKisa}";
 
@@ -749,7 +818,7 @@ public sealed class SalesV2Controller : ControllerBase
                     tenantId,
                     sale.BranchId,
                     sale.UserId,
-                    sale.CustomerId!.Value,
+                    sale.CustomerId,
                     req.TakasHammadde.Ayar,
                     req.TakasHammadde.Gram,
                     req.TakasHammadde.BirimMaliyet,

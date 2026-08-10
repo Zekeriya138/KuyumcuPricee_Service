@@ -42,6 +42,7 @@ public static class BankImportStatuses
     public const string NoCustomerMatch = "NoCustomerMatch";
     public const string Rejected = "Rejected";
     public const string Skipped = "Skipped";
+    public const string AutoSendQueued = "AutoSendQueued";
 }
 
 /// <summary>Şube bazlı Vomsis banka sync worker ayarları (WPF'ten yönetilir).</summary>
@@ -58,4 +59,22 @@ public class BankSyncProfile : Entity, ITenantScoped
     /// <summary>Virgülle ayrılmış Vomsis hesap id listesi (örn. 46).</summary>
     public string AllowedAccountIds { get; set; } = "46";
     public int LookbackDays { get; set; } = 7;
+
+    /// <summary>WPF/canlı API manuel çekim talebi — VM worker ERP'den okur.</summary>
+    public DateTime? ManualSyncRequestedUtc { get; set; }
+
+    public DateTime? LastWorkerSyncUtc { get; set; }
+    public int? LastWorkerSyncFetched { get; set; }
+    public int? LastWorkerSyncImported { get; set; }
+    public string? LastWorkerSyncMessage { get; set; }
+
+    /// <summary>Gelen havalelerde eşik üstü otomatik e-Fatura/e-Arşiv gönderimi.</summary>
+    public bool AutoInstructionIncomingEnabled { get; set; }
+
+    public decimal? AutoInstructionIncomingMinAmount { get; set; }
+
+    /// <summary>Giden havalelerde eşik üstü otomatik gider pusulası gönderimi.</summary>
+    public bool AutoInstructionOutgoingEnabled { get; set; }
+
+    public decimal? AutoInstructionOutgoingMinAmount { get; set; }
 }

@@ -55,6 +55,35 @@ public sealed class ErpImportClient
             result?.Received, result?.Imported, result?.DraftCreated, result?.PendingReview);
         return result;
     }
+
+    public async Task CompleteManualSyncAsync(VomsisSyncRunResult result, CancellationToken ct)
+    {
+        if (_remote is null)
+            throw new InvalidOperationException("ERP import istemcisi yapılandırılmadı.");
+
+        var payload = new ErpSyncCompleteRequest
+        {
+            BranchId = _remote.BranchId,
+            FetchedFromVomsis = result.FetchedFromVomsis,
+            Imported = result.Imported,
+            SummaryMessage = result.SummaryMessage
+        };
+
+        using var resp = await _http.PostAsJsonAsync("api/bank-sync/vomsis/sync-complete", payload, ct);
+        if (!resp.IsSuccessStatusCode)
+        {
+            var body = await resp.Content.ReadAsStringAsync(ct);
+            _logger.LogWarning("Manuel sync tamamlama HTTP {(Code)}: {Body}", (int)resp.StatusCode, body);
+        }
+    }
+}
+
+public sealed class ErpSyncCompleteRequest
+{
+    public Guid BranchId { get; set; }
+    public int FetchedFromVomsis { get; set; }
+    public int Imported { get; set; }
+    public string? SummaryMessage { get; set; }
 }
 
 public sealed class ErpImportRequest
@@ -74,6 +103,7 @@ public sealed class ErpImportTransaction
     public string? Description { get; set; }
     public DateTime? TransactionDateUtc { get; set; }
     public string? SenderName { get; set; }
+    public string? SenderTitle { get; set; }
     public string? SenderTaxNo { get; set; }
     public string? SenderIban { get; set; }
 }
@@ -104,10 +134,25 @@ public static class VomsisTransactionMapper
             Type = tx.Type,
             Description = tx.Description,
             TransactionDateUtc = ParseSystemDate(tx.SystemDate),
-            SenderName = Coalesce(tx.SenderName, tx.SenderTitle),
-            SenderTaxNo = Coalesce(tx.SenderTaxno, tx.PayerTaxNo),
+            SenderName = Coalesce(tx.RelatedTitle, tx.IlgiliUnvan, tx.SenderName)?.Trim(),
+            SenderTitle = Coalesce(tx.RelatedTitle, tx.IlgiliUnvan, tx.SenderTitle)?.Trim(),
+            SenderTaxNo = ResolveTaxNo(tx.SenderTaxno, tx.PayerTaxNo, tx.RelatedVkn, tx.IlgiliVkn, tx.ReceiverTaxno, tx.ReceiverTaxNoAlt),
             SenderIban = tx.SenderIban
         };
+    }
+
+    private static string? ResolveTaxNo(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                continue;
+            var digits = new string(value.Where(char.IsDigit).ToArray());
+            if (digits.Length is 10 or 11)
+                return digits;
+        }
+
+        return null;
     }
 
     private static string NormalizeCurrency(string? fecName)

@@ -45,7 +45,8 @@ public sealed class CustomerTransactionsController : ControllerBase
         decimal? TargetUnitTlRate = null,
         decimal? TargetAmount = null,
         List<ZiynetUrunStokReq>? ZiynetUrunStokItems = null,
-        string? SourceLedgerSide = null);
+        string? SourceLedgerSide = null,
+        string? TargetLedgerSide = null);
 
     [HttpPost("process")]
     public async Task<IActionResult> Process([FromBody] ProcessReq req, CancellationToken ct)
@@ -142,6 +143,8 @@ public sealed class CustomerTransactionsController : ControllerBase
         var (grossBorc, grossAlacak) = CustomerFinanceHelper.ComputeGrossColumns(existingRows);
 
         var remaining = tgtAmt;
+        var noteBase = req.Description;
+        var storeCrossUnit = req.IsConvertEnabled && !string.Equals(src, tgt, StringComparison.OrdinalIgnoreCase);
         if (txType == "PAYMENT")
         {
             // Ödeme: önce alacak sütunundan düş, kalan borca yaz.
@@ -149,13 +152,15 @@ public sealed class CustomerTransactionsController : ControllerBase
             if (offsetAlacak > 0m)
             {
                 AddDovizSettlementTransaction(tenantId, req.CustomerId, branchId, tgt, offsetAlacak, tgtRate,
-                    CustomerFinanceHelper.RefSettleAlacak, -1, "Odeme", req.Description, txDate, batchId);
+                    CustomerFinanceHelper.RefSettleAlacak, -1, "Odeme", noteBase, txDate, batchId,
+                    storeCrossUnit ? src : null, storeCrossUnit ? srcAmt : 0m, storeCrossUnit ? tgtAmt : 0m);
                 remaining -= offsetAlacak;
             }
             if (remaining > 0m)
             {
                 AddDovizSettlementTransaction(tenantId, req.CustomerId, branchId, tgt, remaining, tgtRate,
-                    "MANUAL", -1, "Borclu", req.Description, txDate, batchId);
+                    "MANUAL", -1, "Borclu", noteBase, txDate, batchId,
+                    storeCrossUnit ? src : null, storeCrossUnit ? srcAmt : 0m, storeCrossUnit ? tgtAmt : 0m);
             }
             ApplyCustomerBalanceDelta(bal, tgt, -tgtAmt);
         }
@@ -166,13 +171,15 @@ public sealed class CustomerTransactionsController : ControllerBase
             if (offsetBorc > 0m)
             {
                 AddDovizSettlementTransaction(tenantId, req.CustomerId, branchId, tgt, offsetBorc, tgtRate,
-                    CustomerFinanceHelper.RefSettleBorc, 1, "Tahsilat", req.Description, txDate, batchId);
+                    CustomerFinanceHelper.RefSettleBorc, 1, "Tahsilat", noteBase, txDate, batchId,
+                    storeCrossUnit ? src : null, storeCrossUnit ? srcAmt : 0m, storeCrossUnit ? tgtAmt : 0m);
                 remaining -= offsetBorc;
             }
             if (remaining > 0m)
             {
                 AddDovizSettlementTransaction(tenantId, req.CustomerId, branchId, tgt, remaining, tgtRate,
-                    "MANUAL", 1, "Alacakli", req.Description, txDate, batchId);
+                    "MANUAL", 1, "Alacakli", noteBase, txDate, batchId,
+                    storeCrossUnit ? src : null, storeCrossUnit ? srcAmt : 0m, storeCrossUnit ? tgtAmt : 0m);
             }
             ApplyCustomerBalanceDelta(bal, tgt, +tgtAmt);
         }
@@ -182,8 +189,16 @@ public sealed class CustomerTransactionsController : ControllerBase
 
     private void AddDovizSettlementTransaction(
         Guid tenantId, Guid customerId, Guid branchId, string unit, decimal quantity, decimal unitPriceTl,
-        string refType, int direction, string cariDurum, string? note, DateTime txDate, Guid batchId)
+        string refType, int direction, string cariDurum, string? note, DateTime txDate, Guid batchId,
+        string? crossSrcUnit = null, decimal crossSrcAmount = 0m, decimal crossTgtAmount = 0m)
     {
+        if (crossSrcAmount > 0m && crossTgtAmount > 0m
+            && !string.IsNullOrWhiteSpace(crossSrcUnit)
+            && !string.Equals(crossSrcUnit, unit, StringComparison.OrdinalIgnoreCase))
+        {
+            note = CariIslemKarsilikHelper.AppendCrossUnitNote(note, crossSrcAmount, crossSrcUnit, crossTgtAmount, unit);
+        }
+
         _db.CustomerTransactions.Add(new CustomerTransaction
         {
             TenantId = tenantId,
@@ -379,9 +394,34 @@ public sealed class CustomerTransactionsController : ControllerBase
             ? decimal.Round(req.TargetAmount.Value, 6, MidpointRounding.AwayFromZero)
             : decimal.Round((srcAmt * srcRate) / tgtRate, 6, MidpointRounding.AwayFromZero);
 
+        var targetLedgerSide = CustomerFinanceHelper.NormalizeLedgerSide(req.TargetLedgerSide);
+        if (string.IsNullOrEmpty(targetLedgerSide))
+            targetLedgerSide = ledgerSide;
+
+        var (tgtGrossBorc, tgtGrossAlacak) = await GetCustomerConversionGrossAsync(tenantId, req.CustomerId, branchId, tgtU, ct);
+        var targetIsOpposite = CustomerFinanceHelper.IsLedgerBorc(ledgerSide)
+            ? tgtGrossAlacak > 0m
+            : tgtGrossBorc > 0m;
+
+        if (targetIsOpposite)
+        {
+            if (CustomerFinanceHelper.IsLedgerAlacak(targetLedgerSide))
+            {
+                if (tgtGrossAlacak + 0.0005m < tgtAmt)
+                    throw new InvalidOperationException("Hedef alacak miktarı yetersiz.");
+            }
+            else if (tgtGrossBorc + 0.0005m < tgtAmt)
+            {
+                throw new InvalidOperationException("Hedef borç miktarı yetersiz.");
+            }
+        }
+
         var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
         ApplyCustomerConversionReduction(bal, tenantId, req.CustomerId, branchId, srcU, srcAmt, ledgerSide, srcRate, note, txDate, batchId);
-        ApplyCustomerConversionAddition(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, ledgerSide, tgtRate, note, txDate, batchId);
+        if (targetIsOpposite)
+            ApplyCustomerConversionReduction(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, targetLedgerSide, tgtRate, note, txDate, batchId);
+        else
+            ApplyCustomerConversionAddition(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, targetLedgerSide, tgtRate, note, txDate, batchId);
         bal.UpdatedAt = DateTime.UtcNow;
         _ = sourceBalance;
     }

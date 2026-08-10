@@ -10,6 +10,9 @@ public interface IBankSyncProfileService
     Task<BankSyncProfileDto> GetProfileAsync(Guid tenantId, Guid branchId, CancellationToken ct);
     Task<BankSyncProfileDto> SaveProfileAsync(Guid tenantId, SaveBankSyncProfileReq req, CancellationToken ct);
     Task<BankSyncWorkerConfigDto?> GetWorkerConfigAsync(Guid tenantId, Guid branchId, CancellationToken ct);
+    Task RequestManualSyncAsync(Guid tenantId, Guid branchId, CancellationToken ct);
+    Task CompleteManualSyncAsync(Guid tenantId, Guid branchId, BankSyncPullResult result, CancellationToken ct);
+    Task<BankSyncProfileDto> SaveAutoInstructionAsync(Guid tenantId, SaveBankAutoInstructionReq req, CancellationToken ct);
 }
 
 public sealed class BankSyncProfileDto
@@ -24,6 +27,21 @@ public sealed class BankSyncProfileDto
     public int PollIntervalMinutes { get; set; } = 5;
     public string AllowedAccountIds { get; set; } = "46";
     public int LookbackDays { get; set; } = 7;
+    public DateTime? ManualSyncRequestedUtc { get; set; }
+    public DateTime? LastWorkerSyncUtc { get; set; }
+    public int? LastWorkerSyncFetched { get; set; }
+    public int? LastWorkerSyncImported { get; set; }
+    public string? LastWorkerSyncMessage { get; set; }
+    public bool AutoInstructionIncomingEnabled { get; set; }
+    public decimal? AutoInstructionIncomingMinAmount { get; set; }
+    public bool AutoInstructionOutgoingEnabled { get; set; }
+    public decimal? AutoInstructionOutgoingMinAmount { get; set; }
+
+    public bool IsConfigured =>
+        HasVomsisAppSecret &&
+        !string.IsNullOrWhiteSpace(VomsisAppKey) &&
+        HasErpApiAppKey &&
+        !string.IsNullOrWhiteSpace(ErpApiBaseUrl);
 }
 
 public sealed class BankSyncWorkerConfigDto
@@ -38,6 +56,7 @@ public sealed class BankSyncWorkerConfigDto
     public int PollIntervalMinutes { get; set; } = 5;
     public int[] AllowedAccountIds { get; set; } = [];
     public int LookbackDays { get; set; } = 7;
+    public DateTime? ManualSyncRequestedUtc { get; set; }
 }
 
 public sealed class SaveBankSyncProfileReq
@@ -53,19 +72,31 @@ public sealed class SaveBankSyncProfileReq
     public int LookbackDays { get; set; } = 7;
 }
 
+public sealed class SaveBankAutoInstructionReq
+{
+    public Guid BranchId { get; set; }
+    public bool AutoInstructionIncomingEnabled { get; set; }
+    public decimal? AutoInstructionIncomingMinAmount { get; set; }
+    public bool AutoInstructionOutgoingEnabled { get; set; }
+    public decimal? AutoInstructionOutgoingMinAmount { get; set; }
+}
+
 public sealed class BankSyncProfileService : IBankSyncProfileService
 {
     private readonly AppDbContext _db;
     private readonly IConfiguration _config;
+    private readonly BankSyncSchemaEnsurer _schema;
 
-    public BankSyncProfileService(AppDbContext db, IConfiguration config)
+    public BankSyncProfileService(AppDbContext db, IConfiguration config, BankSyncSchemaEnsurer schema)
     {
         _db = db;
         _config = config;
+        _schema = schema;
     }
 
     public async Task<BankSyncProfileDto> GetProfileAsync(Guid tenantId, Guid branchId, CancellationToken ct)
     {
+        await _schema.EnsureAsync(ct);
         var profile = await _db.BankSyncProfiles
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId, ct);
@@ -88,6 +119,7 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
 
     public async Task<BankSyncProfileDto> SaveProfileAsync(Guid tenantId, SaveBankSyncProfileReq req, CancellationToken ct)
     {
+        await _schema.EnsureAsync(ct);
         if (req.BranchId == Guid.Empty)
             throw new InvalidOperationException("BranchId zorunludur.");
 
@@ -114,7 +146,7 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
             profile.ErpApiAppKey = req.ErpApiAppKey.Trim();
 
         profile.PollIntervalMinutes = Math.Clamp(req.PollIntervalMinutes, 1, 60);
-        profile.LookbackDays = Math.Clamp(req.LookbackDays, 1, 7);
+        profile.LookbackDays = Math.Clamp(req.LookbackDays, 1, 30);
         profile.AllowedAccountIds = NormalizeAccountIds(req.AllowedAccountIds);
 
         ApplyErpDefaults(profile, req);
@@ -145,6 +177,7 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
 
     public async Task<BankSyncWorkerConfigDto?> GetWorkerConfigAsync(Guid tenantId, Guid branchId, CancellationToken ct)
     {
+        await _schema.EnsureAsync(ct);
         var profile = await _db.BankSyncProfiles
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && x.IsEnabled, ct);
@@ -165,9 +198,71 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
             ErpApiBaseUrl = profile.ErpApiBaseUrl.TrimEnd('/'),
             ErpApiAppKey = profile.ErpApiAppKey,
             PollIntervalMinutes = Math.Clamp(profile.PollIntervalMinutes, 1, 60),
-            LookbackDays = Math.Clamp(profile.LookbackDays, 1, 7),
-            AllowedAccountIds = ParseAccountIds(profile.AllowedAccountIds)
+            LookbackDays = Math.Clamp(profile.LookbackDays, 1, 30),
+            AllowedAccountIds = ParseAccountIds(profile.AllowedAccountIds),
+            ManualSyncRequestedUtc = profile.ManualSyncRequestedUtc
         };
+    }
+
+    public async Task RequestManualSyncAsync(Guid tenantId, Guid branchId, CancellationToken ct)
+    {
+        await _schema.EnsureAsync(ct);
+        var profile = await _db.BankSyncProfiles
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct)
+            ?? throw new InvalidOperationException("Vomsis ayarları bulunamadı.");
+
+        profile.ManualSyncRequestedUtc = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task CompleteManualSyncAsync(Guid tenantId, Guid branchId, BankSyncPullResult result, CancellationToken ct)
+    {
+        await _schema.EnsureAsync(ct);
+        var profile = await _db.BankSyncProfiles
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
+        if (profile is null) return;
+
+        profile.ManualSyncRequestedUtc = null;
+        profile.LastWorkerSyncUtc = DateTime.UtcNow;
+        profile.LastWorkerSyncFetched = result.FetchedFromVomsis;
+        profile.LastWorkerSyncImported = result.Imported;
+        profile.LastWorkerSyncMessage = result.SummaryMessage;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task<BankSyncProfileDto> SaveAutoInstructionAsync(Guid tenantId, SaveBankAutoInstructionReq req, CancellationToken ct)
+    {
+        await _schema.EnsureAsync(ct);
+        if (req.BranchId == Guid.Empty)
+            throw new InvalidOperationException("BranchId zorunludur.");
+
+        if (req.AutoInstructionIncomingEnabled &&
+            (!req.AutoInstructionIncomingMinAmount.HasValue || req.AutoInstructionIncomingMinAmount.Value <= 0m))
+        {
+            throw new InvalidOperationException("Gelen havale otomatik gönderimi için minimum tutar (TL) zorunludur.");
+        }
+
+        if (req.AutoInstructionOutgoingEnabled &&
+            (!req.AutoInstructionOutgoingMinAmount.HasValue || req.AutoInstructionOutgoingMinAmount.Value <= 0m))
+        {
+            throw new InvalidOperationException("Giden havale otomatik gider pusulası için minimum tutar (TL) zorunludur.");
+        }
+
+        var profile = await _db.BankSyncProfiles
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == req.BranchId && !x.IsDeleted, ct)
+            ?? throw new InvalidOperationException("Vomsis ayarları bulunamadı. Önce Vomsis Ayarları sekmesinden kaydedin.");
+
+        profile.AutoInstructionIncomingEnabled = req.AutoInstructionIncomingEnabled;
+        profile.AutoInstructionIncomingMinAmount = req.AutoInstructionIncomingEnabled
+            ? decimal.Round(req.AutoInstructionIncomingMinAmount!.Value, 2, MidpointRounding.AwayFromZero)
+            : null;
+        profile.AutoInstructionOutgoingEnabled = req.AutoInstructionOutgoingEnabled;
+        profile.AutoInstructionOutgoingMinAmount = req.AutoInstructionOutgoingEnabled
+            ? decimal.Round(req.AutoInstructionOutgoingMinAmount!.Value, 2, MidpointRounding.AwayFromZero)
+            : null;
+
+        await _db.SaveChangesAsync(ct);
+        return ToDto(profile);
     }
 
     private void ApplyErpDefaults(BankSyncProfile profile, SaveBankSyncProfileReq req)
@@ -208,7 +303,16 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
         HasErpApiAppKey = !string.IsNullOrWhiteSpace(profile.ErpApiAppKey),
         PollIntervalMinutes = profile.PollIntervalMinutes,
         AllowedAccountIds = profile.AllowedAccountIds,
-        LookbackDays = profile.LookbackDays
+        LookbackDays = profile.LookbackDays,
+        ManualSyncRequestedUtc = profile.ManualSyncRequestedUtc,
+        LastWorkerSyncUtc = profile.LastWorkerSyncUtc,
+        LastWorkerSyncFetched = profile.LastWorkerSyncFetched,
+        LastWorkerSyncImported = profile.LastWorkerSyncImported,
+        LastWorkerSyncMessage = profile.LastWorkerSyncMessage,
+        AutoInstructionIncomingEnabled = profile.AutoInstructionIncomingEnabled,
+        AutoInstructionIncomingMinAmount = profile.AutoInstructionIncomingMinAmount,
+        AutoInstructionOutgoingEnabled = profile.AutoInstructionOutgoingEnabled,
+        AutoInstructionOutgoingMinAmount = profile.AutoInstructionOutgoingMinAmount
     };
 
     private static string NormalizeAccountIds(string? value)

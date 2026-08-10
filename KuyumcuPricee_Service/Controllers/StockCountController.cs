@@ -93,15 +93,37 @@ public sealed class StockCountController : ControllerBase
             return BadRequest(new { error = "Bu sayım oturumu kapalı." });
 
         // Yalnızca barkodlu tekil/özel ürünler taranır; ziynet (adetli) kamerayla sayılmaz.
+        // InventoryType null ise Tekil kabul edilir; doğrudan "!= Ziynet" karşılaştırması NULL satırları düşürür.
         var product = await _db.Products.AsNoTracking()
-            .Where(x => x.BranchId == branchId && !x.IsDeleted && x.Barcode == barcode && x.InventoryType != InventoryType.Ziynet)
-            .Select(x => new { x.Id, x.ProductCode, x.Name, x.IsSpecialProduct })
+            .Where(x => x.BranchId == branchId && !x.IsDeleted && x.Barcode == barcode
+                        && (x.InventoryType ?? InventoryType.Tekil) != InventoryType.Ziynet)
+            .Select(x => new { x.Id, x.ProductCode, x.Name, x.IsSpecialProduct, Stok = x.StokMiktari ?? 0 })
             .FirstOrDefaultAsync(ct);
+
+        if (product == null)
+        {
+            var tenantId = await ResolveTenantAsync(ct);
+            product = await _db.ProductItems.AsNoTracking()
+                .Where(pi => pi.TenantId == tenantId && pi.BranchId == branchId && !pi.IsDeleted && pi.IsInStock && pi.Barcode == barcode)
+                .Join(
+                    _db.Products.AsNoTracking().Where(p => p.BranchId == branchId && !p.IsDeleted
+                        && (p.InventoryType ?? InventoryType.Tekil) != InventoryType.Ziynet),
+                    pi => pi.ProductId,
+                    p => p.Id,
+                    (pi, p) => new { p.Id, p.ProductCode, p.Name, p.IsSpecialProduct, Stok = p.StokMiktari ?? 0 })
+                .FirstOrDefaultAsync(ct);
+        }
 
         var already = await _db.StockCountScans.AsNoTracking()
             .AnyAsync(s => s.SessionId == session.Id && s.Barcode == barcode, ct);
 
-        var status = already ? "Duplicate" : (product != null ? "Matched" : "Unknown");
+        // Satılmış özel ürün (adet 0) mağazada fiziksel olarak bulunmaz; sayılan değil "satılmış" olarak bildirilir.
+        var satilmisOzel = product != null && product.IsSpecialProduct && product.Stok <= 0;
+
+        var status = already ? "Duplicate"
+            : product == null ? "Unknown"
+            : satilmisOzel ? "Sold"
+            : "Matched";
         var (uid, uname) = CurrentUser();
 
         _db.StockCountScans.Add(new StockCountScan
@@ -149,9 +171,11 @@ public sealed class StockCountController : ControllerBase
             .FirstOrDefaultAsync(x => x.Id == id && x.BranchId == branchId, ct);
         if (session is null) return NotFound();
 
-        // Beklenen = barkodlu tekil + özel ürünler (ziynet hariç). Ziynet ayrıca onay listesi olarak döner.
+        // Beklenen = barkodlu tekil + stokta olan özel ürünler (ziynet hariç). Ziynet ayrıca onay listesi olarak döner.
         var expected = await _db.Products.AsNoTracking()
-            .Where(x => x.BranchId == branchId && !x.IsDeleted && x.Barcode != null && x.Barcode != "" && x.InventoryType != InventoryType.Ziynet)
+            .Where(x => x.BranchId == branchId && !x.IsDeleted && x.Barcode != null && x.Barcode != ""
+                        && (x.InventoryType ?? InventoryType.Tekil) != InventoryType.Ziynet
+                        && (!x.IsSpecialProduct || (x.StokMiktari ?? 0) > 0))
             .Select(x => new { x.ProductCode, Name = x.Name, Barcode = x.Barcode!, x.IsSpecialProduct })
             .ToListAsync(ct);
 
@@ -246,7 +270,9 @@ public sealed class StockCountController : ControllerBase
     private async Task<int> ExpectedBarcodeCountAsync(Guid branchId, CancellationToken ct)
     {
         return await _db.Products.AsNoTracking()
-            .Where(x => x.BranchId == branchId && !x.IsDeleted && x.Barcode != null && x.Barcode != "" && x.InventoryType != InventoryType.Ziynet)
+            .Where(x => x.BranchId == branchId && !x.IsDeleted && x.Barcode != null && x.Barcode != ""
+                        && (x.InventoryType ?? InventoryType.Tekil) != InventoryType.Ziynet
+                        && (!x.IsSpecialProduct || (x.StokMiktari ?? 0) > 0))
             .Select(x => x.Barcode)
             .Distinct()
             .CountAsync(ct);

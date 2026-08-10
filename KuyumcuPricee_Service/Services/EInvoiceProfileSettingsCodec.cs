@@ -17,6 +17,7 @@ public sealed class EInvoiceProfileSettings
     public decimal? AutoDraftMinTotal { get; set; }
     public decimal? AutoDraftMaxTotal { get; set; }
     public List<WorkmanshipRuleSetting> WorkmanshipRules { get; set; } = new();
+    public Dictionary<string, int> SeriesLastSerial { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 public sealed class WorkmanshipRuleSetting
@@ -104,6 +105,9 @@ public static class EInvoiceProfileSettingsCodec
                     case "wr":
                         settings.WorkmanshipRules = DecodeWorkmanshipRules(value);
                         break;
+                    case "ss":
+                        settings.SeriesLastSerial = DecodeSeriesLastSerial(value);
+                        break;
                 }
             }
         }
@@ -144,7 +148,80 @@ public static class EInvoiceProfileSettingsCodec
             $"pm={string.Join(",", normalizedPayments)}",
             $"mn={minText}",
             $"mx={maxText}",
-            $"wr={EncodeWorkmanshipRules(settings.WorkmanshipRules)}");
+            $"wr={EncodeWorkmanshipRules(settings.WorkmanshipRules)}",
+            $"ss={EncodeSeriesLastSerial(settings.SeriesLastSerial)}");
+    }
+
+    public static int GetSeriesLastSerial(EInvoiceProfileSettings settings, string? prefix, int year)
+    {
+        if (settings.SeriesLastSerial.Count == 0 || year <= 0)
+            return 0;
+
+        var key = BuildSeriesSerialKey(prefix, year);
+        return settings.SeriesLastSerial.TryGetValue(key, out var serial) ? serial : 0;
+    }
+
+    public static void SetSeriesLastSerial(EInvoiceProfileSettings settings, string? invoiceNumber)
+    {
+        if (!kuyumcu_application.GibInvoiceNumber.TryExtractSerialParts(invoiceNumber, out var prefix, out var year, out var serial))
+            return;
+
+        var key = BuildSeriesSerialKey(prefix, year);
+        if (!settings.SeriesLastSerial.TryGetValue(key, out var existing) || serial > existing)
+            settings.SeriesLastSerial[key] = serial;
+    }
+
+    private static string BuildSeriesSerialKey(string? prefix, int year)
+        => $"{NormalizeSeriesPrefix(prefix)}{year}";
+
+    private static string NormalizeSeriesPrefix(string? prefix)
+    {
+        if (string.IsNullOrWhiteSpace(prefix))
+            return "AUR";
+
+        var compact = new string(prefix.Where(char.IsLetter).Select(char.ToUpperInvariant).ToArray());
+        if (compact.Length >= 3)
+            return compact[..3];
+
+        return compact.PadRight(3, 'X');
+    }
+
+    private static Dictionary<string, int> DecodeSeriesLastSerial(string value)
+    {
+        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(value))
+            return map;
+
+        foreach (var segment in value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var idx = segment.IndexOf('=');
+            if (idx <= 0 || idx >= segment.Length - 1)
+                continue;
+
+            var key = segment[..idx].Trim();
+            if (key.Length != 7)
+                continue;
+
+            if (int.TryParse(segment[(idx + 1)..].Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var serial)
+                && serial > 0)
+            {
+                map[key] = serial;
+            }
+        }
+
+        return map;
+    }
+
+    private static string EncodeSeriesLastSerial(Dictionary<string, int>? values)
+    {
+        if (values is null || values.Count == 0)
+            return string.Empty;
+
+        return string.Join(",",
+            values
+                .Where(x => x.Value > 0 && x.Key.Length == 7)
+                .OrderBy(x => x.Key, StringComparer.OrdinalIgnoreCase)
+                .Select(x => $"{x.Key}={x.Value.ToString(CultureInfo.InvariantCulture)}"));
     }
 
     public static List<WorkmanshipRuleSetting> NormalizeWorkmanshipRules(IEnumerable<WorkmanshipRuleSetting>? rules)
@@ -183,6 +260,37 @@ public static class EInvoiceProfileSettingsCodec
             .Where(x => string.Equals(NormalizeWorkmanshipProductType(x.ProductType), normalizedType, StringComparison.OrdinalIgnoreCase))
             .Where(x => string.IsNullOrWhiteSpace(x.Karat) ||
                         string.Equals(NormalizeWorkmanshipSelector(normalizedType, x.Karat), normalizedSelector, StringComparison.OrdinalIgnoreCase))
+            .FirstOrDefault(x => value >= x.MinTotal && value <= x.MaxTotal);
+    }
+
+    /// <summary>
+    /// Tahsilat (banka/havale) taslakları için işçilik kuralı: önce Tahsilat/Has altın, yoksa İşçilikli ayar kuralları.
+    /// </summary>
+    public static WorkmanshipRuleSetting? ResolveCollectionWorkmanshipRule(
+        IReadOnlyCollection<WorkmanshipRuleSetting>? rules,
+        decimal amount)
+    {
+        var tahsilat = ResolveWorkmanshipRule(
+            rules,
+            WorkmanshipProductTypeCollection,
+            WorkmanshipCollectionSelector,
+            amount);
+        if (tahsilat is not null)
+            return tahsilat;
+
+        foreach (var karat in new[] { "24K", "22K", "18K", "14K", "8K" })
+        {
+            var crafted = ResolveWorkmanshipRule(rules, WorkmanshipProductTypeCrafted, karat, amount);
+            if (crafted is not null)
+                return crafted;
+        }
+
+        var value = Math.Round(amount, 2, MidpointRounding.AwayFromZero);
+        return NormalizeWorkmanshipRules(rules)
+            .Where(x => string.Equals(
+                NormalizeWorkmanshipProductType(x.ProductType),
+                WorkmanshipProductTypeCrafted,
+                StringComparison.OrdinalIgnoreCase))
             .FirstOrDefault(x => value >= x.MinTotal && value <= x.MaxTotal);
     }
 

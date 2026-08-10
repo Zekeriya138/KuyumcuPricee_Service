@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Security;
 using System.Text;
@@ -11,6 +13,10 @@ namespace kuyumcu_infrastructure.Services;
 public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
 {
     private static readonly ConcurrentDictionary<string, (string SessionId, DateTime ExpiresAtUtc)> SessionCache = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, (DateTime ExpiresAtUtc, List<GibUserRow> Rows)> GibUserListCache = new(StringComparer.Ordinal);
+    /// <summary>EDM GetUserListBinary en fazla 240 dakikada bir indirilebilir.</summary>
+    private static readonly TimeSpan GibUserListCacheTtl = TimeSpan.FromMinutes(235);
+    private static readonly TimeSpan GibUserListDownloadMinInterval = TimeSpan.FromMinutes(235);
     private readonly HttpClient _http;
     private readonly IConfiguration _cfg;
 
@@ -51,8 +57,13 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
             var receiverAlias = ReadJson(request.PayloadJson, "receiverAlias", "buyerAlias", "buyerEmail");
             var fromAlias = ReadJson(request.PayloadJson, "fromAlias", "senderAlias");
             var toAlias = ReadJson(request.PayloadJson, "toAlias", "receiverAlias", "buyerEmail");
-            var isEArchive = string.Equals(request.DocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase);
+            var payloadDocumentType = ReadJson(request.PayloadJson, "documentType");
+            var effectiveDocumentType = ResolveSendDocumentType(request.DocumentType, payloadDocumentType);
+            var isEArchive = string.Equals(effectiveDocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase);
             var content = ReadJson(request.PayloadJson, "ublBase64");
+            var soleProprietorName = ReadJson(request.PayloadJson, "soleProprietorName", "SoleProprietorName");
+            if (!string.IsNullOrWhiteSpace(content))
+                content = EdmUblSchemaNormalizer.NormalizeBase64Ubl(content, request.Currency, soleProprietorName, effectiveDocumentType);
 
             senderVkn = string.IsNullOrWhiteSpace(senderVkn) ? _cfg["EInvoice:Edm:CompanyTaxNumber"] : senderVkn;
             receiverVkn = string.IsNullOrWhiteSpace(receiverVkn) ? request.BuyerTaxNumber : receiverVkn;
@@ -109,7 +120,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
             var xml = await SendSoapAsync("SendInvoice", BuildBody(session), ct);
             // Bayat/expire olmuş oturum nedeniyle EDM "Kullanıcı Bulunamadı / oturum" hatası dönerse
             // önbelleği yok sayıp taze login ile bir kez daha gönder.
-            if (IsSessionFault(xml))
+            if (IsRetriableEdmSessionFault(xml))
             {
                 session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
                 xml = await SendSoapAsync("SendInvoice", BuildBody(session), ct);
@@ -158,7 +169,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
 </s:Envelope>";
 
             var xml = await SendSoapAsync("GetInvoiceStatus", BuildBody(session), ct);
-            if (IsSessionFault(xml))
+            if (IsRetriableEdmSessionFault(xml))
             {
                 session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
                 xml = await SendSoapAsync("GetInvoiceStatus", BuildBody(session), ct);
@@ -189,7 +200,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
 </s:Envelope>";
 
             var xml = await SendSoapAsync("CancelInvoice", BuildBody(session), ct);
-            if (IsSessionFault(xml))
+            if (IsRetriableEdmSessionFault(xml))
             {
                 session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
                 xml = await SendSoapAsync("CancelInvoice", BuildBody(session), ct);
@@ -487,38 +498,48 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
         }
     }
 
-    public async Task<EdmTaxpayerQueryResult> QueryTaxpayerAsync(string? username, string? password, string taxNumber, CancellationToken ct)
+    public async Task<IntegratorTaxpayerQueryResult> QueryTaxpayerAsync(string? username, string? password, string taxNumber, CancellationToken ct)
     {
         var normalizedTaxNo = new string((taxNumber ?? string.Empty).Where(char.IsDigit).ToArray());
         if (normalizedTaxNo.Length != 10 && normalizedTaxNo.Length != 11)
-            return new EdmTaxpayerQueryResult(false, null, null, null, null, "TCKN/VKN 10 veya 11 hane olmalıdır.");
+            return new IntegratorTaxpayerQueryResult(false, null, null, null, null, "TCKN/VKN 10 veya 11 hane olmalıdır.");
 
         try
         {
-            var session = await LoginAsync(username, password, ct, forceFresh: true);
+            var session = await LoginAsync(username, password, ct);
             if (string.IsNullOrWhiteSpace(session))
-                return new EdmTaxpayerQueryResult(false, null, null, null, null, "EDM oturumu açılamadı.");
+                return new IntegratorTaxpayerQueryResult(false, null, null, null, null, "EDM oturumu açılamadı.");
 
-            var xml = await ExecuteCheckUserSoapAsync(session, normalizedTaxNo, ct);
-            if (IsSessionFault(xml) || IsAuthFault(xml))
+            var xml = await ExecuteCheckUserSoapAsync(session, normalizedTaxNo, null, ct);
+            if (IsRetriableEdmSessionFault(xml))
             {
                 session = await LoginAsync(username, password, ct, forceFresh: true);
-                xml = await ExecuteCheckUserSoapAsync(session, normalizedTaxNo, ct);
+                xml = await ExecuteCheckUserSoapAsync(session, normalizedTaxNo, null, ct);
             }
 
             if (HasSoapFault(xml))
             {
                 var shortErr = GetXmlValue(xml, "ERROR_SHORT_DES") ?? GetXmlValue(xml, "faultstring") ?? "EDM SOAP fault.";
-                return new EdmTaxpayerQueryResult(false, null, null, null, xml, shortErr);
+                return new IntegratorTaxpayerQueryResult(false, null, null, null, xml, shortErr);
             }
 
             var users = ParseGibUsers(xml);
-            var pkUser = users.FirstOrDefault(u => string.Equals(u.Unit, "PK", StringComparison.OrdinalIgnoreCase))
-                         ?? users.FirstOrDefault(u => !string.IsNullOrWhiteSpace(u.Alias));
-            var titleUser = users.FirstOrDefault(u => !string.IsNullOrWhiteSpace(u.Title)) ?? pkUser ?? users.FirstOrDefault();
-            var title = titleUser?.Title?.Trim();
-            var isEInvoice = pkUser is not null;
-            var receiverAlias = pkUser?.Alias?.Trim();
+            var (title, receiverAlias, isEInvoice) = ResolveGibUserIdentity(users);
+
+            if (users.Count == 0 || string.IsNullOrWhiteSpace(receiverAlias) || string.IsNullOrWhiteSpace(title))
+            {
+                var fromGibList = await TryResolveTaxpayerFromGibListAsync(username, password, normalizedTaxNo, ct);
+                if (fromGibList is not null)
+                {
+                    if (string.IsNullOrWhiteSpace(title))
+                        title = fromGibList.Value.Title;
+                    if (string.IsNullOrWhiteSpace(receiverAlias))
+                        receiverAlias = fromGibList.Value.ReceiverAlias;
+                    if (!isEInvoice && fromGibList.Value.IsEInvoiceTaxpayer)
+                        isEInvoice = true;
+                }
+            }
+
             string message;
             if (users.Count == 0)
             {
@@ -545,7 +566,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
                 message = "EDM üzerinden mükellef bilgileri alındı.";
             }
 
-            return new EdmTaxpayerQueryResult(
+            return new IntegratorTaxpayerQueryResult(
                 true,
                 isEInvoice,
                 title,
@@ -555,24 +576,818 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
         }
         catch (Exception ex)
         {
-            return new EdmTaxpayerQueryResult(false, null, null, null, null, NormalizeEdmErrorMessage(ex.Message));
+            return new IntegratorTaxpayerQueryResult(false, null, null, null, null, NormalizeEdmErrorMessage(ex.Message));
         }
     }
 
-    private async Task<string> ExecuteCheckUserSoapAsync(string session, string normalizedTaxNo, CancellationToken ct)
+    /// <summary>
+    /// EDM CheckUser çağrısı. GİB kullanıcı kaydı hem IDENTIFIER (TCKN/VKN) hem TITLE (ünvan) ile aranabilir.
+    /// </summary>
+    private async Task<string> ExecuteCheckUserSoapAsync(
+        string session,
+        string? normalizedTaxNo,
+        string? title,
+        CancellationToken ct)
     {
+        var criteria = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(normalizedTaxNo))
+            criteria.Append($"<IDENTIFIER>{XmlEscape(normalizedTaxNo)}</IDENTIFIER>");
+        if (!string.IsNullOrWhiteSpace(title))
+            criteria.Append($"<TITLE>{XmlEscape(NormalizeIntegratorTitle(title))}</TITLE>");
+
         var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
     <s:Body>
         <CheckUserRequest xmlns=""http://tempuri.org/"">
             {BuildRequestHeaderXml(session, "Mükellef sorgu")}
             <USER xmlns="""">
-                <IDENTIFIER>{XmlEscape(normalizedTaxNo)}</IDENTIFIER>
+                {criteria}
             </USER>
         </CheckUserRequest>
     </s:Body>
 </s:Envelope>";
 
-        return await SendSoapAsync("CheckUser", body, ct);
+        return await SendSoapWithActionFallbackAsync("CheckUser", body, ct);
+    }
+
+    public async Task<IntegratorTaxpayerSearchResult> SearchTaxpayersByTitleAsync(
+        string? username,
+        string? password,
+        string title,
+        CancellationToken ct)
+    {
+        var normalizedTitle = (title ?? string.Empty).Trim();
+        if (normalizedTitle.Length < 3)
+            return IntegratorTaxpayerSearchResult.Fail("Ünvan/ad soyad aramasi için en az 3 karakter girin.");
+
+        try
+        {
+            var session = await LoginAsync(username, password, ct);
+            if (string.IsNullOrWhiteSpace(session))
+                return IntegratorTaxpayerSearchResult.Fail("EDM oturumu açılamadı.");
+
+            // 1) CheckUser TITLE — anlık sorgu, indirme limiti yok (portal autocomplete'in SOAP karşılığı).
+            var merged = new Dictionary<string, IntegratorTaxpayerCandidate>(StringComparer.Ordinal);
+            string? lastXml = null;
+            foreach (var variant in BuildTitleSearchVariants(normalizedTitle))
+            {
+                ct.ThrowIfCancellationRequested();
+                var xml = await ExecuteCheckUserSoapAsync(session, null, variant, ct);
+                if (IsRetriableEdmSessionFault(xml))
+                {
+                    session = await LoginAsync(username, password, ct, forceFresh: true);
+                    xml = await ExecuteCheckUserSoapAsync(session, null, variant, ct);
+                }
+
+                if (HasSoapFault(xml))
+                    continue;
+
+                lastXml = xml;
+                foreach (var candidate in BuildTaxpayerCandidates(xml, normalizedTitle))
+                    merged[candidate.TaxNo] = candidate;
+            }
+
+            if (merged.Count > 0)
+            {
+                var ordered = merged.Values
+                    .OrderByDescending(c => TitleSimilarity(c.Title, normalizedTitle))
+                    .ThenByDescending(c => c.IsEInvoiceTaxpayer)
+                    .ThenBy(c => c.Title ?? c.TaxNo, StringComparer.CurrentCultureIgnoreCase)
+                    .Take(MaxTitleSearchCandidates)
+                    .ToList();
+                return IntegratorTaxpayerSearchResult.Ok(
+                    ordered,
+                    lastXml,
+                    $"EDM ünvan aramasında {ordered.Count} kayıt bulundu.");
+            }
+
+            // 2) Önbellekteki GİB listesi — kısmi eşleşme (portal GİB sekmesi). İndirme limiti nedeniyle zorlanmaz.
+            var gibRows = await TryGetGibUserListAsync(username, password, allowDownload: true, ct);
+            if (gibRows is { Count: > 0 })
+            {
+                var fromCache = BuildTaxpayerCandidatesFromRows(gibRows, normalizedTitle);
+                if (fromCache.Count > 0)
+                {
+                    return IntegratorTaxpayerSearchResult.Ok(
+                        fromCache,
+                        null,
+                        $"EDM GİB listesinde {fromCache.Count} kayıt bulundu.");
+                }
+            }
+
+            return IntegratorTaxpayerSearchResult.Ok(
+                Array.Empty<IntegratorTaxpayerCandidate>(),
+                lastXml,
+                $"EDM'de \"{normalizedTitle}\" ile kayıt bulunamadı. VKN/TCKN biliyorsanız numara ile sorgulayın.");
+        }
+        catch (Exception ex)
+        {
+            return IntegratorTaxpayerSearchResult.Fail(NormalizeEdmErrorMessage(ex.Message));
+        }
+    }
+
+    /// <summary>
+    /// Önbellekteki GİB PK listesinden yerel ünvan araması. Canlı aramada indirme zorlanmaz.
+    /// </summary>
+    private async Task<IntegratorTaxpayerSearchResult> SearchTaxpayersByTitleViaGibListAsync(
+        string? username,
+        string? password,
+        string normalizedTitle,
+        CancellationToken ct)
+    {
+        var gibRows = await TryGetGibUserListAsync(username, password, allowDownload: true, ct);
+        if (gibRows is null || gibRows.Count == 0)
+        {
+            return IntegratorTaxpayerSearchResult.Ok(
+                Array.Empty<IntegratorTaxpayerCandidate>(),
+                null,
+                null);
+        }
+
+        var candidates = BuildTaxpayerCandidatesFromRows(gibRows, normalizedTitle);
+        if (candidates.Count == 0)
+        {
+            return IntegratorTaxpayerSearchResult.Ok(
+                candidates,
+                null,
+                $"EDM GİB listesinde \"{normalizedTitle}\" ile eşleşen kayıt bulunamadı.");
+        }
+
+        return IntegratorTaxpayerSearchResult.Ok(
+            candidates,
+            null,
+            $"EDM GİB listesinde {candidates.Count} kayıt bulundu.");
+    }
+
+    private async Task<List<GibUserRow>?> TryGetGibUserListAsync(
+        string? username,
+        string? password,
+        bool allowDownload,
+        CancellationToken ct)
+    {
+        var cacheKey = (username ?? string.Empty).Trim().ToLowerInvariant();
+        if (GibUserListCache.TryGetValue(cacheKey, out var memoryCached) && memoryCached.ExpiresAtUtc > DateTime.UtcNow)
+            return memoryCached.Rows;
+
+        var diskRows = TryLoadGibUserListFromDisk(cacheKey, allowExpired: false);
+        if (diskRows is { Count: > 0 })
+        {
+            StoreGibUserListInMemory(cacheKey, diskRows);
+            return diskRows;
+        }
+
+        if (!allowDownload)
+            return TryLoadGibUserListFromDisk(cacheKey, allowExpired: true);
+
+        try
+        {
+            var downloaded = await DownloadGibUserListAsync(username, password, cacheKey, ct);
+            if (downloaded is { Count: > 0 })
+                return downloaded;
+        }
+        catch (Exception ex) when (IsGibListRateLimitError(ex.Message))
+        {
+            RecordGibBinaryRateLimit(cacheKey);
+        }
+        catch
+        {
+            // GetUserList / binary hatasında disk önbelleğine düş.
+        }
+
+        return TryLoadGibUserListFromDisk(cacheKey, allowExpired: true);
+    }
+
+    public async Task WarmTaxpayerSearchCacheAsync(string? username, string? password, CancellationToken ct)
+    {
+        var cacheKey = (username ?? string.Empty).Trim().ToLowerInvariant();
+        if (GibUserListCache.TryGetValue(cacheKey, out var cached) && cached.ExpiresAtUtc > DateTime.UtcNow)
+            return;
+
+        if (TryLoadGibUserListFromDisk(cacheKey, allowExpired: false) is { Count: > 0 })
+            return;
+
+        try
+        {
+            await DownloadGibUserListAsync(username, password, cacheKey, ct);
+        }
+        catch (Exception ex) when (IsGibListRateLimitError(ex.Message))
+        {
+            RecordGibBinaryRateLimit(cacheKey);
+        }
+        catch
+        {
+            // Bağlantı testi / arka plan ısıtma sessizce başarısız olabilir.
+        }
+    }
+
+    private async Task<List<GibUserRow>> LoadCachedGibUserListAsync(string? username, string? password, CancellationToken ct)
+    {
+        var rows = await TryGetGibUserListAsync(username, password, allowDownload: true, ct);
+        if (rows is null || rows.Count == 0)
+            throw new InvalidOperationException("GIB listesi alınamadı veya boş döndü.");
+        return rows;
+    }
+
+    private async Task<List<GibUserRow>> DownloadGibUserListAsync(
+        string? username,
+        string? password,
+        string cacheKey,
+        CancellationToken ct)
+    {
+        var session = await LoginAsync(username, password, ct, forceFresh: true);
+        if (string.IsNullOrWhiteSpace(session))
+            throw new InvalidOperationException("EDM oturumu açılamadı.");
+
+        Exception? lastError = null;
+        List<GibUserRow>? rows = null;
+        string? rawXml = null;
+        var binaryAllowed = CanDownloadGibUserListBinary(cacheKey);
+
+        if (binaryAllowed)
+        {
+            foreach (var binaryType in new[] { "XML", "ZIP" })
+            {
+                try
+                {
+                    (rows, rawXml) = await TryLoadGibUserListBinaryAsync(session, binaryType, ct);
+                    if (rows.Count > 0)
+                        break;
+                }
+                catch (Exception ex) when (IsSessionErrorMessage(ex.Message) || IsAuthFault(ex.Message))
+                {
+                    lastError = ex;
+                    session = await LoginAsync(username, password, ct, forceFresh: true);
+                    try
+                    {
+                        (rows, rawXml) = await TryLoadGibUserListBinaryAsync(session, binaryType, ct);
+                        if (rows.Count > 0)
+                            break;
+                    }
+                    catch (Exception retryEx)
+                    {
+                        lastError = retryEx;
+                    }
+                }
+                catch (Exception ex) when (IsGibListRateLimitError(ex.Message))
+                {
+                    lastError = ex;
+                    RecordGibBinaryRateLimit(cacheKey);
+                    rows = null;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    lastError = ex;
+                }
+            }
+        }
+
+        if (rows is null || rows.Count == 0)
+        {
+            try
+            {
+                rows = await LoadGibUserListViaGetUserListAsync(session, ct);
+                rawXml = null;
+            }
+            catch (Exception ex) when (IsSessionErrorMessage(ex.Message) || IsAuthFault(ex.Message))
+            {
+                lastError = ex;
+                session = await LoginAsync(username, password, ct, forceFresh: true);
+                rows = await LoadGibUserListViaGetUserListAsync(session, ct);
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+        }
+
+        if (rows is null || rows.Count == 0)
+        {
+            var detail = lastError is null ? "GIB listesi boş döndü." : NormalizeEdmErrorMessage(lastError.Message);
+            throw new InvalidOperationException(detail);
+        }
+
+        SaveGibUserListToDisk(cacheKey, rawXml, rows);
+        StoreGibUserListInMemory(cacheKey, rows);
+        return rows;
+    }
+
+    private static void StoreGibUserListInMemory(string cacheKey, List<GibUserRow> rows)
+        => GibUserListCache[cacheKey] = (DateTime.UtcNow.Add(GibUserListCacheTtl), rows);
+
+    private static bool CanDownloadGibUserListBinary(string cacheKey)
+    {
+        var limitPath = GetGibListBinaryLimitFilePath(cacheKey);
+        if (!File.Exists(limitPath))
+            return true;
+
+        var text = File.ReadAllText(limitPath).Trim();
+        if (!DateTime.TryParse(text, null, System.Globalization.DateTimeStyles.RoundtripKind, out var limitedAtUtc))
+            return true;
+
+        return DateTime.UtcNow - limitedAtUtc.ToUniversalTime() >= GibUserListDownloadMinInterval;
+    }
+
+    private static void RecordGibBinaryRateLimit(string cacheKey)
+    {
+        try
+        {
+            File.WriteAllText(GetGibListBinaryLimitFilePath(cacheKey), DateTime.UtcNow.ToString("O"), Encoding.UTF8);
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private static string GetGibListBinaryLimitFilePath(string cacheKey)
+        => Path.Combine(GetGibListCacheDirectory(), SanitizeCacheKey(cacheKey) + ".gibusers.binarylimit");
+
+    private static bool CanDownloadGibUserList(string cacheKey) => CanDownloadGibUserListBinary(cacheKey);
+
+    private static bool IsGibListRateLimitError(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+
+        return message.Contains("240", StringComparison.Ordinal)
+               || message.Contains("dakikalık periyot", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("Gib UserList", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string GetGibListCacheDirectory()
+    {
+        var dir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Kuyumcu",
+            "EdmGibUserList");
+        Directory.CreateDirectory(dir);
+        return dir;
+    }
+
+    private static string SanitizeCacheKey(string cacheKey)
+    {
+        var safe = new string(cacheKey.Select(ch => Path.GetInvalidFileNameChars().Contains(ch) ? '_' : ch).ToArray());
+        return string.IsNullOrWhiteSpace(safe) ? "default" : safe;
+    }
+
+    private static string GetGibListDataFilePath(string cacheKey)
+        => Path.Combine(GetGibListCacheDirectory(), SanitizeCacheKey(cacheKey) + ".gibusers.xml");
+
+    private static string GetGibListMetaFilePath(string cacheKey)
+        => Path.Combine(GetGibListCacheDirectory(), SanitizeCacheKey(cacheKey) + ".gibusers.meta");
+
+    private static List<GibUserRow>? TryLoadGibUserListFromDisk(string cacheKey, bool allowExpired)
+    {
+        try
+        {
+            var dataPath = GetGibListDataFilePath(cacheKey);
+            if (!File.Exists(dataPath))
+                return null;
+
+            var metaPath = GetGibListMetaFilePath(cacheKey);
+            if (File.Exists(metaPath))
+            {
+                var metaText = File.ReadAllText(metaPath).Trim();
+                if (DateTime.TryParse(metaText, null, System.Globalization.DateTimeStyles.RoundtripKind, out var downloadedAtUtc))
+                {
+                    var age = DateTime.UtcNow - downloadedAtUtc.ToUniversalTime();
+                    if (age >= GibUserListCacheTtl && !allowExpired)
+                        return null;
+                }
+            }
+            else if (!allowExpired)
+            {
+                return null;
+            }
+
+            var xml = File.ReadAllText(dataPath);
+            var rows = ParseGibUsers(xml);
+            return rows.Count == 0 ? null : rows;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void SaveGibUserListToDisk(string cacheKey, string? rawXml, List<GibUserRow> rows)
+    {
+        try
+        {
+            var xml = rawXml;
+            if (string.IsNullOrWhiteSpace(xml))
+            {
+                var sb = new StringBuilder();
+                sb.Append("<GibUsers>");
+                foreach (var row in rows)
+                {
+                    sb.Append("<USER>");
+                    if (!string.IsNullOrWhiteSpace(row.Identifier))
+                        sb.Append($"<IDENTIFIER>{SecurityElement.Escape(row.Identifier)}</IDENTIFIER>");
+                    if (!string.IsNullOrWhiteSpace(row.Alias))
+                        sb.Append($"<ALIAS>{SecurityElement.Escape(row.Alias)}</ALIAS>");
+                    if (!string.IsNullOrWhiteSpace(row.Title))
+                        sb.Append($"<TITLE>{SecurityElement.Escape(row.Title)}</TITLE>");
+                    if (!string.IsNullOrWhiteSpace(row.Unit))
+                        sb.Append($"<UNIT>{SecurityElement.Escape(row.Unit)}</UNIT>");
+                    sb.Append("</USER>");
+                }
+                sb.Append("</GibUsers>");
+                xml = sb.ToString();
+            }
+
+            File.WriteAllText(GetGibListDataFilePath(cacheKey), xml, Encoding.UTF8);
+            File.WriteAllText(GetGibListMetaFilePath(cacheKey), DateTime.UtcNow.ToString("O"), Encoding.UTF8);
+        }
+        catch
+        {
+            // Önbellek yazılamazsa arama yine CheckUser ile devam eder.
+        }
+    }
+
+    private async Task<(List<GibUserRow> Rows, string? RawXml)> TryLoadGibUserListBinaryAsync(string session, string type, CancellationToken ct)
+    {
+        // Resmi EDM örneği yalnızca TYPE gönderir; UNIT=PK bazı hesaplarda "Sistem hatası" üretebiliyor.
+        var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+    <s:Body>
+        <GetUserListBinaryRequest xmlns=""http://tempuri.org/"">
+            {BuildRequestHeaderXml(session, "GIB kullanıcı listesi indir")}
+            <TYPE xmlns="""">{XmlEscape(type)}</TYPE>
+        </GetUserListBinaryRequest>
+    </s:Body>
+</s:Envelope>";
+
+        var xml = await SendSoapWithActionFallbackAsync("GetUserListBinary", body, ct);
+        EnsureEdmRequestSuccess(xml, "GetUserListBinary");
+        return ParseGibUsersFromBinarySoapResponse(xml);
+    }
+
+    private async Task<List<GibUserRow>> LoadGibUserListViaGetUserListAsync(string session, CancellationToken ct)
+    {
+        var merged = new List<GibUserRow>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var rangeStart = new DateTime(2010, 1, 1);
+        var rangeEnd = DateTime.UtcNow.Date;
+        var chunkMonths = 6;
+        const int maxChunks = 40;
+
+        for (var chunk = 0; chunk < maxChunks && rangeStart <= rangeEnd; chunk++)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            var chunkEnd = rangeStart.AddMonths(chunkMonths);
+            if (chunkEnd > rangeEnd)
+                chunkEnd = rangeEnd;
+
+            var body = $@"<s:Envelope xmlns:s=""http://schemas.xmlsoap.org/soap/envelope/"">
+    <s:Body>
+        <GetUserListRequest xmlns=""http://tempuri.org/"">
+            {BuildRequestHeaderXml(session, "GIB kullanıcı listesi sorgu")}
+            <REGISTER_TIME_START xmlns="""">{rangeStart:yyyy-MM-ddTHH:mm:ss}</REGISTER_TIME_START>
+            <REGISTER_TIME_END xmlns="""">{chunkEnd:yyyy-MM-ddT23:59:59}</REGISTER_TIME_END>
+            <REMOVED_ONLY xmlns="""">false</REMOVED_ONLY>
+            <UNIT xmlns="""">PK</UNIT>
+        </GetUserListRequest>
+    </s:Body>
+</s:Envelope>";
+
+            try
+            {
+                var xml = await SendSoapWithActionFallbackAsync("GetUserList", body, ct);
+                EnsureEdmRequestSuccess(xml, "GetUserList");
+
+                foreach (var row in ParseGibUsers(xml))
+                {
+                    var key = $"{row.Identifier}|{row.Alias}|{row.Unit}";
+                    if (seen.Add(key))
+                        merged.Add(row);
+                }
+            }
+            catch
+            {
+                // Kayıtsız dönem veya geçici hata — sonraki aralığa devam et.
+            }
+
+            rangeStart = chunkEnd.AddDays(1);
+        }
+
+        return merged;
+    }
+
+    private static void EnsureEdmRequestSuccess(string? xml, string operation)
+    {
+        if (string.IsNullOrWhiteSpace(xml))
+            throw new InvalidOperationException($"EDM {operation} boş yanıt döndürdü.");
+
+        if (HasSoapFault(xml))
+        {
+            var shortErr = GetXmlValue(xml, "ERROR_SHORT_DES") ?? GetXmlValue(xml, "faultstring") ?? "EDM SOAP fault.";
+            var longErr = GetXmlValue(xml, "ERROR_LONG_DES");
+            var msg = shortErr;
+            if (!string.IsNullOrWhiteSpace(longErr))
+                msg += " " + longErr;
+            throw new InvalidOperationException(msg);
+        }
+
+        var returnCode = GetXmlValue(xml, "RETURN_CODE");
+        if (!string.IsNullOrWhiteSpace(returnCode) &&
+            !string.Equals(returnCode, "0", StringComparison.OrdinalIgnoreCase))
+        {
+            var err = GetXmlValue(xml, "ERROR_SHORT_DES")
+                      ?? GetXmlValue(xml, "ERROR_LONG_DES")
+                      ?? $"RETURN_CODE={returnCode}";
+            throw new InvalidOperationException(err);
+        }
+    }
+
+    private static bool IsSessionErrorMessage(string? message)
+    {
+        if (string.IsNullOrWhiteSpace(message))
+            return false;
+        return message.Contains("aktif session", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("session bulunamad", StringComparison.OrdinalIgnoreCase)
+               || message.Contains("not authenticated", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static (List<GibUserRow> Rows, string? RawXml) ParseGibUsersFromBinarySoapResponse(string soapXml)
+    {
+        var embeddedXml = GetXmlValue(soapXml, "xml");
+        if (!string.IsNullOrWhiteSpace(embeddedXml))
+            return (ParseGibUsers(embeddedXml), embeddedXml);
+
+        var base64 = GetXmlValue(soapXml, "Item")
+                     ?? GetXmlValue(soapXml, "Value")
+                     ?? GetXmlValue(soapXml, "DATA");
+        if (string.IsNullOrWhiteSpace(base64))
+            throw new InvalidOperationException("EDM GetUserListBinary yanıtında veri bulunamadı.");
+
+        var bytes = Convert.FromBase64String(base64.Trim());
+        if (bytes.Length >= 2 && bytes[0] == 0x50 && bytes[1] == 0x4B)
+        {
+            using var zipStream = new MemoryStream(bytes);
+            using var archive = new ZipArchive(zipStream, ZipArchiveMode.Read);
+            var entry = archive.Entries.FirstOrDefault(e => e.Name.EndsWith(".xml", StringComparison.OrdinalIgnoreCase))
+                        ?? archive.Entries.FirstOrDefault();
+            if (entry is null)
+                throw new InvalidOperationException("EDM GetUserListBinary zip içinde dosya bulunamadı.");
+
+            using var reader = new StreamReader(entry.Open(), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+            var xml = reader.ReadToEnd();
+            return (ParseGibUsers(xml), xml);
+        }
+
+        var plainXml = Encoding.UTF8.GetString(bytes);
+        return (ParseGibUsers(plainXml), plainXml);
+    }
+
+    private static List<IntegratorTaxpayerCandidate> BuildTaxpayerCandidatesFromRows(
+        IReadOnlyList<GibUserRow> rows,
+        string originalTitle)
+        => rows
+            .Where(r => TitleMatchesSearch(r.Title, originalTitle))
+            .Where(u => !string.IsNullOrWhiteSpace(u.Identifier))
+            .GroupBy(u => new string(u.Identifier!.Where(char.IsDigit).ToArray()))
+            .Where(g => g.Key.Length is 10 or 11)
+            .Select(g =>
+            {
+                var (resolvedTitle, alias, isEInvoice) = ResolveGibUserIdentity(g.ToList());
+                return new IntegratorTaxpayerCandidate(g.Key, resolvedTitle, alias, isEInvoice);
+            })
+            .OrderByDescending(c => TitleSimilarity(c.Title, originalTitle))
+            .ThenByDescending(c => c.IsEInvoiceTaxpayer)
+            .ThenBy(c => c.Title ?? c.TaxNo, StringComparer.CurrentCultureIgnoreCase)
+            .Take(MaxTitleSearchCandidates)
+            .ToList();
+
+    private static List<IntegratorTaxpayerCandidate> BuildTaxpayerCandidatesFromRowsByTaxNo(
+        IReadOnlyList<GibUserRow> rows,
+        string taxNo)
+        => rows
+            .Where(r => string.Equals(DigitsOnly(r.Identifier), taxNo, StringComparison.Ordinal))
+            .GroupBy(_ => taxNo)
+            .Select(g =>
+            {
+                var (resolvedTitle, alias, isEInvoice) = ResolveGibUserIdentity(g.ToList());
+                return new IntegratorTaxpayerCandidate(g.Key, resolvedTitle, alias, isEInvoice);
+            })
+            .ToList();
+
+    private async Task<(string? Title, string? ReceiverAlias, bool IsEInvoiceTaxpayer)?> TryResolveTaxpayerFromGibListAsync(
+        string? username,
+        string? password,
+        string taxNo,
+        CancellationToken ct)
+    {
+        try
+        {
+            var gibRows = await TryGetGibUserListAsync(username, password, allowDownload: false, ct);
+            var candidates = gibRows is null
+                ? new List<IntegratorTaxpayerCandidate>()
+                : BuildTaxpayerCandidatesFromRowsByTaxNo(gibRows, taxNo);
+            if (candidates.Count == 0)
+                return null;
+
+            var best = candidates[0];
+            return (best.Title, best.ReceiverAlias, best.IsEInvoiceTaxpayer);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string DigitsOnly(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+        return new string(value.Where(char.IsDigit).ToArray());
+    }
+
+    private static bool TitleMatchesSearch(string? candidateTitle, string searchTitle)
+    {
+        if (string.IsNullOrWhiteSpace(candidateTitle))
+            return false;
+
+        if (TitleSimilarity(candidateTitle, searchTitle) >= 0.35)
+            return true;
+
+        var normCandidate = NormalizeForCompare(candidateTitle);
+        var searchTokens = NormalizeForCompare(searchTitle)
+            .Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .Where(t => t.Length >= 3)
+            .ToList();
+        if (searchTokens.Count == 0 || normCandidate.Length == 0)
+            return false;
+
+        var significant = searchTokens.Where(t => t.Length >= 4).ToList();
+        if (significant.Count == 0)
+            significant = searchTokens;
+
+        if (significant.Any(t => normCandidate.Contains(t, StringComparison.Ordinal)))
+            return true;
+
+        var first = searchTokens[0];
+        if (first.Length >= 3 && normCandidate.Contains(first, StringComparison.Ordinal))
+            return true;
+
+        return false;
+    }
+
+    private static List<IntegratorTaxpayerCandidate> BuildTaxpayerCandidates(string xml, string originalTitle)
+        => ParseGibUsers(xml)
+            .Where(u => !string.IsNullOrWhiteSpace(u.Identifier))
+            .GroupBy(u => new string(u.Identifier!.Where(char.IsDigit).ToArray()))
+            .Where(g => g.Key.Length is 10 or 11)
+            .Select(g =>
+            {
+                var (resolvedTitle, alias, isEInvoice) = ResolveGibUserIdentity(g.ToList());
+                return new IntegratorTaxpayerCandidate(g.Key, resolvedTitle, alias, isEInvoice);
+            })
+            // En çok benzeyen kayıt başa gelsin; tek sonuçta otomatik uygulanacak olan bu kayıttır.
+            .OrderByDescending(c => TitleSimilarity(c.Title, originalTitle))
+            .ThenByDescending(c => c.IsEInvoiceTaxpayer)
+            .ThenBy(c => c.Title ?? c.TaxNo, StringComparer.CurrentCultureIgnoreCase)
+            .Take(MaxTitleSearchCandidates)
+            .ToList();
+
+    private const int MaxTitleSearchCandidates = 50;
+
+    /// <summary>
+    /// Tam ünvandan başlayıp kademeli olarak kısalan arama terimleri üretir.
+    /// Örn: "CEMATEK İNŞAAT GIDA TEKS. SAN. TİC. LTD. ŞTİ.-YUSUF KUYUMCULUK"
+    /// → tam ünvan, "-" öncesi, tüzel ek atılmış hali, ilk 2 kelime, ilk kelime.
+    /// </summary>
+    private static List<string> BuildTitleSearchVariants(string title)
+    {
+        var variants = new List<string>();
+
+        void Add(string? value)
+        {
+            var text = (value ?? "").Trim(' ', '-', '.', ',', ';', ':', '%');
+            text = string.Join(' ', text.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            if (text.Length < 3) return;
+            if (!variants.Contains(text, StringComparer.OrdinalIgnoreCase))
+                variants.Add(text);
+        }
+
+        Add(title);
+
+        foreach (var part in title.Split(['-', '/', '|', '\\'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            Add(part);
+
+        // Şube / alt ünvan: "... LTD. ŞTİ.-YUSUF KUYUMCULUK" → "YUSUF KUYUMCULUK"
+        var dashIndex = title.IndexOf('-');
+        if (dashIndex >= 0 && dashIndex < title.Length - 1)
+            Add(title[(dashIndex + 1)..].Trim());
+        if (dashIndex > 2)
+            Add(title[..dashIndex]);
+
+        var core = StripLegalFormTokens(title);
+        Add(core);
+
+        var normalizedWords = NormalizeForCompare(title).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        foreach (var word in normalizedWords.Where(w => w.Length >= 4))
+            Add(word);
+        if (normalizedWords.Length > 1)
+            Add(string.Join(' ', normalizedWords.TakeLast(2)));
+        if (normalizedWords.Length > 0)
+            Add(normalizedWords[^1]);
+
+        var words = core.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length > 2) Add(string.Join(' ', words.Take(2)));
+        if (words.Length > 1) Add(words[0]);
+
+        return variants;
+    }
+
+    private static readonly HashSet<string> LegalFormTokens = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "LTD", "STI", "ŞTİ", "SIRKETI", "ŞİRKETİ", "LIMITED", "LİMİTED",
+        "AS", "A.Ş", "AŞ", "ANONIM", "ANONİM", "SAN", "SANAYI", "SANAYİ",
+        "TIC", "TİC", "TICARET", "TİCARET", "KOLL", "İTH", "ITH", "İHR", "IHR",
+        "VE", "PAZARLAMA", "PAZ"
+    };
+
+    private static string StripLegalFormTokens(string title)
+    {
+        var beforeDash = title.IndexOf('-') > 2 ? title[..title.IndexOf('-')] : title;
+        var tokens = beforeDash
+            .Split([' ', '.', ',', ';', ':', '/'], StringSplitOptions.RemoveEmptyEntries)
+            .Where(t => !LegalFormTokens.Contains(t.Trim()))
+            .ToList();
+        return tokens.Count == 0 ? beforeDash.Trim() : string.Join(' ', tokens);
+    }
+
+    /// <summary>Aday ünvanın aranan metne benzerlik oranı (0-1). Ortak kelime sayısı esas alınır.</summary>
+    private static double TitleSimilarity(string? candidateTitle, string? searchTitle)
+    {
+        var a = NormalizeForCompare(candidateTitle);
+        var b = NormalizeForCompare(searchTitle);
+        if (a.Length == 0 || b.Length == 0) return 0;
+        if (string.Equals(a, b, StringComparison.Ordinal)) return 1;
+
+        var aTokens = a.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.Ordinal);
+        var bTokens = b.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.Ordinal);
+        if (aTokens.Count == 0 || bTokens.Count == 0) return 0;
+
+        var shared = aTokens.Count(t => bTokens.Contains(t));
+        var score = (double)shared / Math.Max(aTokens.Count, bTokens.Count);
+
+        if (a.Contains(b, StringComparison.Ordinal) || b.Contains(a, StringComparison.Ordinal))
+            score = Math.Max(score, 0.9);
+
+        return score;
+    }
+
+    private static string NormalizeIntegratorTitle(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return string.Empty;
+        return value.Trim().ToUpper(System.Globalization.CultureInfo.GetCultureInfo("tr-TR"));
+    }
+
+    private static string NormalizeForCompare(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+
+        var sb = new StringBuilder(value.Length);
+        foreach (var ch in value.ToUpperInvariant())
+        {
+            sb.Append(ch switch
+            {
+                'İ' or 'I' or 'Ï' => 'I',
+                'Ş' => 'S',
+                'Ğ' => 'G',
+                'Ü' => 'U',
+                'Ö' => 'O',
+                'Ç' => 'C',
+                _ => char.IsLetterOrDigit(ch) ? ch : ' '
+            });
+        }
+
+        return string.Join(' ', sb.ToString().Split(' ', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    /// <summary>
+    /// Aynı mükellefe ait GİB kullanıcı satırlarından ünvan, alıcı etiketi ve e-Fatura mükellefiyetini çıkarır.
+    /// PK birimi e-Fatura posta kutusudur; PK yoksa urn: ile başlayan diğer etiketler de kabul edilir.
+    /// </summary>
+    private static (string? Title, string? ReceiverAlias, bool IsEInvoiceTaxpayer) ResolveGibUserIdentity(
+        IReadOnlyList<GibUserRow> users)
+    {
+        var pkUser = users.FirstOrDefault(u => string.Equals(u.Unit, "PK", StringComparison.OrdinalIgnoreCase));
+        var gbUser = users.FirstOrDefault(u => string.Equals(u.Unit, "GB", StringComparison.OrdinalIgnoreCase));
+        var aliasUser = users.FirstOrDefault(u =>
+            !string.IsNullOrWhiteSpace(u.Alias) &&
+            u.Alias.StartsWith("urn:", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(u.Unit, "GB", StringComparison.OrdinalIgnoreCase));
+        var titleUser = users.FirstOrDefault(u => !string.IsNullOrWhiteSpace(u.Title))
+                        ?? pkUser ?? aliasUser ?? gbUser ?? users.FirstOrDefault();
+
+        return (
+            titleUser?.Title?.Trim(),
+            pkUser?.Alias?.Trim() ?? aliasUser?.Alias?.Trim(),
+            pkUser is not null || aliasUser is not null);
     }
 
     private static bool IsAuthFault(string? xml)
@@ -581,9 +1396,13 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
             return false;
         return xml.Contains("not authenticated", StringComparison.OrdinalIgnoreCase)
                || xml.Contains("caller was not authenticated", StringComparison.OrdinalIgnoreCase)
+               || xml.Contains("InvalidSecurity", StringComparison.OrdinalIgnoreCase)
                || xml.Contains("aktif session", StringComparison.OrdinalIgnoreCase)
                || xml.Contains("session bulunamad", StringComparison.OrdinalIgnoreCase);
     }
+
+    private static bool IsRetriableEdmSessionFault(string? xml)
+        => IsSessionFault(xml) || IsAuthFault(xml);
 
     private sealed record GibUserRow(string? Identifier, string? Alias, string? Title, string? Unit);
 
@@ -594,21 +1413,73 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
             return result;
 
         var x = XDocument.Parse(xml);
-        foreach (var user in x.Descendants().Where(e => e.Name.LocalName == "USER"))
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        void TryAdd(GibUserRow? row)
         {
-            string? Local(string name) => user.Elements().FirstOrDefault(e => e.Name.LocalName == name)?.Value;
-            var identifier = Local("IDENTIFIER");
-            var alias = Local("ALIAS");
-            var title = Local("TITLE");
-            var unit = Local("UNIT");
-            if (string.IsNullOrWhiteSpace(identifier) &&
-                string.IsNullOrWhiteSpace(alias) &&
-                string.IsNullOrWhiteSpace(title))
-                continue;
-            result.Add(new GibUserRow(identifier, alias, title, unit));
+            if (row is null) return;
+            if (string.IsNullOrWhiteSpace(row.Identifier) &&
+                string.IsNullOrWhiteSpace(row.Alias) &&
+                string.IsNullOrWhiteSpace(row.Title))
+                return;
+
+            var key = $"{row.Identifier}|{row.Alias}|{row.Unit}";
+            if (seen.Add(key))
+                result.Add(row);
+        }
+
+        foreach (var user in x.Descendants().Where(e =>
+                     e.Name.LocalName is "USER" or "GIBUSER" or "User" or "GibUser"))
+            TryAdd(ParseGibUserElement(user));
+
+        foreach (var user in x.Descendants().Where(e =>
+                     e.Name.LocalName is "CheckUserResponseMessage" or "Items"))
+            TryAdd(ParseGibUserElement(user));
+
+        if (result.Count == 0)
+        {
+            foreach (var el in x.Descendants().Where(e => e.Elements().Any(c => c.Name.LocalName == "IDENTIFIER")))
+                TryAdd(ParseGibUserElement(el));
         }
 
         return result;
+    }
+
+    private static GibUserRow? ParseGibUserElement(XElement user)
+    {
+        string? Local(string name)
+        {
+            var el = user.Elements().FirstOrDefault(e => e.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (el is null)
+                el = user.Descendants().FirstOrDefault(e => e.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (el is null) return null;
+            return string.IsNullOrWhiteSpace(el.Value)
+                ? el.Attribute("Value")?.Value ?? el.Attribute("value")?.Value
+                : el.Value;
+        }
+
+        string? Attr(params string[] names)
+        {
+            foreach (var name in names)
+            {
+                var direct = user.Attributes().FirstOrDefault(a => a.Name.LocalName.Equals(name, StringComparison.OrdinalIgnoreCase))?.Value;
+                if (!string.IsNullOrWhiteSpace(direct))
+                    return direct;
+            }
+            return null;
+        }
+
+        var identifier = Local("IDENTIFIER")
+                         ?? Attr("IDENTIFIER", "Identifier", "VKN", "TCKN", "Id", "ID");
+        var alias = Local("ALIAS") ?? Attr("ALIAS", "Alias");
+        var title = Local("TITLE") ?? Attr("TITLE", "Title", "NAME", "Name");
+        var unit = Local("UNIT") ?? Attr("UNIT", "Unit");
+        if (string.IsNullOrWhiteSpace(identifier) &&
+            string.IsNullOrWhiteSpace(alias) &&
+            string.IsNullOrWhiteSpace(title))
+            return null;
+
+        return new GibUserRow(identifier, alias, title, unit);
     }
 
     // START_DATE/END_DATE fatura tarihi bazlı filtredir (xs:date = sadece yyyy-MM-dd).
@@ -648,7 +1519,7 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
                 {
                     var body = BuildGetIncomingInvoiceBody(session, chunkStart, chunkEnd, pageLimit, offset);
                     var xml = await SendSoapWithActionFallbackAsync("GetInvoice", body, ct);
-                    if (IsSessionFault(xml))
+                    if (IsRetriableEdmSessionFault(xml))
                     {
                         session = await LoginAsync(request.IntegratorUsername, request.IntegratorPassword, ct, forceFresh: true);
                         body = BuildGetIncomingInvoiceBody(session, chunkStart, chunkEnd, pageLimit, offset);
@@ -1136,6 +2007,15 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
         return normalized == "-" || normalized.Equals("MERKEZ", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static string ResolveSendDocumentType(string? requestDocumentType, string? payloadDocumentType)
+    {
+        if (!string.IsNullOrWhiteSpace(requestDocumentType))
+            return string.Equals(requestDocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase) ? "EArsiv" : "EFatura";
+        if (!string.IsNullOrWhiteSpace(payloadDocumentType))
+            return string.Equals(payloadDocumentType, "EArsiv", StringComparison.OrdinalIgnoreCase) ? "EArsiv" : "EFatura";
+        return "EFatura";
+    }
+
     private static string? ReadJson(string? json, params string[] names)
     {
         if (string.IsNullOrWhiteSpace(json)) return null;
@@ -1404,15 +2284,6 @@ public sealed class EdmSoapEInvoiceProviderAdapter : IEInvoiceProviderAdapter
         return string.IsNullOrWhiteSpace(trimmed) ? null : trimmed;
     }
 }
-
-public sealed record EdmTaxpayerQueryResult(
-    bool IsSuccess,
-    bool? IsEInvoiceTaxpayer,
-    string? Title,
-    string? ReceiverAlias,
-    string? RawResponse,
-    string? Message
-);
 
 public sealed record EdmSessionCompanyInfo(
     string? CompanyName,

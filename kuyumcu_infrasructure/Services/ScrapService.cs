@@ -141,7 +141,7 @@ public sealed class ScrapService : IScrapService
         Guid tenantId,
         Guid branchId,
         Guid userId,
-        Guid customerId,
+        Guid? customerId,
         string karatRaw,
         decimal weightGram,
         decimal goldPricePerGram,
@@ -158,9 +158,12 @@ public sealed class ScrapService : IScrapService
             .FirstOrDefaultAsync(b => b.Id == branchId && b.TenantId == tenantId, ct);
         if (branch is null) return (false, null, "Şube bulunamadı.");
 
-        var cust = await _db.Customers.AsNoTracking()
-            .FirstOrDefaultAsync(c => c.Id == customerId && c.TenantId == tenantId && !c.IsDeleted, ct);
-        if (cust is null) return (false, null, "Müşteri bulunamadı.");
+        if (customerId.HasValue && customerId.Value != Guid.Empty)
+        {
+            var cust = await _db.Customers.AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Id == customerId.Value && c.TenantId == tenantId && !c.IsDeleted, ct);
+            if (cust is null) return (false, null, "Müşteri bulunamadı.");
+        }
 
         var lineTotal = Math.Round(weightGram * goldPricePerGram, 2);
         var pure = ScrapPureGoldCalculator.ComputePureGoldGrams(weightGram, karatRaw);
@@ -170,7 +173,7 @@ public sealed class ScrapService : IScrapService
             TenantId = tenantId,
             BranchId = branchId,
             UserId = userId,
-            CustomerId = customerId,
+            CustomerId = customerId is Guid cid && cid != Guid.Empty ? cid : null,
             PurchaseType = PurchaseType.Musteri,
             PaymentMethod = (PurchasePaymentMethod)Math.Clamp(paymentMethod, 0, 4),
             Date = DateTime.UtcNow,
@@ -204,6 +207,99 @@ public sealed class ScrapService : IScrapService
 
         await UpsertAddAsync(tenantId, branchId, karatKey, weightGram, pure, ScrapLedgerType.CustomerPurchase,
             customerId, purchase.Id, lineTotal, goldPricePerGram, note, ct);
+        await _db.SaveChangesAsync(ct);
+
+        return (true, purchase.Id, null);
+    }
+
+    public async Task<(bool ok, Guid? purchaseId, string? error)> RecordCustomerScrapPurchaseLinesAsync(
+        Guid tenantId,
+        Guid branchId,
+        Guid userId,
+        Guid? customerId,
+        IReadOnlyList<CustomerScrapPurchaseLineDto> lines,
+        int paymentMethod,
+        string? note,
+        CancellationToken ct = default)
+    {
+        if (lines is null || lines.Count == 0)
+            return (false, null, "Hurda satırı yok.");
+
+        var branch = await _db.Branches.AsNoTracking()
+            .FirstOrDefaultAsync(b => b.Id == branchId && b.TenantId == tenantId, ct);
+        if (branch is null) return (false, null, "Şube bulunamadı.");
+
+        if (customerId.HasValue && customerId.Value != Guid.Empty)
+        {
+            var cust = await _db.Customers.AsNoTracking()
+                .FirstOrDefaultAsync(c => c.Id == customerId.Value && c.TenantId == tenantId && !c.IsDeleted, ct);
+            if (cust is null) return (false, null, "Müşteri bulunamadı.");
+        }
+
+        decimal subtotal = 0m;
+        decimal totalHas = 0m;
+        var purchase = new Purchase
+        {
+            TenantId = tenantId,
+            BranchId = branchId,
+            UserId = userId,
+            CustomerId = customerId is Guid cid && cid != Guid.Empty ? cid : null,
+            PurchaseType = PurchaseType.Musteri,
+            PaymentMethod = (PurchasePaymentMethod)Math.Clamp(paymentMethod, 0, 4),
+            Date = DateTime.UtcNow,
+            Note = note
+        };
+
+        var lineNo = 1;
+        foreach (var line in lines.Where(x => x.Gram > 0m))
+        {
+            var milyemText = line.Milyem > 0m
+                ? line.Milyem.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)
+                : ScrapPureGoldCalculator.NormalizeKaratKey(line.Ayar);
+            if (string.IsNullOrWhiteSpace(milyemText))
+                return (false, null, "Geçersiz milyem/ayar.");
+
+            var lineTotal = Math.Round(line.TutarTl, 2, MidpointRounding.AwayFromZero);
+            var unitCost = line.Gram > 0m ? Math.Round(lineTotal / line.Gram, 6, MidpointRounding.AwayFromZero) : 0m;
+            var odenecek = line.OdenecekToplamHas;
+            if (odenecek == 0m && line.Gram > 0m)
+                odenecek = Math.Round(line.Gram * line.Milyem + line.Gram * line.BirimIscilikHas, 4, MidpointRounding.AwayFromZero);
+            var pure = ScrapPureGoldCalculator.ComputePureGoldGrams(line.Gram, milyemText);
+
+            purchase.Items.Add(new PurchaseItem
+            {
+                TenantId = tenantId,
+                LineNo = lineNo++,
+                Kind = ItemKind.Scrap,
+                ProductCode = "HURDA",
+                ProductName = string.IsNullOrWhiteSpace(line.MalTanimi) ? $"Hurda {line.Ayar}" : line.MalTanimi.Trim(),
+                Karat = milyemText,
+                Category = "Hurda",
+                Quantity = line.Gram,
+                UnitCost = unitCost,
+                Discount = 0,
+                TaxRate = 0,
+                LineTotal = lineTotal,
+                BirimIscilikHas = line.BirimIscilikHas,
+                OdenecekToplamHas = odenecek
+            });
+            subtotal += lineTotal;
+            totalHas += pure;
+        }
+
+        if (purchase.Items.Count == 0)
+            return (false, null, "Geçerli hurda satırı yok.");
+
+        purchase.Subtotal = Math.Round(subtotal, 2, MidpointRounding.AwayFromZero);
+        purchase.DiscountTotal = 0;
+        purchase.TaxTotal = 0;
+        purchase.GrandTotal = purchase.Subtotal;
+        purchase.TotalAmount = purchase.GrandTotal;
+        purchase.TotalHas = totalHas;
+
+        _db.Purchases.Add(purchase);
+        await _db.SaveChangesAsync(ct);
+        await AddFromPurchaseItemsAsync(tenantId, purchase, ct);
         await _db.SaveChangesAsync(ct);
 
         return (true, purchase.Id, null);

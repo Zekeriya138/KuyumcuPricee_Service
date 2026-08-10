@@ -588,7 +588,17 @@ public sealed class FinanceController : ControllerBase
     {
         var tenantId = GetTenantId();
         if (page <= 0) page = 1;
-        if (pageSize <= 0 || pageSize > 500) pageSize = 100;
+        if (pageSize <= 0) pageSize = 100;
+        else if (pageSize > 500) pageSize = 500;
+
+        // Client inclusive day queries (yyyy-MM-dd) arrive as midnight; without expanding
+        // the end to the next day, TxDate >= from && TxDate < to becomes an empty range.
+        if (from.HasValue || to.HasValue)
+        {
+            var (f, tExclusive) = NormalizeDateRangeInclusive(from, to);
+            from = f;
+            to = tExclusive;
+        }
 
         static decimal RoundAmt(decimal v) => decimal.Round(Math.Abs(v), 4, MidpointRounding.AwayFromZero);
         var takasSaleMap = new Dictionary<Guid, HashSet<decimal>>();
@@ -685,7 +695,10 @@ public sealed class FinanceController : ControllerBase
             {
                 var code = ((string?)x.AccountCode ?? "").ToUpperInvariant();
                 var name = ((string?)x.AccountName ?? "").ToUpperInvariant();
-                return code.StartsWith("10")
+                // 1100 Stok / 1200 Alacak gibi 10xx olmayan varlıklar likidite sayılmamalı.
+                // Eski kontrol code.StartsWith("10") bunları da yakalıyordu.
+                return code.StartsWith("100")
+                       || code.StartsWith("101")
                        || name.Contains("KASA")
                        || name.Contains("BANKA")
                        || name.Contains("VAULT")
@@ -826,9 +839,7 @@ public sealed class FinanceController : ControllerBase
                     Amount = x.Amount,
                     TxDate = x.TxDate,
                     RefType = x.RefType,
-                    // Legacy veritabanlarında RefId kolonu metin tutulmuş olabilir.
-                    // Kasa ekranını kırmamak için liste endpoint'inde RefId materialize etmiyoruz.
-                    RefId = null,
+                    RefId = x.RefId,
                     Description = x.Description,
                     AccountName = x.CashAccount.Name,
                     Kullanici = x.KullaniciAdi
@@ -998,48 +1009,90 @@ public sealed class FinanceController : ControllerBase
             return $"{rType}|{rId}|{t}|{c}|{a}";
         }
 
-        var existingKeys = new HashSet<string>(
-            baseRows.Select(x => BuildKey(x.RefType, x.RefId, x.TxType, x.Currency, x.Amount)),
-            StringComparer.OrdinalIgnoreCase);
+        // RefId client/API tarafında sık null geldiği için (legacy cast), satış/alış
+        // yevmiye + CashTransaction çiftini yakalamak için RefId'siz anahtar da tutulur.
+        static string BuildSoftKey(string? refType, string? sourceModule, string txType, string currency, decimal amount)
+        {
+            var rType = (refType ?? "").Trim().ToUpperInvariant();
+            if (string.IsNullOrEmpty(rType))
+            {
+                var sm = (sourceModule ?? "").Trim().ToUpperInvariant();
+                rType = sm switch
+                {
+                    "SALE" => "SALE",
+                    "PURCHASE" => "PURCHASE",
+                    _ => sm
+                };
+            }
+            var t = (txType ?? "").Trim().ToUpperInvariant();
+            var c = (currency ?? "").Trim().ToUpperInvariant();
+            var a = decimal.Round(Math.Abs(amount), 4, MidpointRounding.AwayFromZero).ToString("0.0000", System.Globalization.CultureInfo.InvariantCulture);
+            return $"{rType}|{t}|{c}|{a}";
+        }
+
+        var existingKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var existingSoftKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var x in baseRows)
+        {
+            existingKeys.Add(BuildKey(x.RefType, x.RefId, x.TxType, x.Currency, x.Amount));
+            existingSoftKeys.Add(BuildSoftKey(x.RefType, x.SourceModule, x.TxType, x.Currency, x.Amount));
+        }
         var cashTxIdsInBase = new HashSet<Guid>(baseRows.Where(x => x.Id != Guid.Empty).Select(x => x.Id));
+
+        bool AlreadyPresent(CashTxRow row)
+        {
+            var key = BuildKey(row.RefType, row.RefId, row.TxType, row.Currency, row.Amount);
+            if (existingKeys.Contains(key)) return true;
+            var soft = BuildSoftKey(row.RefType, row.SourceModule, row.TxType, row.Currency, row.Amount);
+            return existingSoftKeys.Contains(soft);
+        }
+
+        void Remember(CashTxRow row)
+        {
+            existingKeys.Add(BuildKey(row.RefType, row.RefId, row.TxType, row.Currency, row.Amount));
+            existingSoftKeys.Add(BuildSoftKey(row.RefType, row.SourceModule, row.TxType, row.Currency, row.Amount));
+        }
 
         var syntheticRows = new List<CashTxRow>();
         foreach (var s in fallbackSaleRows)
         {
-            var key = BuildKey(s.RefType, s.RefId, s.TxType, s.Currency, s.Amount);
-            if (existingKeys.Contains(key)) continue;
-            existingKeys.Add(key);
+            if (AlreadyPresent(s)) continue;
+            Remember(s);
             syntheticRows.Add(s);
         }
         foreach (var s in fallbackSaleDocRows)
         {
-            var key = BuildKey(s.RefType, s.RefId, s.TxType, s.Currency, s.Amount);
-            if (existingKeys.Contains(key)) continue;
-            existingKeys.Add(key);
+            if (AlreadyPresent(s)) continue;
+            Remember(s);
             syntheticRows.Add(s);
         }
         foreach (var p in fallbackPurchaseRows)
         {
-            var key = BuildKey(p.RefType, p.RefId, p.TxType, p.Currency, p.Amount);
-            if (existingKeys.Contains(key)) continue;
-            existingKeys.Add(key);
+            if (AlreadyPresent(p)) continue;
+            Remember(p);
             syntheticRows.Add(p);
         }
         foreach (var p in fallbackPurchaseDocRows)
         {
-            var key = BuildKey(p.RefType, p.RefId, p.TxType, p.Currency, p.Amount);
-            if (existingKeys.Contains(key)) continue;
-            existingKeys.Add(key);
+            if (AlreadyPresent(p)) continue;
+            Remember(p);
             syntheticRows.Add(p);
         }
         foreach (var j in journalDerivedRows)
         {
+            var sm = (j.SourceModule ?? "").Trim();
+            // Satış/alış için CashTransactions zaten ApplySale/PurchasePayments ile yazılıyor.
+            // Yevmiye satırı aynı tutarı tekrar üretir → Gün Sonu Gelir/Gider 2 kat şişer.
+            if (sm.Equals("Sale", StringComparison.OrdinalIgnoreCase)
+                || sm.Equals("Purchase", StringComparison.OrdinalIgnoreCase))
+                continue;
+
             var cashRefId = TryExtractRefId(j.Description, "REF:CASH:");
             if (cashRefId.HasValue && cashTxIdsInBase.Contains(cashRefId.Value))
                 continue;
-            var key = BuildKey(j.RefType, j.RefId, j.TxType, j.Currency, j.Amount);
-            if (existingKeys.Contains(key)) continue;
-            existingKeys.Add(key);
+            if (AlreadyPresent(j))
+                continue;
+            Remember(j);
             syntheticRows.Add(j);
         }
 
@@ -2320,8 +2373,11 @@ public sealed class FinanceController : ControllerBase
 
     private static (DateTime StartInclusive, DateTime EndExclusive) NormalizeDateRangeInclusive(DateTime? from, DateTime? to)
     {
-        var start = (from ?? DateTime.UtcNow.Date.AddDays(-30)).Date;
-        var endInclusive = (to ?? DateTime.UtcNow.Date).Date;
+        static DateTime ToLocalDate(DateTime value) =>
+            value.Kind == DateTimeKind.Utc ? value.ToLocalTime().Date : value.Date;
+
+        var start = ToLocalDate(from ?? DateTime.Today.AddDays(-30));
+        var endInclusive = ToLocalDate(to ?? DateTime.Today);
         if (endInclusive < start)
             endInclusive = start;
 
@@ -2359,6 +2415,7 @@ public sealed class FinanceController : ControllerBase
                 SaleDate = s.CreatedAt,
                 i.SaleId,
                 i.LineNo,
+                i.Kind,
                 s.PaymentType,
                 s.DeliveryType,
                 s.UserId,
@@ -2382,6 +2439,8 @@ public sealed class FinanceController : ControllerBase
                         && (x.GroupCode ?? "").Trim().ToUpper() == "ZIYNET"
                         && (x.RefType ?? "").Trim().ToUpper() == "SALE"
                         && x.RefId == null)
+            // Satış fişi + ZIYNET_ALACAK birlikte yazıldığında gelir çift sayılır; alacak kaydını rapor dışı bırak.
+            .Where(x => x.Note == null || !EF.Functions.Like(x.Note, "%ZIYNET_ALACAK%"))
             .Where(x => !branchId.HasValue || branchId.Value == Guid.Empty || x.BranchId == branchId.Value)
             .Join(
                 _db.Customers.AsNoTracking().Where(c => c.TenantId == tenantId && !c.IsDeleted),
@@ -2446,7 +2505,8 @@ public sealed class FinanceController : ControllerBase
                     {
                         CostRaw = p.Cost ?? 0m,
                         IsSpecial = p.IsSpecialProduct,
-                        IsZiynet = p.InventoryType == kuyumcu_domain.Enums.InventoryType.Ziynet,
+                        IsZiynet = p.InventoryType == kuyumcu_domain.Enums.InventoryType.Ziynet
+                            || IsZiynetReportRow(p.Category, p.Name, p.ProductCode),
                         IsSilver = IsSilverProduct(p.Category, p.Name, p.Karat),
                         IsForex = IsForexText(p.Category) || IsForexText(p.Name) || (p.ProductCode ?? "").StartsWith("FX-", StringComparison.OrdinalIgnoreCase),
                         TargetSaleHas = p.BelirlenenSatisFiyatiHas ?? 0m,
@@ -2547,9 +2607,18 @@ public sealed class FinanceController : ControllerBase
 
             var meta = productMetaDict.TryGetValue(x.ProductCode ?? "", out var m) ? m : null;
             var isSpecial = meta?.IsSpecial == true;
-            var isZiynet = meta?.IsZiynet == true;
-            var isSilver = meta?.IsSilver == true;
-            var isForex = meta?.IsForex == true || IsForexText(x.Category) || (x.ProductCode ?? "").StartsWith("FX-", StringComparison.OrdinalIgnoreCase);
+            var isZiynet = meta?.IsZiynet == true
+                || x.Kind == ItemKind.Ziynet
+                || x.Kind == ItemKind.GramGold
+                || IsZiynetReportRow(x.Category, x.ProductName, x.ProductCode);
+            var isSilver = meta?.IsSilver == true
+                || x.Kind == ItemKind.Silver
+                || IsSilverProduct(x.Category, x.ProductName, x.Karat);
+            var isForex = meta?.IsForex == true
+                || x.Kind == ItemKind.Forex
+                || IsForexText(x.Category)
+                || IsForexText(x.ProductName)
+                || (x.ProductCode ?? "").StartsWith("FX-", StringComparison.OrdinalIgnoreCase);
             var qty = x.Quantity > 0 ? x.Quantity : 1m;
 
             // SatisViewModel ile aynı maliyet mantığı:
@@ -2557,12 +2626,14 @@ public sealed class FinanceController : ControllerBase
             // - Digerleri: cost alanı HAS kabul edilir; ziynette adet kadar çarpılır, tekilde 1x.
             decimal resolvedCostTl;
             decimal resolvedCostHas;
-            var ziynetBirimAlisTl = isZiynet
+            var ziynetBirimAlisTl = (isZiynet || x.Kind == ItemKind.GramGold)
                 ? ResolveZiynetAlisUnitTl(x.ProductName, x.Karat, Ask, Bid)
                 : 0m;
-            if (isZiynet && ziynetBirimAlisTl > 0m)
+            if (ziynetBirimAlisTl <= 0m && isZiynet)
+                ziynetBirimAlisTl = ResolveZiynetAlisUnitTl(x.Category, x.Karat, Ask, Bid);
+            if (ziynetBirimAlisTl > 0m)
             {
-                // Ziynet maliyeti: anlık alış kuru x satılan adet.
+                // Ziynet / gram-külçe maliyeti: anlık alış kuru x satılan adet/gram.
                 resolvedCostTl = Math.Round(ziynetBirimAlisTl * qty, 2, MidpointRounding.AwayFromZero);
                 resolvedCostHas = TlToHas(resolvedCostTl);
             }
@@ -2669,6 +2740,13 @@ public sealed class FinanceController : ControllerBase
                 var birimAlis = x.HasEquivalent.GetValueOrDefault();
                 if (birimAlis > 0m)
                     cost = Math.Round(qty * birimAlis, 2, MidpointRounding.AwayFromZero);
+                else
+                {
+                    // HasEquivalent boşsa satış analizi ile aynı: anlık ziynet alış kuru.
+                    var unitAlis = ResolveZiynetAlisUnitTl(x.ItemName, x.ItemType, Ask, Bid);
+                    if (unitAlis > 0m)
+                        cost = Math.Round(qty * unitAlis, 2, MidpointRounding.AwayFromZero);
+                }
                 var revenueHas = TlToHas(revenue);
                 var costHas = TlToHas(cost);
                 var profit = revenue - cost;
@@ -3122,6 +3200,7 @@ public sealed class FinanceController : ControllerBase
             closed = row != null,
             id = row?.Id,
             businessDate = day,
+            closedAtUtc = row?.CreatedAt,
             closingTl = row?.ClosingTl ?? 0m,
             closingUsd = row?.ClosingUsd ?? 0m,
             closingEur = row?.ClosingEur ?? 0m,
@@ -3175,7 +3254,7 @@ public sealed class FinanceController : ControllerBase
         _db.DayEndReports.Add(row);
         await _db.SaveChangesAsync(ct);
 
-        return Ok(new { row.Id, row.BusinessDate, row.ClosingTl, row.ClosingUsd, row.ClosingEur, row.ClosingHas });
+        return Ok(new { row.Id, row.BusinessDate, closedAtUtc = row.CreatedAt, row.ClosingTl, row.ClosingUsd, row.ClosingEur, row.ClosingHas });
     }
 
     [HttpGet("dayend/{id:guid}/pdf")]
@@ -3921,18 +4000,50 @@ public sealed class FinanceController : ControllerBase
         return "YENI";
     }
 
+    /// <summary>
+    /// Satış analizi / gün sonu kârı için ziynet-gram satırı tespiti.
+    /// InventoryType boş olsa bile kategori/ad/kod üzerinden yakalar.
+    /// </summary>
+    private static bool IsZiynetReportRow(string? category, string? productName, string? productCode)
+    {
+        if (!string.IsNullOrWhiteSpace(NormalizeZiynetAilesiToken(productName)))
+            return true;
+        if (!string.IsNullOrWhiteSpace(NormalizeZiynetAilesiToken(category)))
+            return true;
+
+        var blob = FoldTrUpper($"{category} {productName} {productCode}");
+        if (blob.Contains("ZIYNET")) return true;
+        if (blob.Contains("KULCE") || blob.Contains("CULCE")) return true;
+        if (blob.Contains("GRAM") && blob.Contains("ALTIN")) return true;
+        return false;
+    }
+
+    private static string FoldTrUpper(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return "";
+        return raw.Trim()
+            .ToUpperInvariant()
+            .Replace('İ', 'I')
+            .Replace('I', 'I')
+            .Replace('Ü', 'U')
+            .Replace('Ö', 'O')
+            .Replace('Ç', 'C')
+            .Replace('Ğ', 'G')
+            .Replace('Ş', 'S');
+    }
+
     private static string NormalizeZiynetAilesiToken(string? raw)
     {
-        var text = (raw ?? "").Trim().ToUpperInvariant();
+        var text = FoldTrUpper(raw);
         if (string.IsNullOrWhiteSpace(text)) return "";
-        if (text.Contains("ÇEYREK") || text.Contains("CEYREK")) return "CEYREK";
+        if (text.Contains("CEYREK")) return "CEYREK";
         if (text.Contains("YARIM")) return "YARIM";
         if (text.Contains("ATA5")) return "ATA5";
         if (text.Contains("GREMSE")) return "GREMSE";
-        if (text.Contains("CUMHURIYET") || text.Contains("CUMHURİYET")) return "CUMHURIYET";
+        if (text.Contains("CUMHURIYET")) return "CUMHURIYET";
         if (text.Contains("ATA")) return "ATA";
         if (text == "TAM" || text.Contains("TAM")) return "TAM";
-        if (text.Contains("GRAM")) return "GRAM";
+        if (text.Contains("KULCE") || text.Contains("CULCE") || text.Contains("GRAM")) return "GRAM";
         if (text.Contains("HAS")) return "HAS";
         return "";
     }

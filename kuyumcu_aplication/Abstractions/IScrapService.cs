@@ -4,6 +4,15 @@ namespace kuyumcu_application.Abstractions;
 
 public sealed record ScrapStockLineDto(string Karat, decimal WeightGram, decimal PureGoldGram);
 
+public sealed record CustomerScrapPurchaseLineDto(
+    string MalTanimi,
+    string Ayar,
+    decimal Milyem,
+    decimal Gram,
+    decimal BirimIscilikHas,
+    decimal OdenecekToplamHas,
+    decimal TutarTl);
+
 public sealed record ScrapDashboardDto(
     decimal TotalWeightGram,
     decimal TotalPureGoldGram,
@@ -31,10 +40,21 @@ public interface IScrapService
         Guid tenantId,
         Guid branchId,
         Guid userId,
-        Guid customerId,
+        Guid? customerId,
         string karatRaw,
         decimal weightGram,
         decimal goldPricePerGram,
+        int paymentMethod,
+        string? note,
+        CancellationToken ct = default);
+
+    /// <summary>Takas / detaylı müşteri hurda alışı — işçilik alanları ile çok satırlı.</summary>
+    Task<(bool ok, Guid? purchaseId, string? error)> RecordCustomerScrapPurchaseLinesAsync(
+        Guid tenantId,
+        Guid branchId,
+        Guid userId,
+        Guid? customerId,
+        IReadOnlyList<CustomerScrapPurchaseLineDto> lines,
         int paymentMethod,
         string? note,
         CancellationToken ct = default);

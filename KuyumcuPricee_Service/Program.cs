@@ -144,6 +144,7 @@ builder.Services.AddScoped<IStockService, StockService>(); // Stock
 builder.Services.AddScoped<IScrapService, ScrapService>();   // Hurda stok
 builder.Services.AddScoped<IFinanceService, FinanceService>();
 builder.Services.AddScoped<IAiService, AiService>();
+builder.Services.AddScoped<IBranchLogoService, BranchLogoService>();
 builder.Services.AddScoped<IBranchSubscriptionService, BranchSubscriptionService>();
 builder.Services.AddScoped<IAccountingJournalService, AccountingJournalService>();
 builder.Services.AddScoped<TransactionReversalService>();
@@ -153,11 +154,15 @@ builder.Services.AddSingleton<IJewelryTaxCalculator, JewelryTaxCalculator>();
 builder.Services.AddSingleton<IJewelryProductTypeMapper, JewelryProductTypeMapper>();
 builder.Services.AddScoped<IUblInvoiceBuilder, UblInvoiceBuilder>();
 builder.Services.AddScoped<IEInvoiceWorkflowService, EInvoiceWorkflowService>();
+builder.Services.AddSingleton<EInvoiceImmediateProcessQueue>();
 builder.Services.AddScoped<IBankSyncService, BankSyncService>();
 builder.Services.AddScoped<IBankSyncProfileService, BankSyncProfileService>();
-builder.Services.AddScoped<ITaxpayerLookupService, EdmTaxpayerLookupService>();
+builder.Services.AddScoped<BankSyncSchemaEnsurer>();
+builder.Services.AddScoped<EInvoiceProfileSchemaEnsurer>();
+builder.Services.AddScoped<ITaxpayerLookupService, IntegratorTaxpayerLookupService>();
 builder.Services.AddScoped<ICounterpartyTaxResolver, CounterpartyTaxResolverService>();
 builder.Services.AddHttpClient<VomsisApiClient>();
+builder.Services.AddHttpClient<VomsisWorkerProxyClient>();
 builder.Services.AddScoped<IEInvoiceProviderResolver, EInvoiceProviderResolver>();
 builder.Services.AddHttpClient<EdmSoapEInvoiceProviderAdapter>((sp, client) =>
 {
@@ -171,10 +176,13 @@ builder.Services.AddScoped<IEInvoiceProviderAdapter>(sp => sp.GetRequiredService
 builder.Services.AddHttpClient<UyumsoftEInvoiceProviderAdapter>((sp, client) =>
 {
     var configuration = sp.GetRequiredService<IConfiguration>();
-    var baseUrl = configuration["EInvoice:Uyumsoft:BaseUrl"];
-    if (Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri))
+    var useTest = string.Equals(configuration["EInvoice:Uyumsoft:UseTestEnvironment"], "true", StringComparison.OrdinalIgnoreCase);
+    var endpoint = useTest
+        ? configuration["EInvoice:Uyumsoft:TestEndpoint"]
+        : configuration["EInvoice:Uyumsoft:Endpoint"];
+    if (Uri.TryCreate(endpoint, UriKind.Absolute, out var uri))
         client.BaseAddress = uri;
-    client.Timeout = TimeSpan.FromSeconds(45);
+    client.Timeout = TimeSpan.FromSeconds(60);
 });
 builder.Services.AddScoped<IEInvoiceProviderAdapter>(sp => sp.GetRequiredService<UyumsoftEInvoiceProviderAdapter>());
 builder.Services.AddScoped<IEInvoiceProviderAdapter, StubEInvoiceProviderAdapter>();
@@ -262,7 +270,13 @@ if (string.IsNullOrWhiteSpace(sqlConn))
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    await db.Database.MigrateAsync();
+    // Migration geçmişi bozuk ortamlarda MigrateAsync patlayabilir; aşağıdaki idempotent
+    // güvenlik ALTER'larının her durumda çalışması için kendi try/catch'inde izole edildi.
+    try
+    {
+        await db.Database.MigrateAsync();
+    }
+    catch (Exception ex) { Console.WriteLine("MigrateAsync (skipped, ensuring columns manually): " + ex.Message); }
 
     // KRİTİK idempotent güvenlik: Invoices.PaymentSplitRatio kolonu (migration atlanmış/uygulanmamış
     // ortamlar için). Kendi bağımsız try/catch bloğunda; sonraki güvenlik ifadeleri ne olursa olsun çalışır.
@@ -274,6 +288,22 @@ IF OBJECT_ID(N'[dbo].[Invoices]', N'U') IS NOT NULL
     ALTER TABLE [dbo].[Invoices] ADD [PaymentSplitRatio] decimal(18,10) NOT NULL CONSTRAINT [DF_Invoices_PaymentSplitRatio] DEFAULT 1.0;");
     }
     catch (Exception ex) { Console.WriteLine("EnsureInvoicePaymentSplitRatio: " + ex.Message); }
+
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(EInvoiceProfileSchemaEnsurer.EnsureColumnsSql);
+    }
+    catch (Exception ex) { Console.WriteLine("EnsureEInvoiceProfileColumns: " + ex.Message); }
+
+    // Şube logosu (PDF raporları) — migration uygulanmamış ortamlar için.
+    try
+    {
+        await db.Database.ExecuteSqlRawAsync(@"
+IF OBJECT_ID(N'[dbo].[Branches]', N'U') IS NOT NULL
+   AND COL_LENGTH('Branches', 'LogoBase64') IS NULL
+    ALTER TABLE [dbo].[Branches] ADD [LogoBase64] nvarchar(max) NULL;");
+    }
+    catch (Exception ex) { Console.WriteLine("EnsureBranchLogoBase64: " + ex.Message); }
 
     // Tahsilat kaynaklı (satışsız) taslak faturalar için alıcı + has altın kalem meta bilgisi.
     try
@@ -861,6 +891,7 @@ BEGIN
         FOREIGN KEY([BranchId]) REFERENCES [Branches]([Id]) ON DELETE NO ACTION;
 END");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'SupplierCode') ALTER TABLE Suppliers ADD SupplierCode nvarchar(32) NULL");
+        await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('EInvoiceProfiles') AND name = 'SoleProprietorName') ALTER TABLE EInvoiceProfiles ADD SoleProprietorName nvarchar(200) NULL");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'CompanyName') ALTER TABLE Suppliers ADD CompanyName nvarchar(200) NULL");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'ContactName') ALTER TABLE Suppliers ADD ContactName nvarchar(100) NULL");
         await db.Database.ExecuteSqlRawAsync(@"IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('Suppliers') AND name = 'SupplierType') ALTER TABLE Suppliers ADD SupplierType int NOT NULL DEFAULT 0");

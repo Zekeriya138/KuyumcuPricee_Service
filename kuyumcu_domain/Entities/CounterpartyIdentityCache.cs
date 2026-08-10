@@ -24,6 +24,7 @@ public static class CounterpartyIdentitySources
     public const string Supplier = "Supplier";
     public const string BankImport = "BankImport";
     public const string Edm = "Edm";
+    public const string Uyumsoft = "Uyumsoft";
     public const string IdentityCache = "IdentityCache";
     public const string NihaiTuketici = "NihaiTuketici";
     public const string Description = "Description";

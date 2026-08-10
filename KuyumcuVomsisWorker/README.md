@@ -63,7 +63,29 @@ sudo journalctl -u kuyumcu-vomsis-worker -f
 
 ## Akış
 
-1. Vomsis `authenticate` → token
+1. Vomsis `authenticate` → token (yalnızca whitelist IP: **172.213.185.78**)
 2. Son 7 gün `GET /api/v2/transactions`
 3. `POST /api/bank-sync/vomsis/import` (ERP)
 4. ERP: müşteri eşleştirme + otomatik taslak (e-fatura ayarlarına göre)
+
+## Manuel tetikleme (WPF "Vomsis'ten Çek")
+
+Worker HTTP endpoint:
+
+```bash
+POST http://172.213.185.78:5080/sync?tenantId=...&branchId=...
+Header: x-sync-key: <Sync:TriggerKey>   # opsiyonel
+```
+
+ERP API `BankSync:WorkerTriggerUrl` ile bu endpoint'i çağırır. Canlı ortamda WPF butonu worker üzerinden senkron yapar.
+
+### VM NSG
+
+Azure NSG'de **5080/TCP** inbound açık olmalı (kaynak: ERP App Service outbound IP'leri veya `Any` test için).
+
+### systemd ortam değişkenleri
+
+```ini
+Environment=Sync__ListenPort=5080
+Environment=Sync__TriggerKey=your-secret
+```
