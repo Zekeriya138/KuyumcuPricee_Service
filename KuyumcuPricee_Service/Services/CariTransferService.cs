@@ -5,8 +5,8 @@ using Microsoft.EntityFrameworkCore;
 
 namespace KUYUMCU.Price_Service.Services;
 
-public sealed record CariTransferDovizLineReq(string Unit, decimal SignedAmount, string? LedgerSide = null);
-public sealed record CariTransferZiynetLineReq(string Ad, string? Tip, decimal Adet, int OpenDirection);
+public sealed record CariTransferDovizLineReq(string Unit, decimal SignedAmount, string? LedgerSide = null, string? TargetLedgerSide = null);
+public sealed record CariTransferZiynetLineReq(string Ad, string? Tip, decimal Adet, int OpenDirection, string? TargetLedgerSide = null);
 public sealed record CariTransferIscilikliLineReq(Guid TransactionId);
 
 public sealed record CariTransferProcessReq(
@@ -67,13 +67,14 @@ public sealed class CariTransferService
             foreach (var line in doviz)
             {
                 var unit = NormalizeUnit(line.Unit);
-                var ledgerSide = ResolveLedgerSide(line.LedgerSide, line.SignedAmount);
+                var sourceLedgerSide = ResolveLedgerSide(line.LedgerSide, line.SignedAmount);
+                var targetLedgerSide = ResolveTargetLedgerSide(sourceLedgerSide, line.TargetLedgerSide);
                 var amount = decimal.Round(Math.Abs(line.SignedAmount), 6, MidpointRounding.AwayFromZero);
                 if (amount == 0m) continue;
                 await ApplyDovizTransferAsync(
                     tenantId, branchId, userId, userName, transferId, txDate,
                     sourceKind, req.SourcePartyId, sourceBatchId, sourceName, targetKind, req.TargetPartyId, targetBatchId, targetName,
-                    unit, amount, ledgerSide, req.Description, ct);
+                    unit, amount, sourceLedgerSide, targetLedgerSide, req.Description, ct);
             }
 
             foreach (var line in ziynet)
@@ -83,7 +84,7 @@ public sealed class CariTransferService
                 await ApplyZiynetTransferAsync(
                     tenantId, branchId, userId, userName, transferId, txDate,
                     sourceKind, req.SourcePartyId, sourceBatchId, sourceName, targetKind, req.TargetPartyId, targetBatchId, targetName,
-                    line.Ad, line.Tip, adet, line.OpenDirection, req.Description, ct);
+                    line.Ad, line.Tip, adet, line.OpenDirection, line.TargetLedgerSide, req.Description, ct);
             }
 
             foreach (var line in iscilikli)
@@ -102,7 +103,8 @@ public sealed class CariTransferService
         catch (Exception ex)
         {
             await tx.RollbackAsync(ct);
-            return new CariTransferProcessResult(false, ex.Message, null, null, null);
+            var msg = ex.InnerException?.Message ?? ex.Message;
+            return new CariTransferProcessResult(false, msg, null, null, null);
         }
     }
 
@@ -110,39 +112,48 @@ public sealed class CariTransferService
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,
         string sourceKind, Guid sourceId, Guid sourceBatchId, string sourceName,
         string targetKind, Guid targetId, Guid targetBatchId, string targetName,
-        string unit, decimal amount, string ledgerSide, string? description, CancellationToken ct)
+        string unit, decimal amount, string sourceLedgerSide, string targetLedgerSide, string? description, CancellationToken ct)
     {
+        var targetUseReduction = ShouldTargetUseReduction(sourceLedgerSide, targetLedgerSide);
+
         if (sourceKind == "Customer")
-        {
-            await ApplyCustomerDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, unit, amount, ledgerSide, isSource: true, description, ct);
-            await ApplyCustomerDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, unit, amount, ledgerSide, isSource: false, description, ct);
-        }
+            await ApplyCustomerDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, unit, amount, sourceLedgerSide, isSource: true, targetUseReduction: false, description, ct);
         else
-        {
-            await ApplySupplierDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, unit, amount, ledgerSide, isSource: true, description, ct);
-            await ApplySupplierDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, unit, amount, ledgerSide, isSource: false, description, ct);
-        }
+            await ApplySupplierDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, unit, amount, sourceLedgerSide, isSource: true, targetUseReduction: false, description, ct);
+
+        if (targetKind == "Customer")
+            await ApplyCustomerDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, unit, amount, targetLedgerSide, isSource: false, targetUseReduction, description, ct);
+        else
+            await ApplySupplierDovizLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, unit, amount, targetLedgerSide, isSource: false, targetUseReduction, description, ct);
     }
 
     private async Task ApplyCustomerDovizLegAsync(
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,
         Guid customerId, Guid batchId, string peerKind, Guid peerId, Guid peerBatchId, string peerName,
-        string unit, decimal amount, string ledgerSide, bool isSource, string? description, CancellationToken ct)
+        string unit, decimal amount, string ledgerSide, bool isSource, bool targetUseReduction, string? description, CancellationToken ct)
     {
         var bal = await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, customerId, ct);
         int direction;
         string refType;
         decimal balanceDelta;
         string cariDurum;
-        if (isSource)
+        if (isSource || !targetUseReduction)
         {
-            (direction, refType, balanceDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount);
-            cariDurum = "Transfer";
+            if (isSource)
+            {
+                (direction, refType, balanceDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount);
+                cariDurum = "Transfer";
+            }
+            else
+            {
+                (direction, cariDurum, balanceDelta) = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, amount);
+                refType = "TRANSFER";
+            }
         }
         else
         {
-            (direction, cariDurum, balanceDelta) = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, amount);
-            refType = "TRANSFER";
+            (direction, refType, balanceDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount);
+            cariDurum = "Transfer";
         }
 
         ApplyCustomerBalanceDelta(bal, unit, balanceDelta);
@@ -171,14 +182,23 @@ public sealed class CariTransferService
     private async Task ApplySupplierDovizLegAsync(
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,
         Guid supplierId, Guid batchId, string peerKind, Guid peerId, Guid peerBatchId, string peerName,
-        string unit, decimal amount, string ledgerSide, bool isSource, string? description, CancellationToken ct)
+        string unit, decimal amount, string ledgerSide, bool isSource, bool targetUseReduction, string? description, CancellationToken ct)
     {
         var bal = await GetOrCreateSupplierBalanceAsync(tenantId, supplierId, ct);
         decimal signedDelta;
-        if (isSource)
-            signedDelta = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount).BalanceDelta;
+        string refType;
+        if (isSource || !targetUseReduction)
+        {
+            if (isSource)
+                (_, refType, signedDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount);
+            else
+            {
+                signedDelta = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, amount).BalanceDelta;
+                refType = "TRANSFER";
+            }
+        }
         else
-            signedDelta = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, amount).BalanceDelta;
+            (_, refType, signedDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount);
 
         ApplySupplierBalanceDelta(bal, unit, signedDelta);
         bal.UpdatedAt = DateTime.UtcNow;
@@ -198,7 +218,7 @@ public sealed class CariTransferService
             TargetUnitTlRate = 1m,
             Description = CariTransferMarker.BuildNote(transferId, isSource ? "SOURCE" : "TARGET", peerKind, peerId, peerBatchId, peerName, description),
             TxDate = txDate,
-            RefType = "TRANSFER",
+            RefType = refType,
             RefId = transferId,
             BatchId = batchId,
             UserId = userId,
@@ -210,28 +230,30 @@ public sealed class CariTransferService
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,
         string sourceKind, Guid sourceId, Guid sourceBatchId, string sourceName,
         string targetKind, Guid targetId, Guid targetBatchId, string targetName,
-        string ad, string? tip, decimal adet, int openDirection, string? description, CancellationToken ct)
+        string ad, string? tip, decimal adet, int openDirection, string? targetLedgerSideRaw, string? description, CancellationToken ct)
     {
         if (openDirection == 0) openDirection = 1;
-        var ledgerSide = openDirection >= 0
+        var sourceLedgerSide = openDirection >= 0
             ? CustomerFinanceHelper.LedgerAlacak
             : CustomerFinanceHelper.LedgerBorc;
+        var targetLedgerSide = ResolveTargetLedgerSide(sourceLedgerSide, targetLedgerSideRaw);
+        var targetUseReduction = ShouldTargetUseReduction(sourceLedgerSide, targetLedgerSide);
 
         if (sourceKind == "Customer")
-            await ApplyCustomerZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, ad, tip, adet, ledgerSide, isSource: true, description, ct);
+            await ApplyCustomerZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, ad, tip, adet, sourceLedgerSide, isSource: true, targetUseReduction: false, description, ct);
         else
-            await ApplySupplierZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, ad, tip, adet, ledgerSide, isSource: true, description, ct);
+            await ApplySupplierZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, sourceId, sourceBatchId, targetKind, targetId, targetBatchId, targetName, ad, tip, adet, sourceLedgerSide, isSource: true, targetUseReduction: false, description, ct);
 
         if (targetKind == "Customer")
-            await ApplyCustomerZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, ad, tip, adet, ledgerSide, isSource: false, description, ct);
+            await ApplyCustomerZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, ad, tip, adet, targetLedgerSide, isSource: false, targetUseReduction, description, ct);
         else
-            await ApplySupplierZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, ad, tip, adet, ledgerSide, isSource: false, description, ct);
+            await ApplySupplierZiynetLegAsync(tenantId, branchId, userId, userName, transferId, txDate, targetId, targetBatchId, sourceKind, sourceId, sourceBatchId, sourceName, ad, tip, adet, targetLedgerSide, isSource: false, targetUseReduction, description, ct);
     }
 
     private Task ApplyCustomerZiynetLegAsync(
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,
         Guid customerId, Guid batchId, string peerKind, Guid peerId, Guid peerBatchId, string peerName,
-        string ad, string? tip, decimal adet, string ledgerSide, bool isSource, string? description, CancellationToken ct)
+        string ad, string? tip, decimal adet, string ledgerSide, bool isSource, bool targetUseReduction, string? description, CancellationToken ct)
     {
         var keyAd = NormalizeZiynetKeyPart(ad);
         var keyTip = NormalizeZiynetKeyPart(string.IsNullOrWhiteSpace(tip) ? "Yeni" : tip);
@@ -239,24 +261,36 @@ public sealed class CariTransferService
 
         if (IsHasAltinZiynetAd(keyAd))
         {
-            var balanceDelta = isSource
-                ? CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet).BalanceDelta
-                : CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, adet).BalanceDelta;
-            return ApplyCustomerHasFromZiynetAsync(tenantId, branchId, userId, userName, transferId, txDate, customerId, batchId, peerKind, peerId, peerBatchId, peerName, balanceDelta, ledgerSide, isSource, role, description, ct);
+            decimal balanceDelta;
+            if (isSource || !targetUseReduction)
+                balanceDelta = isSource
+                    ? CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet).BalanceDelta
+                    : CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, adet).BalanceDelta;
+            else
+                balanceDelta = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet).BalanceDelta;
+            return ApplyCustomerHasFromZiynetAsync(tenantId, branchId, userId, userName, transferId, txDate, customerId, batchId, peerKind, peerId, peerBatchId, peerName, balanceDelta, ledgerSide, isSource, targetUseReduction, role, description, ct);
         }
 
         int direction;
         string refType;
         string cariDurum;
-        if (isSource)
+        if (isSource || !targetUseReduction)
         {
-            (direction, refType, _) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet);
-            cariDurum = "Transfer";
+            if (isSource)
+            {
+                (direction, refType, _) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet);
+                cariDurum = "Transfer";
+            }
+            else
+            {
+                (direction, cariDurum, _) = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, adet);
+                refType = "TRANSFER";
+            }
         }
         else
         {
-            (direction, cariDurum, _) = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, adet);
-            refType = "TRANSFER";
+            (direction, refType, _) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet);
+            cariDurum = "Transfer";
         }
 
         _db.CustomerTransactions.Add(new CustomerTransaction
@@ -284,7 +318,7 @@ public sealed class CariTransferService
     private async Task ApplyCustomerHasFromZiynetAsync(
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,
         Guid customerId, Guid batchId, string peerKind, Guid peerId, Guid peerBatchId, string peerName,
-        decimal balanceDelta, string ledgerSide, bool isSource, string role, string? description, CancellationToken ct)
+        decimal balanceDelta, string ledgerSide, bool isSource, bool targetUseReduction, string role, string? description, CancellationToken ct)
     {
         var bal = await CustomerFinanceHelper.GetOrCreateBalanceAsync(_db, tenantId, customerId, ct);
         ApplyCustomerBalanceDelta(bal, "HAS", balanceDelta);
@@ -292,15 +326,18 @@ public sealed class CariTransferService
         var qty = Math.Abs(balanceDelta);
         int direction;
         string refType;
-        if (isSource)
+        if (isSource || !targetUseReduction)
         {
-            (direction, refType, _) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, qty);
+            if (isSource)
+                (direction, refType, _) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, qty);
+            else
+            {
+                (direction, _, _) = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, qty);
+                refType = "TRANSFER";
+            }
         }
         else
-        {
-            (direction, _, _) = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, qty);
-            refType = "TRANSFER";
-        }
+            (direction, refType, _) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, qty);
 
         _db.CustomerTransactions.Add(new CustomerTransaction
         {
@@ -326,14 +363,25 @@ public sealed class CariTransferService
     private async Task ApplySupplierZiynetLegAsync(
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,
         Guid supplierId, Guid batchId, string peerKind, Guid peerId, Guid peerBatchId, string peerName,
-        string ad, string? tip, decimal adet, string ledgerSide, bool isSource, string? description, CancellationToken ct)
+        string ad, string? tip, decimal adet, string ledgerSide, bool isSource, bool targetUseReduction, string? description, CancellationToken ct)
     {
         var normAd = (ad ?? "").Trim();
         var normTip = NormalizeOpeningZiynetTip(normAd, tip);
         var role = isSource ? "SOURCE" : "TARGET";
-        decimal signedDelta = isSource
-            ? CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet).BalanceDelta
-            : CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, adet).BalanceDelta;
+        decimal signedDelta;
+        string refType;
+        if (isSource || !targetUseReduction)
+        {
+            if (isSource)
+                (_, refType, signedDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet);
+            else
+            {
+                signedDelta = CustomerFinanceHelper.BuildAdditionLeg(ledgerSide, adet).BalanceDelta;
+                refType = "TRANSFER";
+            }
+        }
+        else
+            (_, refType, signedDelta) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, adet);
 
         if (IsHasAltinZiynetAd(normAd))
         {
@@ -355,7 +403,7 @@ public sealed class CariTransferService
                 TargetUnitTlRate = 1m,
                 Description = CariTransferMarker.BuildNote(transferId, role, peerKind, peerId, peerBatchId, peerName, description),
                 TxDate = txDate,
-                RefType = "TRANSFER",
+                RefType = refType,
                 RefId = transferId,
                 BatchId = batchId,
                 UserId = userId,
@@ -380,7 +428,7 @@ public sealed class CariTransferService
             Description = BuildSupplierZiynetDescription(normAd, normTip, signedDelta, $"TRANSFER:{transferId:D}") + " " +
                           CariTransferMarker.BuildNote(transferId, role, peerKind, peerId, peerBatchId, peerName, description),
             TxDate = txDate,
-            RefType = "TRANSFER",
+            RefType = refType,
             RefId = transferId,
             BatchId = batchId,
             UserId = userId,
@@ -395,6 +443,17 @@ public sealed class CariTransferService
             return normalized;
         return signedAmount < 0m ? CustomerFinanceHelper.LedgerBorc : CustomerFinanceHelper.LedgerAlacak;
     }
+
+    private static string ResolveTargetLedgerSide(string sourceLedgerSide, string? targetLedgerSide)
+    {
+        var normalized = CustomerFinanceHelper.NormalizeLedgerSide(targetLedgerSide);
+        return string.IsNullOrEmpty(normalized) ? sourceLedgerSide : normalized;
+    }
+
+    private static bool ShouldTargetUseReduction(string sourceLedgerSide, string targetLedgerSide)
+        => CustomerFinanceHelper.IsLedgerBorc(sourceLedgerSide)
+            ? CustomerFinanceHelper.IsLedgerAlacak(targetLedgerSide)
+            : CustomerFinanceHelper.IsLedgerBorc(targetLedgerSide);
 
     private async Task ApplyIscilikliTransferAsync(
         Guid tenantId, Guid branchId, Guid? userId, string? userName, Guid transferId, DateTime txDate,

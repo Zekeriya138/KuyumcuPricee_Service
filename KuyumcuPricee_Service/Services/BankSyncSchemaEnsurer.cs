@@ -32,13 +32,12 @@ public sealed class BankSyncSchemaEnsurer
             if (_ensured && !force)
                 return;
 
-            await _db.Database.ExecuteSqlRawAsync(BankImportTransactionsSql, ct);
-            await _db.Database.ExecuteSqlRawAsync(BankImportTransactionsIndexesSql, ct);
-            await _db.Database.ExecuteSqlRawAsync(BankSyncProfilesSql, ct);
-            await _db.Database.ExecuteSqlRawAsync(BankSyncProfilesIndexesSql, ct);
-            await _db.Database.ExecuteSqlRawAsync(BankSyncProfilesColumnsSql, ct);
-            await _db.Database.ExecuteSqlRawAsync(CounterpartyIdentityCachesSql, ct);
-            await _db.Database.ExecuteSqlRawAsync(CounterpartyIdentityCachesIndexesSql, ct);
+            await _db.Database.ExecuteSqlRawAsync(BankImportTransactionsSql, Array.Empty<object>(), ct);
+            await _db.Database.ExecuteSqlRawAsync(BankImportTransactionsIndexesSql, Array.Empty<object>(), ct);
+            await _db.Database.ExecuteSqlRawAsync(BankImportTransactionsColumnsSql, Array.Empty<object>(), ct);
+            await _db.Database.ExecuteSqlRawAsync(BankSyncProfilesSql, Array.Empty<object>(), ct);
+            await _db.Database.ExecuteSqlRawAsync(BankSyncProfilesIndexesSql, Array.Empty<object>(), ct);
+            await _db.Database.ExecuteSqlRawAsync(BankSyncProfilesColumnsSql, Array.Empty<object>(), ct);
 
             _ensured = true;
             _logger.LogInformation("Bank sync tabloları doğrulandı (BankSyncProfiles, BankImportTransactions).");
@@ -111,7 +110,7 @@ BEGIN
         [VomsisAppSecret] nvarchar(512) NULL,
         [ErpApiBaseUrl] nvarchar(512) NOT NULL,
         [ErpApiAppKey] nvarchar(256) NULL,
-        [PollIntervalMinutes] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_PollIntervalMinutes] DEFAULT(5),
+        [PollIntervalMinutes] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_PollIntervalMinutes] DEFAULT(2),
         [AllowedAccountIds] nvarchar(128) NOT NULL CONSTRAINT [DF_BankSyncProfiles_AllowedAccountIds] DEFAULT(N'46'),
         [LookbackDays] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_LookbackDays] DEFAULT(7),
         [IsDeleted] bit NOT NULL CONSTRAINT [DF_BankSyncProfiles_IsDeleted] DEFAULT(0),
@@ -130,6 +129,18 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM sys.foreign_keys WHERE name = N'FK_BankSyncProfiles_Branches_BranchId')
         ALTER TABLE [dbo].[BankSyncProfiles] WITH CHECK ADD CONSTRAINT [FK_BankSyncProfiles_Branches_BranchId]
             FOREIGN KEY([BranchId]) REFERENCES [dbo].[Branches]([Id]) ON DELETE NO ACTION;
+END
+""";
+
+    private const string BankImportTransactionsColumnsSql = """
+IF OBJECT_ID(N'[dbo].[BankImportTransactions]', N'U') IS NOT NULL
+BEGIN
+    IF COL_LENGTH('BankImportTransactions', 'BankBranchName') IS NULL
+        ALTER TABLE [dbo].[BankImportTransactions] ADD [BankBranchName] nvarchar(256) NULL;
+    IF COL_LENGTH('BankImportTransactions', 'BankBranchCity') IS NULL
+        ALTER TABLE [dbo].[BankImportTransactions] ADD [BankBranchCity] nvarchar(64) NULL;
+    IF COL_LENGTH('BankImportTransactions', 'BankBranchDistrict') IS NULL
+        ALTER TABLE [dbo].[BankImportTransactions] ADD [BankBranchDistrict] nvarchar(64) NULL;
 END
 """;
 
@@ -154,6 +165,12 @@ BEGIN
         ALTER TABLE [dbo].[BankSyncProfiles] ADD [AutoInstructionOutgoingEnabled] bit NOT NULL CONSTRAINT [DF_BankSyncProfiles_AutoInstructionOutgoingEnabled] DEFAULT(0);
     IF COL_LENGTH('BankSyncProfiles', 'AutoInstructionOutgoingMinAmount') IS NULL
         ALTER TABLE [dbo].[BankSyncProfiles] ADD [AutoInstructionOutgoingMinAmount] decimal(18,2) NULL;
+    IF COL_LENGTH('BankSyncProfiles', 'PendingEnrichExternalIdsJson') IS NULL
+        ALTER TABLE [dbo].[BankSyncProfiles] ADD [PendingEnrichExternalIdsJson] nvarchar(2000) NULL;
+    -- Eski varsayılan 5 dk; daha hızlı çekim için 2 dk'ya indir.
+    UPDATE [dbo].[BankSyncProfiles]
+    SET [PollIntervalMinutes] = 2
+    WHERE [IsDeleted] = 0 AND [PollIntervalMinutes] = 5;
 END
 """;
 

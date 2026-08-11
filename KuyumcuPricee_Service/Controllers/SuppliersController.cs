@@ -844,6 +844,11 @@ public class SuppliersController : ControllerBase
         if (refType == "SALE" || desc.Contains("satis belgesi", StringComparison.OrdinalIgnoreCase))
             return "Satış";
 
+        // Transfer bacakları SETTLE_* ref tipiyle yazıldığı için tip yalnızca transfer işaretinden anlaşılır.
+        if (txType == "TRANSFER" || refType == "TRANSFER" ||
+            desc.Contains(CariTransferMarker.Prefix, StringComparison.OrdinalIgnoreCase))
+            return "Transfer";
+
         var veresiyeKaydi =
             desc.Contains("veresiye", StringComparison.OrdinalIgnoreCase) ||
             desc.Contains("cari", StringComparison.OrdinalIgnoreCase);
@@ -852,7 +857,6 @@ public class SuppliersController : ControllerBase
 
         if (txType == "OPENING_BALANCE") return "Açılış Bakiye Girişi";
         if (txType == "BALANCE_CONVERSION") return "Bakiye Dönüştürme";
-        if (txType == "TRANSFER") return "Transfer";
         if (txType == "PAYMENT") return "Ödeme";
         if (txType == "COLLECTION") return "Tahsilat";
         if (txType == "ZIYNET") return "Ziynet";

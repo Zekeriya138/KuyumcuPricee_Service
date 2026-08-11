@@ -6,6 +6,7 @@ using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
 using kuyumcu_infrastructure.Services;
 using kuyumcu_infrastructure.Tenancy;
+using KUYUMCU.Price_Service.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
@@ -20,12 +21,18 @@ public sealed class ExpenseSlipController : ControllerBase
     private readonly AppDbContext _db;
     private readonly ITenantContext _tenant;
     private readonly IEInvoiceProviderResolver _providerResolver;
+    private readonly ExpenseSlipSchemaEnsurer _schema;
 
-    public ExpenseSlipController(AppDbContext db, ITenantContext tenant, IEInvoiceProviderResolver providerResolver)
+    public ExpenseSlipController(
+        AppDbContext db,
+        ITenantContext tenant,
+        IEInvoiceProviderResolver providerResolver,
+        ExpenseSlipSchemaEnsurer schema)
     {
         _db = db;
         _tenant = tenant;
         _providerResolver = providerResolver;
+        _schema = schema;
     }
 
     [HttpGet]
@@ -38,6 +45,8 @@ public sealed class ExpenseSlipController : ControllerBase
     {
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
+
+        await _schema.EnsureAsync(ct);
 
         var tid = _tenant.TenantId;
         var q = _db.ExpenseSlipDocuments.AsNoTracking().Where(x => x.TenantId == tid);
@@ -84,6 +93,8 @@ public sealed class ExpenseSlipController : ControllerBase
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
 
+        await _schema.EnsureAsync(ct);
+
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
@@ -96,6 +107,8 @@ public sealed class ExpenseSlipController : ControllerBase
     {
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
+
+        await _schema.EnsureAsync(ct);
 
         var tid = _tenant.TenantId;
         var exists = await _db.ExpenseSlipDocuments.AsNoTracking().AnyAsync(x => x.TenantId == tid && x.Id == id, ct);
@@ -125,6 +138,8 @@ public sealed class ExpenseSlipController : ControllerBase
     {
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
+
+        await _schema.EnsureAsync(ct);
 
         if (req.BranchId == Guid.Empty)
             return BadRequest(new { error = "BranchId zorunludur." });
@@ -206,6 +221,8 @@ public sealed class ExpenseSlipController : ControllerBase
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
 
+        await _schema.EnsureAsync(ct);
+
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
         if (row is null) return NotFound(new { error = "Belge bulunamadı." });
@@ -256,6 +273,8 @@ public sealed class ExpenseSlipController : ControllerBase
     {
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
+
+        await _schema.EnsureAsync(ct);
 
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
@@ -323,6 +342,8 @@ public sealed class ExpenseSlipController : ControllerBase
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
 
+        await _schema.EnsureAsync(ct);
+
         var tid = _tenant.TenantId;
         var row = await _db.ExpenseSlipDocuments.FirstOrDefaultAsync(x => x.TenantId == tid && x.Id == id, ct);
         if (row is null) return NotFound(new { error = "Belge bulunamadı." });
@@ -387,6 +408,8 @@ public sealed class ExpenseSlipController : ControllerBase
     {
         var denied = RequireExpenseSlipPermission();
         if (denied != null) return denied;
+
+        await _schema.EnsureAsync(ct);
 
         var tid = _tenant.TenantId;
         var ids = (req.DocumentIds ?? [])

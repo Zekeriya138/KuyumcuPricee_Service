@@ -20,43 +20,45 @@ public sealed class ErpWorkerConfigClient
 
     public async Task<RemoteWorkerConfig?> FetchAsync(VomsisSyncRunRequest? request, CancellationToken ct)
     {
-        var baseUrl = FirstNonEmpty(
-            request?.ErpApiBaseUrl,
-            _config["Bootstrap:ErpApiBaseUrl"],
-            _config["ErpApi:BaseUrl"]);
-        var appKey = FirstNonEmpty(
-            _config["Bootstrap:ErpApiAppKey"],
-            _config["ErpApi:AppKey"]);
-        var tenantId = FirstNonEmpty(
-            request?.TenantId?.ToString(),
-            _config["Bootstrap:TenantId"],
-            _config["Sync:TenantId"]);
-        var branchId = FirstNonEmpty(
-            request?.BranchId?.ToString(),
-            _config["Bootstrap:BranchId"],
-            _config["Sync:BranchId"]);
-
-        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(appKey) ||
-            string.IsNullOrWhiteSpace(tenantId) || string.IsNullOrWhiteSpace(branchId))
+        var bootstrap = ResolveBootstrap(request);
+        if (bootstrap is null)
         {
-            _logger.LogWarning("Bootstrap ERP ayarları eksik (BaseUrl/AppKey/TenantId/BranchId).");
+            _logger.LogWarning("Bootstrap ERP ayarları eksik (BaseUrl/AppKey).");
             return null;
         }
 
-        _http.BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/");
-        _http.Timeout = TimeSpan.FromSeconds(60);
-        var headerName = _config["Bootstrap:AppKeyHeader"] ?? _config["ErpApi:AppKeyHeader"] ?? "x-app-key";
-        _http.DefaultRequestHeaders.Remove(headerName);
-        _http.DefaultRequestHeaders.Add(headerName, appKey);
-        _http.DefaultRequestHeaders.Remove("X-Tenant-Id");
-        _http.DefaultRequestHeaders.Remove("X-Branch-Id");
-        _http.DefaultRequestHeaders.Add("X-Tenant-Id", tenantId);
-        _http.DefaultRequestHeaders.Add("X-Branch-Id", branchId);
+        if (request?.BranchId is not { } branchId || branchId == Guid.Empty)
+        {
+            var fallbackBranchId = ParseOptionalGuid(bootstrap.BranchId);
+            if (fallbackBranchId is null || fallbackBranchId == Guid.Empty)
+            {
+                _logger.LogWarning("Tek şube profili için BranchId gerekli.");
+                return null;
+            }
 
-        using var resp = await _http.GetAsync("api/bank-sync/profile/worker?branchId=" + Uri.EscapeDataString(branchId), ct);
+            branchId = fallbackBranchId.Value;
+        }
+
+        var tenantId = request?.TenantId
+            ?? ParseOptionalGuid(bootstrap.TenantId)
+            ?? Guid.Empty;
+        if (tenantId == Guid.Empty)
+        {
+            _logger.LogWarning("Tek şube profili için TenantId gerekli.");
+            return null;
+        }
+
+        var url = bootstrap.BaseUrl.TrimEnd('/') + "/api/bank-sync/profile/worker?branchId=" + Uri.EscapeDataString(branchId.ToString());
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        
+        req.Headers.Add(bootstrap.AppKeyHeader, bootstrap.AppKey);
+        req.Headers.Add("X-Tenant-Id", tenantId.ToString());
+        req.Headers.Add("X-Branch-Id", branchId.ToString());
+
+        using var resp = await _http.SendAsync(req, ct);
         if (resp.StatusCode == System.Net.HttpStatusCode.NotFound)
         {
-            _logger.LogWarning("ERP'de banka sync profili yok veya devre dışı.");
+            _logger.LogWarning("ERP'de banka sync profili yok veya devre dışı (şube {BranchId}).", branchId);
             return null;
         }
 
@@ -67,12 +69,137 @@ public sealed class ErpWorkerConfigClient
         return await resp.Content.ReadFromJsonAsync<RemoteWorkerConfig>(cancellationToken: ct);
     }
 
+    public async Task<IReadOnlyList<RemoteWorkerBranchQueueItem>> FetchBranchQueueAsync(CancellationToken ct)
+    {
+        var bootstrap = ResolveBootstrap(null);
+        if (bootstrap is null)
+        {
+            _logger.LogWarning("Bootstrap ERP ayarları eksik (BaseUrl/AppKey).");
+            return Array.Empty<RemoteWorkerBranchQueueItem>();
+        }
+
+        var query = BuildBranchQueueQuery(bootstrap);
+        using var req = new HttpRequestMessage(HttpMethod.Get, bootstrap.BaseUrl.TrimEnd('/') + "/api/bank-sync/profile/worker/branches" + query);
+        
+        req.Headers.Add(bootstrap.AppKeyHeader, bootstrap.AppKey);
+        if (ParseOptionalGuid(bootstrap.TenantId) is { } tenantId && tenantId != Guid.Empty)
+            req.Headers.Add("X-Tenant-Id", tenantId.ToString());
+
+        using var resp = await _http.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Worker branch queue HTTP {(int)resp.StatusCode}: {body}");
+
+        var items = await resp.Content.ReadFromJsonAsync<List<RemoteWorkerBranchQueueItem>>(cancellationToken: ct)
+            ?? new List<RemoteWorkerBranchQueueItem>();
+
+        return items;
+    }
+
+    public static bool IsManualSyncPending(RemoteWorkerBranchQueueItem branch, DateTime utcNow)
+        => branch.HasPendingEnrich ||
+           (branch.ManualSyncRequestedUtc is DateTime req &&
+            (utcNow - req).TotalMinutes < 15);
+
+    public static bool ShouldSyncBranch(RemoteWorkerBranchQueueItem branch, DateTime utcNow)
+    {
+        if (IsManualSyncPending(branch, utcNow))
+            return true;
+
+        if (!branch.LastWorkerSyncUtc.HasValue)
+            return true;
+
+        var intervalMinutes = Math.Clamp(branch.PollIntervalMinutes, 1, 60);
+        return (utcNow - branch.LastWorkerSyncUtc.Value).TotalMinutes >= intervalMinutes;
+    }
+
+    private string BuildBranchQueueQuery(BootstrapSettings bootstrap)
+    {
+        var parts = new List<string>();
+
+        if (ParseOptionalGuid(bootstrap.TenantId) is { } tenantId && tenantId != Guid.Empty)
+            parts.Add("tenantId=" + Uri.EscapeDataString(tenantId.ToString()));
+
+        var branchFilter = ResolveBranchIdFilter(bootstrap);
+        if (branchFilter is { Count: > 0 })
+            parts.Add("branchIds=" + Uri.EscapeDataString(string.Join(",", branchFilter)));
+
+        return parts.Count == 0 ? "" : "?" + string.Join("&", parts);
+    }
+
+    private IReadOnlyCollection<Guid>? ResolveBranchIdFilter(BootstrapSettings bootstrap)
+    {
+        if (!string.IsNullOrWhiteSpace(bootstrap.BranchIds))
+        {
+            var ids = bootstrap.BranchIds
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(x => Guid.TryParse(x, out var g) ? g : Guid.Empty)
+                .Where(x => x != Guid.Empty)
+                .Distinct()
+                .ToList();
+            if (ids.Count > 0)
+                return ids;
+        }
+
+        if (ParseOptionalGuid(bootstrap.BranchId) is { } single && single != Guid.Empty)
+            return [single];
+
+        return null;
+    }
+
+
+    private BootstrapSettings? ResolveBootstrap(VomsisSyncRunRequest? request)
+    {
+        var baseUrl = FirstNonEmpty(
+            request?.ErpApiBaseUrl,
+            _config["Bootstrap:ErpApiBaseUrl"],
+            _config["ErpApi:BaseUrl"]);
+        var appKey = FirstNonEmpty(
+            _config["Bootstrap:ErpApiAppKey"],
+            _config["ErpApi:AppKey"]);
+
+        if (string.IsNullOrWhiteSpace(baseUrl) || string.IsNullOrWhiteSpace(appKey))
+            return null;
+
+        return new BootstrapSettings
+        {
+            BaseUrl = baseUrl.Trim(),
+            AppKey = appKey.Trim(),
+            AppKeyHeader = FirstNonEmpty(
+                _config["Bootstrap:AppKeyHeader"],
+                _config["ErpApi:AppKeyHeader"],
+                "x-app-key") ?? "x-app-key",
+            TenantId = FirstNonEmpty(
+                request?.TenantId?.ToString(),
+                _config["Bootstrap:TenantId"],
+                _config["Sync:TenantId"]),
+            BranchId = FirstNonEmpty(
+                request?.BranchId?.ToString(),
+                _config["Bootstrap:BranchId"],
+                _config["Sync:BranchId"]),
+            BranchIds = _config["Bootstrap:BranchIds"]
+        };
+    }
+
+    private static Guid? ParseOptionalGuid(string? value)
+        => Guid.TryParse(value, out var g) && g != Guid.Empty ? g : null;
+
     private static string? FirstNonEmpty(params string?[] values)
     {
         foreach (var v in values)
             if (!string.IsNullOrWhiteSpace(v))
                 return v.Trim();
         return null;
+    }
+
+    private sealed class BootstrapSettings
+    {
+        public string BaseUrl { get; set; } = "";
+        public string AppKey { get; set; } = "";
+        public string AppKeyHeader { get; set; } = "x-app-key";
+        public string? TenantId { get; set; }
+        public string? BranchId { get; set; }
+        public string? BranchIds { get; set; }
     }
 }
 
@@ -89,4 +216,15 @@ public sealed class RemoteWorkerConfig
     public int[] AllowedAccountIds { get; set; } = [];
     public int LookbackDays { get; set; } = 7;
     public DateTime? ManualSyncRequestedUtc { get; set; }
+    public long[] PendingEnrichExternalIds { get; set; } = [];
+}
+
+public sealed class RemoteWorkerBranchQueueItem
+{
+    public Guid TenantId { get; set; }
+    public Guid BranchId { get; set; }
+    public DateTime? ManualSyncRequestedUtc { get; set; }
+    public int PollIntervalMinutes { get; set; } = 5;
+    public DateTime? LastWorkerSyncUtc { get; set; }
+    public bool HasPendingEnrich { get; set; }
 }

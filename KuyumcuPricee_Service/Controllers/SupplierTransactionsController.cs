@@ -277,32 +277,16 @@ public sealed class SupplierTransactionsController : ControllerBase
                 if (string.IsNullOrEmpty(targetLedgerSide))
                     targetLedgerSide = ledgerSide;
 
-                var (tgtGrossBorc, tgtGrossAlacak) = await GetSupplierConversionGrossAsync(tenantId, supplier.Id, branchId, tgtU, ct);
-                var targetIsOpposite = CustomerFinanceHelper.IsLedgerBorc(ledgerSide)
-                    ? tgtGrossAlacak > 0m
-                    : tgtGrossBorc > 0m;
-
-                if (targetIsOpposite)
-                {
-                    if (CustomerFinanceHelper.IsLedgerAlacak(targetLedgerSide))
-                    {
-                        if (tgtGrossAlacak + 0.0005m < tgtAmt)
-                            return BadRequest(new { error = "Hedef alacak miktarı yetersiz." });
-                    }
-                    else if (tgtGrossBorc + 0.0005m < tgtAmt)
-                    {
-                        return BadRequest(new { error = "Hedef borç miktarı yetersiz." });
-                    }
-                }
+                var targetUseReduction = CustomerFinanceHelper.ShouldTargetUseReduction(ledgerSide, targetLedgerSide);
 
                 var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
                 var srcDelta = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, srcAmt).BalanceDelta;
-                var tgtDelta = targetIsOpposite
+                var tgtDelta = targetUseReduction
                     ? CustomerFinanceHelper.BuildReductionLeg(targetLedgerSide, tgtAmt).BalanceDelta
                     : CustomerFinanceHelper.BuildAdditionLeg(targetLedgerSide, tgtAmt).BalanceDelta;
 
-                ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate, batchId);
-                lastEntity = ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate, batchId);
+                ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate, batchId, ledgerSide, useReduction: true);
+                lastEntity = ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate, batchId, targetLedgerSide, targetUseReduction);
                 lastEntityAdded = true;
             }
             else
@@ -848,8 +832,13 @@ public sealed class SupplierTransactionsController : ControllerBase
     private SupplierTransaction ApplySupplierConversionSide(
         SupplierBalance bal, Guid tenantId, Guid supplierId, Guid branchId,
         BalanceConversionZiynetHelper.ConversionUnit unit,
-        decimal amount, decimal delta, decimal rate, string note, DateTime txDate, Guid batchId)
+        decimal amount, decimal delta, decimal rate, string note, DateTime txDate, Guid batchId,
+        string ledgerSide, bool useReduction)
     {
+        string? refType = null;
+        if (useReduction)
+            (_, refType, _) = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, amount);
+
         SupplierTransaction entity;
         if (unit.IsZiynet)
         {
@@ -869,6 +858,7 @@ public sealed class SupplierTransactionsController : ControllerBase
                 TargetUnitTlRate = 1m,
                 Description = BuildSupplierZiynetDescription(unit.ZiynetAd, tip, delta, "BALANCE_CONVERSION"),
                 TxDate = txDate,
+                RefType = refType,
                 BatchId = batchId
             };
         }
@@ -890,6 +880,7 @@ public sealed class SupplierTransactionsController : ControllerBase
                 TargetUnitTlRate = rate,
                 Description = note,
                 TxDate = txDate,
+                RefType = refType,
                 BatchId = batchId
             };
         }

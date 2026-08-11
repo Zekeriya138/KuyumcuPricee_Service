@@ -21,13 +21,8 @@ app.MapPost("/sync", async (
     string? erpApiBaseUrl,
     CancellationToken ct) =>
 {
-    var expectedKey = config["Sync:TriggerKey"];
-    if (!string.IsNullOrWhiteSpace(expectedKey))
-    {
-        var provided = http.Request.Headers["x-sync-key"].FirstOrDefault();
-        if (!string.Equals(provided, expectedKey, StringComparison.Ordinal))
-            return Results.Unauthorized();
-    }
+    if (!IsAuthorized(http, config))
+        return Results.Unauthorized();
 
     try
     {
@@ -48,6 +43,51 @@ app.MapPost("/sync", async (
         return Results.BadRequest(new { error = ex.Message });
     }
 });
+
+app.MapPost("/enrich-tax", async (
+    HttpContext http,
+    VomsisSyncRunner runner,
+    IConfiguration config,
+    Guid tenantId,
+    Guid branchId,
+    long externalId,
+    string? erpApiBaseUrl,
+    CancellationToken ct) =>
+{
+    if (!IsAuthorized(http, config))
+        return Results.Unauthorized();
+
+    if (tenantId == Guid.Empty || branchId == Guid.Empty || externalId <= 0)
+        return Results.BadRequest(new { error = "tenantId, branchId ve externalId zorunludur." });
+
+    try
+    {
+        var result = await runner.EnrichTaxAsync(new VomsisSyncRunRequest
+        {
+            TenantId = tenantId,
+            BranchId = branchId,
+            ErpApiBaseUrl = erpApiBaseUrl
+        }, externalId, ct);
+
+        if (!result.Success)
+            return Results.BadRequest(result);
+
+        return Results.Ok(result);
+    }
+    catch (Exception ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+});
+
+static bool IsAuthorized(HttpContext http, IConfiguration config)
+{
+    var expectedKey = config["Sync:TriggerKey"];
+    if (string.IsNullOrWhiteSpace(expectedKey))
+        return true;
+    var provided = http.Request.Headers["x-sync-key"].FirstOrDefault();
+    return string.Equals(provided, expectedKey, StringComparison.Ordinal);
+}
 
 var listenPort = builder.Configuration.GetValue("Sync:ListenPort", 5080);
 app.Urls.Add($"http://0.0.0.0:{listenPort}");

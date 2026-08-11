@@ -94,6 +94,7 @@ namespace kuyumcu_infrastructure.Tenancy
             if (path.Equals("/health", StringComparison.OrdinalIgnoreCase)) return false;
             if (path.StartsWith("/auth", StringComparison.OrdinalIgnoreCase)) return false;
             if (path.StartsWith("/api/auth", StringComparison.OrdinalIgnoreCase)) return false;
+            if (path.StartsWith("/api/bank-sync/profile/worker", StringComparison.OrdinalIgnoreCase)) return false;
             if (HttpMethods.IsOptions(ctx.Request.Method)) return false;
             return true;
         }

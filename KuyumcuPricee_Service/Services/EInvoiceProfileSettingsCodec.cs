@@ -263,35 +263,106 @@ public static class EInvoiceProfileSettingsCodec
             .FirstOrDefault(x => value >= x.MinTotal && value <= x.MaxTotal);
     }
 
+    public static readonly string[] CollectionCraftedKaratCandidates = ["24K", "22K", "18K", "14K", "8K"];
+
     /// <summary>
-    /// Tahsilat (banka/havale) taslakları için işçilik kuralı: önce Tahsilat/Has altın, yoksa İşçilikli ayar kuralları.
+    /// Tahsilat tutarına uyan İşçilikli (24/22/18/14/8K) kurallarını listeler.
     /// </summary>
-    public static WorkmanshipRuleSetting? ResolveCollectionWorkmanshipRule(
+    public static List<WorkmanshipRuleSetting> ListMatchingCollectionWorkmanshipRules(
         IReadOnlyCollection<WorkmanshipRuleSetting>? rules,
         decimal amount)
     {
+        var matches = new List<WorkmanshipRuleSetting>();
+        if (rules is null || rules.Count == 0 || amount <= 0m)
+            return matches;
+
+        foreach (var karat in CollectionCraftedKaratCandidates)
+        {
+            var crafted = ResolveWorkmanshipRule(rules, WorkmanshipProductTypeCrafted, karat, amount);
+            if (crafted is not null)
+                matches.Add(crafted);
+        }
+
+        // Eski Tahsilat/Has kuralları varsa 24K eşdeğeri olarak değerlendir.
         var tahsilat = ResolveWorkmanshipRule(
             rules,
             WorkmanshipProductTypeCollection,
             WorkmanshipCollectionSelector,
             amount);
-        if (tahsilat is not null)
-            return tahsilat;
-
-        foreach (var karat in new[] { "24K", "22K", "18K", "14K", "8K" })
+        if (tahsilat is not null &&
+            !matches.Any(x => string.Equals(
+                NormalizeWorkmanshipSelector(WorkmanshipProductTypeCrafted, x.Karat),
+                "24K",
+                StringComparison.OrdinalIgnoreCase)))
         {
-            var crafted = ResolveWorkmanshipRule(rules, WorkmanshipProductTypeCrafted, karat, amount);
-            if (crafted is not null)
-                return crafted;
+            matches.Add(new WorkmanshipRuleSetting
+            {
+                ProductType = WorkmanshipProductTypeCrafted,
+                Karat = "24K",
+                MinTotal = tahsilat.MinTotal,
+                MaxTotal = tahsilat.MaxTotal,
+                Percentage = tahsilat.Percentage
+            });
         }
 
-        var value = Math.Round(amount, 2, MidpointRounding.AwayFromZero);
-        return NormalizeWorkmanshipRules(rules)
+        return matches;
+    }
+
+    /// <summary>
+    /// Tahsilat taslağı için tutara uyan ayarlardan rastgele bir işçilik kuralı seçer.
+    /// Uyan kural yoksa null döner (taslak oluşturulmamalı).
+    /// </summary>
+    public static WorkmanshipRuleSetting? ResolveCollectionWorkmanshipRule(
+        IReadOnlyCollection<WorkmanshipRuleSetting>? rules,
+        decimal amount)
+    {
+        var matches = ListMatchingCollectionWorkmanshipRules(rules, amount);
+        if (matches.Count == 0)
+            return null;
+        if (matches.Count == 1)
+            return matches[0];
+        return matches[Random.Shared.Next(matches.Count)];
+    }
+
+    public static bool HasAnyWorkmanshipRules(IReadOnlyCollection<WorkmanshipRuleSetting>? rules)
+        => NormalizeWorkmanshipRules(rules).Count > 0;
+
+    /// <summary>
+    /// Gider pusulası / banka giden havale için tutara uyan kurallardan rastgele ayar seçer.
+    /// </summary>
+    public static string ResolveRandomExpenseSlipKarat(
+        IReadOnlyCollection<WorkmanshipRuleSetting>? rules,
+        decimal amount)
+    {
+        var matches = ListMatchingCollectionWorkmanshipRules(rules, amount);
+        if (matches.Count > 0)
+        {
+            var rule = matches[Random.Shared.Next(matches.Count)];
+            return string.IsNullOrWhiteSpace(rule.Karat) ? "24K" : rule.Karat.Trim();
+        }
+
+        var craftedKarats = NormalizeWorkmanshipRules(rules)
             .Where(x => string.Equals(
                 NormalizeWorkmanshipProductType(x.ProductType),
                 WorkmanshipProductTypeCrafted,
                 StringComparison.OrdinalIgnoreCase))
-            .FirstOrDefault(x => value >= x.MinTotal && value <= x.MaxTotal);
+            .Select(x => NormalizeWorkmanshipSelector(WorkmanshipProductTypeCrafted, x.Karat))
+            .Where(x => !string.IsNullOrWhiteSpace(x) && AllowedKaratValues.Contains(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (craftedKarats.Count > 0)
+            return craftedKarats[Random.Shared.Next(craftedKarats.Count)];
+
+        return CollectionCraftedKaratCandidates[Random.Shared.Next(CollectionCraftedKaratCandidates.Length)];
+    }
+
+    public static string BuildExpenseSlipProductType(string karat)
+        => string.IsNullOrWhiteSpace(karat) ? "24K" : karat.Trim();
+
+    public static string BuildExpenseSlipWorkmanship(string karat)
+    {
+        var k = BuildExpenseSlipProductType(karat);
+        return $"{k} altın";
     }
 
     public static string NormalizeWorkmanshipProductType(string? value)

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
@@ -56,14 +57,36 @@ public interface IBankSyncService
         Guid branchId,
         Guid transactionId,
         CancellationToken ct);
+
+    Task<BankImportTaxRefreshResult> ApplyVomsisEnrichmentAsync(
+        Guid tenantId,
+        Guid branchId,
+        VomsisEnrichmentApplyDto enrichment,
+        CancellationToken ct);
+}
+
+public sealed class VomsisEnrichmentApplyDto
+{
+    public long ExternalId { get; set; }
+    public string? ExternalKey { get; set; }
+    public string? SenderName { get; set; }
+    public string? SenderTitle { get; set; }
+    public string? SenderTaxNo { get; set; }
+    public string? BankBranchName { get; set; }
+    public string? BankBranchCity { get; set; }
+    public string? BankBranchDistrict { get; set; }
 }
 
 public sealed class BankImportTaxRefreshResult
 {
     public bool Success { get; set; }
+    public bool Queued { get; set; }
     public string? Message { get; set; }
     public string? CounterpartyTaxNo { get; set; }
     public string? CounterpartyName { get; set; }
+    public string? BankBranchName { get; set; }
+    public string? BankBranchCity { get; set; }
+    public string? BankBranchDistrict { get; set; }
     public string? Status { get; set; }
 }
 
@@ -171,9 +194,11 @@ public sealed class BankSyncService : IBankSyncService
     private readonly IConfiguration _config;
     private readonly BankSyncSchemaEnsurer _schema;
     private readonly EInvoiceProfileSchemaEnsurer _einvoiceSchema;
+    private readonly ExpenseSlipSchemaEnsurer _expenseSlipSchema;
     private readonly IBankSyncProfileService _profileService;
     private readonly IWebHostEnvironment _env;
     private readonly ICounterpartyTaxResolver _taxResolver;
+    private readonly ExchangeRateService _rates;
 
     public BankSyncService(
         AppDbContext db,
@@ -183,9 +208,11 @@ public sealed class BankSyncService : IBankSyncService
         IConfiguration config,
         BankSyncSchemaEnsurer schema,
         EInvoiceProfileSchemaEnsurer einvoiceSchema,
+        ExpenseSlipSchemaEnsurer expenseSlipSchema,
         IBankSyncProfileService profileService,
         IWebHostEnvironment env,
-        ICounterpartyTaxResolver taxResolver)
+        ICounterpartyTaxResolver taxResolver,
+        ExchangeRateService rates)
     {
         _db = db;
         _workflow = workflow;
@@ -194,9 +221,11 @@ public sealed class BankSyncService : IBankSyncService
         _config = config;
         _schema = schema;
         _einvoiceSchema = einvoiceSchema;
+        _expenseSlipSchema = expenseSlipSchema;
         _profileService = profileService;
         _env = env;
         _taxResolver = taxResolver;
+        _rates = rates;
     }
 
     public async Task<BankSyncPullResult> PullFromVomsisAsync(
@@ -253,12 +282,41 @@ public sealed class BankSyncService : IBankSyncService
         }
     }
 
+    private async Task EnqueueMissingTaxRowsForWorkerAsync(
+        Guid tenantId,
+        Guid branchId,
+        CancellationToken ct)
+    {
+        var missingIds = await _db.BankImportTransactions.AsNoTracking()
+            .Where(x =>
+                x.TenantId == tenantId &&
+                x.BranchId == branchId &&
+                x.Provider == ProviderVomsis &&
+                !x.IsDeleted &&
+                x.ExternalId > 0 &&
+                (x.Status == BankImportStatuses.MissingTaxId ||
+                 x.Status == BankImportStatuses.Skipped ||
+                 x.Status == BankImportStatuses.Pending ||
+                 x.CounterpartyTaxNo == null ||
+                 x.CounterpartyTaxNo == "" ||
+                 x.BankBranchName == null ||
+                 x.BankBranchName == ""))
+            .OrderByDescending(x => x.TransactionDateUtc)
+            .Select(x => x.ExternalId)
+            .Take(40)
+            .ToListAsync(ct);
+
+        foreach (var id in missingIds)
+            await _profileService.EnqueuePendingEnrichAsync(tenantId, branchId, id, ct);
+    }
+
     private async Task<BankSyncPullResult> QueueWorkerSyncAndWaitAsync(
         Guid tenantId,
         Guid branchId,
         CancellationToken ct)
     {
         var requestedAt = DateTime.UtcNow;
+        await EnqueueMissingTaxRowsForWorkerAsync(tenantId, branchId, ct);
         await _profileService.RequestManualSyncAsync(tenantId, branchId, ct);
 
         var blockingWait = _config.GetValue("BankSync:WorkerQueueBlockingWait", false);
@@ -514,6 +572,42 @@ public sealed class BankSyncService : IBankSyncService
             .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
         var allowedAccounts = ParseAccountIds(bankProfile?.AllowedAccountIds).ToHashSet();
 
+        var customerRowsCache = await _db.Customers.AsNoTracking()
+            .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted && x.CariTip == 0)
+            .Select(x => new CustomerMatchRow(x.Id, x.FullName, x.NationalId, x.Address, x.City, x.District, x.Email))
+            .ToListAsync(ct);
+
+        var externalKeys = transactions
+            .Where(tx => !string.IsNullOrWhiteSpace(tx.ExternalKey))
+            .Select(tx => tx.ExternalKey!)
+            .Distinct(StringComparer.Ordinal)
+            .ToList();
+
+        // externalKeys.Contains → SQL Server'da OPENJSON ... WITH üretip batch hatasına düşebilir.
+        // Tarih penceresini geniş tut: aksi halde mevcut MissingTaxId satırları bulunamaz, TCKN yazılmaz.
+        var minTransactionDate = DateTime.UtcNow.AddDays(-90);
+        var externalKeySet = externalKeys.ToHashSet(StringComparer.Ordinal);
+        var externalIdSet = transactions.Select(x => x.ExternalId).Where(x => x > 0).ToHashSet();
+        var recentRows = externalKeySet.Count == 0 && externalIdSet.Count == 0
+            ? new List<BankImportTransaction>()
+            : await _db.BankImportTransactions
+                .Where(x => x.TenantId == tenantId &&
+                            x.BranchId == branchId &&
+                            x.Provider == ProviderVomsis &&
+                            !x.IsDeleted &&
+                            x.TransactionDateUtc >= minTransactionDate)
+                .ToListAsync(ct);
+        var matchedRows = recentRows
+            .Where(x => externalKeySet.Contains(x.ExternalKey) || externalIdSet.Contains(x.ExternalId))
+            .ToList();
+        var existingByKey = matchedRows
+            .Where(x => !string.IsNullOrWhiteSpace(x.ExternalKey))
+            .GroupBy(x => x.ExternalKey, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.First(), StringComparer.Ordinal);
+        var existingByExternalId = matchedRows
+            .GroupBy(x => x.ExternalId)
+            .ToDictionary(g => g.Key, g => g.First());
+
         foreach (var tx in transactions)
         {
             if (string.IsNullOrWhiteSpace(tx.ExternalKey))
@@ -522,35 +616,43 @@ public sealed class BankSyncService : IBankSyncService
                 continue;
             }
 
-            var enrichedTx = await EnsureTaxEnrichedAsync(tx, bankProfile, ct);
-
-            var existingEntity = await _db.BankImportTransactions
-                .FirstOrDefaultAsync(x =>
-                    x.TenantId == tenantId &&
-                    x.BranchId == branchId &&
-                    x.Provider == ProviderVomsis &&
-                    x.ExternalKey == enrichedTx.ExternalKey &&
-                    !x.IsDeleted, ct);
+            existingByKey.TryGetValue(tx.ExternalKey, out var existingEntity);
+            if (existingEntity is null)
+                existingByExternalId.TryGetValue(tx.ExternalId, out existingEntity);
             if (existingEntity is not null)
             {
-                if (await TryUpgradeExistingIncomingAsync(
-                        existingEntity, enrichedTx, tenantId, branchId, profile, bankProfile, result, ct))
-                    result.Imported++;
+                ApplyVomsisTransactionDate(existingEntity, tx);
+                var existingType = NormalizeVomsisTxType(existingEntity.TransactionType ?? tx.Type);
+                var existingCurrency = NormalizeCurrency(existingEntity.Currency ?? tx.Currency);
+                var isOutgoingExisting =
+                    string.Equals(existingType, "borclu", StringComparison.OrdinalIgnoreCase) &&
+                    IsTryCurrency(existingCurrency);
+
+                if (ShouldAttemptExistingUpgrade(existingEntity, bankProfile))
+                {
+                    var upgraded = isOutgoingExisting
+                        ? await TryUpgradeExistingOutgoingAsync(
+                            existingEntity, tx, tenantId, branchId, bankProfile, result, ct)
+                        : await TryUpgradeExistingIncomingAsync(
+                            existingEntity, tx, tenantId, branchId, profile, bankProfile, result, ct);
+                    if (upgraded)
+                        result.Imported++;
+                }
                 result.SkippedDuplicate++;
                 continue;
             }
 
-            var currency = NormalizeCurrency(enrichedTx.Currency);
-            var txType = (enrichedTx.Type ?? "").Trim().ToLowerInvariant();
-            var amount = decimal.Round(Math.Abs(enrichedTx.Amount), 2, MidpointRounding.AwayFromZero);
+            var currency = NormalizeCurrency(tx.Currency);
+            var txType = (tx.Type ?? "").Trim().ToLowerInvariant();
+            var amount = decimal.Round(Math.Abs(tx.Amount), 2, MidpointRounding.AwayFromZero);
 
-            if (ShouldSkipForAccountFilter(enrichedTx.VomsisAccountId, allowedAccounts, txType, currency))
+            if (ShouldSkipForAccountFilter(tx.VomsisAccountId, allowedAccounts, txType, currency))
             {
-                var skippedAccount = CreateEntity(tenantId, branchId, enrichedTx, currency, txType, amount);
-                ApplyCounterpartyFields(skippedAccount, enrichedTx);
+                var skippedAccount = CreateEntity(tenantId, branchId, tx, currency, txType, amount);
+                ApplyCounterpartyFields(skippedAccount, tx);
                 skippedAccount.Status = BankImportStatuses.Skipped;
-                skippedAccount.StatusMessage = enrichedTx.VomsisAccountId.HasValue
-                    ? $"Hesap {enrichedTx.VomsisAccountId} izin dışı (yalnızca TL hesap {string.Join(",", allowedAccounts.OrderBy(x => x))})."
+                skippedAccount.StatusMessage = tx.VomsisAccountId.HasValue
+                    ? $"Hesap {tx.VomsisAccountId} izin dışı (yalnızca TL hesap {string.Join(",", allowedAccounts.OrderBy(x => x))})."
                     : "Hesap bilgisi yok; TL hesap filtresi uygulanamadı.";
                 _db.BankImportTransactions.Add(skippedAccount);
                 result.SkippedFilter++;
@@ -561,14 +663,14 @@ public sealed class BankSyncService : IBankSyncService
             if (string.Equals(txType, "borclu", StringComparison.OrdinalIgnoreCase) && IsTryCurrency(currency))
             {
                 await ImportOutgoingTransactionAsync(
-                    tenantId, branchId, bankProfile, enrichedTx, currency, txType, amount, result, ct);
+                    tenantId, branchId, bankProfile, tx, currency, txType, amount, result, ct);
                 continue;
             }
 
-            if (!IsQualifyingIncomingTransfer(txType, amount, currency, enrichedTx.Description))
+            if (!IsQualifyingIncomingTransfer(txType, amount, currency, tx.Description))
             {
-                var skipped = CreateEntity(tenantId, branchId, enrichedTx, currency, txType, amount);
-                ApplyCounterpartyFields(skipped, enrichedTx);
+                var skipped = CreateEntity(tenantId, branchId, tx, currency, txType, amount);
+                ApplyCounterpartyFields(skipped, tx);
                 skipped.Status = BankImportStatuses.Skipped;
                 skipped.StatusMessage = IsTryCurrency(currency)
                     ? "Filtre dışı hareket (TL gelen havale değil)."
@@ -578,6 +680,9 @@ public sealed class BankSyncService : IBankSyncService
                 result.Imported++;
                 continue;
             }
+
+            // Yalnızca işlenecek TL gelen havaleler için dekont detayı çekilir (toplu import hızını korur).
+            var enrichedTx = await EnsureTaxEnrichedAsync(tx, bankProfile, ct);
 
             var entity = CreateEntity(tenantId, branchId, enrichedTx, currency, txType, amount);
             ApplyCounterpartyFields(entity, enrichedTx);
@@ -589,9 +694,10 @@ public sealed class BankSyncService : IBankSyncService
                 entity.CounterpartyTaxNo,
                 entity.CounterpartyIban,
                 entity.Description,
-                IsIncomingTransfer: true), ct);
+                IsIncomingTransfer: true,
+                AllowNihaiTuketici: false), ct);
 
-            if (!resolved.Success || string.IsNullOrWhiteSpace(resolved.TaxNo))
+            if (!resolved.Success || string.IsNullOrWhiteSpace(resolved.TaxNo) || IsPlaceholderTax(resolved.TaxNo))
             {
                 entity.Status = BankImportStatuses.MissingTaxId;
                 entity.StatusMessage = resolved.Message ?? "TCKN/VKN bulunamadı.";
@@ -605,9 +711,14 @@ public sealed class BankSyncService : IBankSyncService
             }
 
             entity.CounterpartyTaxNo = resolved.TaxNo;
-            if (!string.IsNullOrWhiteSpace(resolved.DisplayName))
-                entity.CounterpartyName = BankMovementParser.SanitizeCounterpartyDisplayName(resolved.DisplayName, resolved.TaxNo)
-                    ?? resolved.DisplayName;
+            if (!string.IsNullOrWhiteSpace(resolved.DisplayName) || !string.IsNullOrWhiteSpace(enrichedTx.SenderTitle))
+            {
+                entity.CounterpartyName = BankMovementParser.PreferCounterpartyDisplayName(
+                    enrichedTx.SenderTitle ?? enrichedTx.SenderName,
+                    entity.CounterpartyName,
+                    resolved.DisplayName,
+                    resolved.TaxNo) ?? entity.CounterpartyName;
+            }
 
             CustomerMatchRow? customer = null;
             if (resolved.CustomerId.HasValue)
@@ -619,11 +730,7 @@ public sealed class BankSyncService : IBankSyncService
             }
             else
             {
-                var customerRows = await _db.Customers.AsNoTracking()
-                    .Where(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted && x.CariTip == 0)
-                    .Select(x => new CustomerMatchRow(x.Id, x.FullName, x.NationalId, x.Address, x.City, x.District, x.Email))
-                    .ToListAsync(ct);
-                customer = ResolveCustomer(customerRows, entity.CounterpartyName, entity.CounterpartyTaxNo);
+                customer = ResolveCustomer(customerRowsCache, entity.CounterpartyName, entity.CounterpartyTaxNo);
             }
 
             if (customer is not null)
@@ -633,108 +740,198 @@ public sealed class BankSyncService : IBankSyncService
 
                 if (ShouldAutoSendIncoming(bankProfile, amount))
                 {
-                    try
-                    {
-                        var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
-                            tenantId, branchId, customer, taxNo, amount, entity, enrichedTx, bankProfile, ct);
-                        await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
-                        entity.Status = BankImportStatuses.AutoSendQueued;
-                        entity.StatusMessage = resolved.IsNihaiTuketici
-                            ? $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL)."
-                            : $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL, {resolved.Source}).";
-                        entity.InvoiceId = invoiceId;
-                        entity.EInvoiceDocumentId = documentId;
-                        result.DraftCreated++;
-                        await _taxResolver.LearnAsync(new CounterpartyLearnInput(
-                            tenantId, entity.CounterpartyName, entity.CounterpartyIban, taxNo,
-                            resolved.Source ?? CounterpartyIdentitySources.BankImport, customer.Id), ct);
-                    }
-                    catch (Exception ex)
+                    var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                    if (workmanshipError is not null)
                     {
                         entity.Status = BankImportStatuses.Pending;
-                        entity.StatusMessage = "Otomatik gönderim başarısız: " + ex.Message;
+                        entity.StatusMessage = workmanshipError;
                         result.PendingReview++;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                                tenantId, branchId, customer, taxNo, amount, entity, enrichedTx, bankProfile, ct);
+                            await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+                            await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                            entity.Status = BankImportStatuses.AutoSendQueued;
+                            entity.StatusMessage = resolved.IsNihaiTuketici
+                                ? $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL)."
+                                : $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL, {resolved.Source}).";
+                            entity.InvoiceId = invoiceId;
+                            entity.EInvoiceDocumentId = documentId;
+                            result.DraftCreated++;
+                        }
+                        catch (Exception ex)
+                        {
+                            entity.Status = BankImportStatuses.Pending;
+                            entity.StatusMessage = "Otomatik gönderim başarısız: " + ex.Message;
+                            result.PendingReview++;
+                        }
                     }
                 }
                 else if (ShouldCreateIncomingBankDraft(profile, bankProfile, amount))
                 {
-                    try
-                    {
-                        var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
-                            tenantId, branchId, customer, taxNo, amount, entity, enrichedTx, bankProfile, ct);
-                        entity.Status = BankImportStatuses.DraftCreated;
-                        entity.StatusMessage = resolved.IsNihaiTuketici
-                            ? "Otomatik taslak (nihai tüketici)."
-                            : $"Otomatik taslak oluşturuldu ({resolved.Source}).";
-                        entity.InvoiceId = invoiceId;
-                        entity.EInvoiceDocumentId = documentId;
-                        result.DraftCreated++;
-                        await _taxResolver.LearnAsync(new CounterpartyLearnInput(
-                            tenantId, entity.CounterpartyName, entity.CounterpartyIban, taxNo,
-                            resolved.Source ?? CounterpartyIdentitySources.BankImport, customer.Id), ct);
-                    }
-                    catch (Exception ex)
+                    var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                    if (workmanshipError is not null)
                     {
                         entity.Status = BankImportStatuses.Pending;
-                        entity.StatusMessage = "Taslak oluşturulamadı: " + ex.Message;
+                        entity.StatusMessage = workmanshipError;
                         result.PendingReview++;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                                tenantId, branchId, customer, taxNo, amount, entity, enrichedTx, bankProfile, ct);
+                            entity.Status = BankImportStatuses.DraftCreated;
+                            entity.StatusMessage = resolved.IsNihaiTuketici
+                                ? "Otomatik taslak (nihai tüketici)."
+                                : $"Otomatik taslak oluşturuldu ({resolved.Source}).";
+                            entity.InvoiceId = invoiceId;
+                            entity.EInvoiceDocumentId = documentId;
+                            result.DraftCreated++;
+                        }
+                        catch (Exception ex)
+                        {
+                            entity.Status = BankImportStatuses.Pending;
+                            entity.StatusMessage = "Taslak oluşturulamadı: " + ex.Message;
+                            result.PendingReview++;
+                        }
                     }
                 }
                 else
                 {
                     entity.Status = BankImportStatuses.Pending;
-                    entity.StatusMessage = "Eşleşti; e-fatura otomatik taslak ayarları kapalı veya tutar aralığı dışında.";
+                    entity.StatusMessage = IncomingBelowThresholdMessage(bankProfile);
                     result.PendingReview++;
                 }
             }
             else if (resolved.IsNihaiTuketici)
             {
-                try
+                if (ShouldAutoSendIncoming(bankProfile, amount))
                 {
-                    var nihaiCustomer = await EnsureNihaiCustomerAsync(tenantId, branchId, ct);
-                    entity.MatchedCustomerId = nihaiCustomer.Id;
-                    var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
-                        tenantId, branchId, nihaiCustomer, resolved.TaxNo!, amount, entity, enrichedTx, bankProfile, ct);
-
-                    if (ShouldAutoSendIncoming(bankProfile, amount))
+                    var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                    if (workmanshipError is not null)
                     {
-                        await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
-                        entity.Status = BankImportStatuses.AutoSendQueued;
-                        entity.StatusMessage = $"Otomatik e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL, nihai tüketici).";
-                        result.DraftCreated++;
-                    }
-                    else if (ShouldCreateIncomingBankDraft(profile, bankProfile, amount))
-                    {
-                        entity.Status = BankImportStatuses.DraftCreated;
-                        entity.StatusMessage = "Otomatik taslak (nihai tüketici).";
-                        result.DraftCreated++;
+                        entity.Status = BankImportStatuses.Pending;
+                        entity.StatusMessage = workmanshipError;
+                        result.PendingReview++;
                     }
                     else
                     {
+                        try
+                        {
+                            var nihaiCustomer = await EnsureNihaiCustomerAsync(tenantId, branchId, ct);
+                            entity.MatchedCustomerId = nihaiCustomer.Id;
+                            var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                                tenantId, branchId, nihaiCustomer, resolved.TaxNo!, amount, entity, enrichedTx, bankProfile, ct);
+                            await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+                            await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                            entity.Status = BankImportStatuses.AutoSendQueued;
+                            entity.StatusMessage = $"Otomatik e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL, nihai tüketici).";
+                            entity.InvoiceId = invoiceId;
+                            entity.EInvoiceDocumentId = documentId;
+                            result.DraftCreated++;
+                        }
+                        catch (Exception ex)
+                        {
+                            entity.Status = BankImportStatuses.Pending;
+                            entity.StatusMessage = "Nihai tüketici taslağı oluşturulamadı: " + ex.Message;
+                            result.PendingReview++;
+                        }
+                    }
+                }
+                else if (ShouldCreateIncomingBankDraft(profile, bankProfile, amount))
+                {
+                    var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                    if (workmanshipError is not null)
+                    {
                         entity.Status = BankImportStatuses.Pending;
-                        entity.StatusMessage = "Nihai tüketici eşleşti; otomatik taslak ayarları kapalı.";
+                        entity.StatusMessage = workmanshipError;
                         result.PendingReview++;
                     }
-
-                    entity.InvoiceId = invoiceId;
-                    entity.EInvoiceDocumentId = documentId;
-                    await _taxResolver.LearnAsync(new CounterpartyLearnInput(
-                        tenantId, entity.CounterpartyName, entity.CounterpartyIban, resolved.TaxNo!,
-                        CounterpartyIdentitySources.NihaiTuketici, nihaiCustomer.Id), ct);
+                    else
+                    {
+                        try
+                        {
+                            var nihaiCustomer = await EnsureNihaiCustomerAsync(tenantId, branchId, ct);
+                            entity.MatchedCustomerId = nihaiCustomer.Id;
+                            var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                                tenantId, branchId, nihaiCustomer, resolved.TaxNo!, amount, entity, enrichedTx, bankProfile, ct);
+                            entity.Status = BankImportStatuses.DraftCreated;
+                            entity.StatusMessage = "Otomatik taslak (nihai tüketici).";
+                            entity.InvoiceId = invoiceId;
+                            entity.EInvoiceDocumentId = documentId;
+                            result.DraftCreated++;
+                        }
+                        catch (Exception ex)
+                        {
+                            entity.Status = BankImportStatuses.Pending;
+                            entity.StatusMessage = "Nihai tüketici taslağı oluşturulamadı: " + ex.Message;
+                            result.PendingReview++;
+                        }
+                    }
                 }
-                catch (Exception ex)
+                else
                 {
                     entity.Status = BankImportStatuses.Pending;
-                    entity.StatusMessage = "Nihai tüketici taslağı oluşturulamadı: " + ex.Message;
+                    entity.StatusMessage = IncomingBelowThresholdMessage(bankProfile);
                     result.PendingReview++;
                 }
             }
             else
             {
-                entity.Status = BankImportStatuses.NoCustomerMatch;
-                entity.StatusMessage = resolved.Message ?? "Karşı taraf cari kayıtlarda bulunamadı.";
-                result.NoCustomerMatch++;
-                result.PendingReview++;
+                if (ShouldAutoSendIncoming(bankProfile, amount) &&
+                    IsValidTaxNo(NormalizeTaxNo(entity.CounterpartyTaxNo)))
+                {
+                    var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                    if (workmanshipError is not null)
+                    {
+                        entity.Status = BankImportStatuses.Pending;
+                        entity.StatusMessage = workmanshipError;
+                        result.PendingReview++;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            var counterparty = new CustomerMatchRow(
+                                Guid.Empty,
+                                entity.CounterpartyName ?? resolved.DisplayName ?? "Karşı Taraf",
+                                entity.CounterpartyTaxNo!,
+                                null,
+                                entity.BankBranchCity,
+                                entity.BankBranchDistrict,
+                                null);
+                            var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                                tenantId, branchId, counterparty, entity.CounterpartyTaxNo!, amount, entity, enrichedTx, bankProfile, ct);
+                            await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+                            await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                            entity.Status = BankImportStatuses.AutoSendQueued;
+                            entity.StatusMessage =
+                                $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL, cari eşleşmesiz).";
+                            entity.InvoiceId = invoiceId;
+                            entity.EInvoiceDocumentId = documentId;
+                            result.DraftCreated++;
+                        }
+                        catch (Exception ex)
+                        {
+                            entity.Status = BankImportStatuses.Pending;
+                            entity.StatusMessage = "Otomatik gönderim başarısız: " + ex.Message;
+                            result.PendingReview++;
+                        }
+                    }
+                }
+                else
+                {
+                    entity.Status = BankImportStatuses.NoCustomerMatch;
+                    entity.StatusMessage = resolved.Message ?? "Karşı taraf cari kayıtlarda bulunamadı.";
+                    result.NoCustomerMatch++;
+                    result.PendingReview++;
+                }
             }
 
             _db.BankImportTransactions.Add(entity);
@@ -743,24 +940,20 @@ public sealed class BankSyncService : IBankSyncService
 
         await _db.SaveChangesAsync(ct);
 
-        var bankSyncProfile = await _db.BankSyncProfiles
-            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
-        if (bankSyncProfile?.ManualSyncRequestedUtc is not null)
+        // Worker her import sonrası sync zamanını güncellesin (manuel istek olmasa da).
+        await _profileService.CompleteManualSyncAsync(tenantId, branchId, new BankSyncPullResult
         {
-            await _profileService.CompleteManualSyncAsync(tenantId, branchId, new BankSyncPullResult
-            {
-                FetchedFromVomsis = result.Received,
-                Received = result.Received,
-                Imported = result.Imported,
-                SkippedDuplicate = result.SkippedDuplicate,
-                SkippedFilter = result.SkippedFilter,
-                DraftCreated = result.DraftCreated,
-                PendingReview = result.PendingReview,
-                SummaryMessage =
-                    $"Vomsis worker: {result.Received} hareket, ERP'ye {result.Imported} kayıt " +
-                    $"(taslak: {result.DraftCreated}, bekleyen: {result.PendingReview})."
-            }, ct);
-        }
+            FetchedFromVomsis = result.Received,
+            Received = result.Received,
+            Imported = result.Imported,
+            SkippedDuplicate = result.SkippedDuplicate,
+            SkippedFilter = result.SkippedFilter,
+            DraftCreated = result.DraftCreated,
+            PendingReview = result.PendingReview,
+            SummaryMessage =
+                $"Vomsis worker: {result.Received} hareket, ERP'ye {result.Imported} kayıt " +
+                $"(taslak: {result.DraftCreated}, bekleyen: {result.PendingReview})."
+        }, ct);
 
         return result;
     }
@@ -806,14 +999,26 @@ public sealed class BankSyncService : IBankSyncService
                 x.Status,
                 x.StatusMessage,
                 x.MatchedCustomerId,
-                MatchedCustomerName = x.MatchedCustomerId.HasValue
-                    ? _db.Customers.Where(c => c.Id == x.MatchedCustomerId.Value).Select(c => c.FullName).FirstOrDefault()
-                    : null,
                 x.InvoiceId,
                 x.EInvoiceDocumentId,
                 x.CreatedAt
             })
             .ToListAsync(ct);
+
+        var customerIds = rows
+            .Where(x => x.MatchedCustomerId.HasValue)
+            .Select(x => x.MatchedCustomerId!.Value)
+            .Distinct()
+            .ToList();
+        var customerIdSet = customerIds.ToHashSet();
+        var customerNames = customerIdSet.Count == 0
+            ? new Dictionary<Guid, string>()
+            : (await _db.Customers.AsNoTracking()
+                .Where(c => c.TenantId == tenantId && c.BranchId == branchId && !c.IsDeleted)
+                .Select(c => new { c.Id, c.FullName })
+                .ToListAsync(ct))
+                .Where(c => customerIdSet.Contains(c.Id))
+                .ToDictionary(c => c.Id, c => c.FullName ?? "");
 
         return new BankImportListResult
         {
@@ -834,7 +1039,10 @@ public sealed class BankSyncService : IBankSyncService
                 Status = x.Status,
                 StatusMessage = x.StatusMessage,
                 MatchedCustomerId = x.MatchedCustomerId,
-                MatchedCustomerName = x.MatchedCustomerName,
+                MatchedCustomerName = x.MatchedCustomerId.HasValue &&
+                                      customerNames.TryGetValue(x.MatchedCustomerId.Value, out var name)
+                    ? name
+                    : null,
                 InvoiceId = x.InvoiceId,
                 EInvoiceDocumentId = x.EInvoiceDocumentId,
                 CreatedAt = x.CreatedAt
@@ -857,11 +1065,16 @@ public sealed class BankSyncService : IBankSyncService
         if (tx is null)
             return Fail("Hareket bulunamadı.");
 
-        if (tx.Status == BankImportStatuses.DraftCreated && tx.InvoiceId.HasValue)
-            return Fail("Bu hareket için zaten taslak oluşturulmuş.");
+        if (HasBankImportDraft(tx))
+            return Fail(IsOutgoingTryTransfer(tx)
+                ? "Bu hareket için zaten gider pusulası taslağı oluşturulmuş."
+                : "Bu hareket için zaten taslak oluşturulmuş.");
 
         if (tx.Status == BankImportStatuses.Rejected)
             return Fail("Reddedilmiş hareket için taslak oluşturulamaz.");
+
+        if (IsOutgoingTryTransfer(tx))
+            return await CreateOutgoingExpenseSlipDraftFromImportAsync(tenantId, branchId, tx, customerId, null, ct);
 
         var customer = await _db.Customers
             .AsNoTracking()
@@ -903,19 +1116,30 @@ public sealed class BankSyncService : IBankSyncService
 
         try
         {
+            var bankProfile = await LoadBankSyncProfileAsync(tenantId, branchId, ct);
             var row = new CustomerMatchRow(customer.Id, customer.FullName, customer.NationalId, customer.Address, customer.City, customer.District, customer.Email);
             var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
-                tenantId, branchId, row, taxNo, tx.Amount, tx, ct);
+                tenantId, branchId, row, taxNo, tx.Amount, tx, null, bankProfile, ct);
             tx.MatchedCustomerId = customer.Id;
             tx.CounterpartyTaxNo = taxNo;
-            tx.Status = BankImportStatuses.DraftCreated;
-            tx.StatusMessage = "Manuel eşleştirme ile taslak oluşturuldu.";
             tx.InvoiceId = invoiceId;
             tx.EInvoiceDocumentId = documentId;
+
+            if (ShouldAutoSendIncoming(bankProfile, tx.Amount))
+            {
+                await TryPatchLinkedCollectionDraftAddressAsync(tenantId, tx, bankProfile, ct);
+                await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                tx.Status = BankImportStatuses.AutoSendQueued;
+                tx.StatusMessage =
+                    $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL).";
+            }
+            else
+            {
+                tx.Status = BankImportStatuses.DraftCreated;
+                tx.StatusMessage = "Manuel eşleştirme ile taslak oluşturuldu.";
+            }
+
             await _db.SaveChangesAsync(ct);
-            await _taxResolver.LearnAsync(new CounterpartyLearnInput(
-                tenantId, tx.CounterpartyName, tx.CounterpartyIban, taxNo,
-                CounterpartyIdentitySources.BankImport, customer.Id), ct);
             return new BankImportActionResult
             {
                 Success = true,
@@ -947,16 +1171,27 @@ public sealed class BankSyncService : IBankSyncService
         if (tx is null)
             return Fail("Hareket bulunamadı.");
 
-        if (tx.Status == BankImportStatuses.DraftCreated && tx.InvoiceId.HasValue)
-            return Fail("Bu hareket için zaten taslak oluşturulmuş.");
+        if (HasBankImportDraft(tx))
+            return Fail(IsOutgoingTryTransfer(tx)
+                ? "Bu hareket için zaten gider pusulası taslağı oluşturulmuş."
+                : "Bu hareket için zaten taslak oluşturulmuş.");
 
         if (tx.Status == BankImportStatuses.Rejected)
             return Fail("Reddedilmiş hareket için taslak oluşturulamaz.");
 
+        if (IsOutgoingTryTransfer(tx))
+            return await CreateOutgoingExpenseSlipDraftFromImportAsync(
+                tenantId,
+                branchId,
+                tx,
+                options.CustomerId,
+                options,
+                ct);
+
         string taxNo;
         Guid? customerId = null;
         Guid? supplierId = null;
-        string buyerName;
+        string buyerName = tx.CounterpartyName ?? "";
         string? address = null;
         string? city = null;
         string? district = null;
@@ -1055,7 +1290,11 @@ public sealed class BankSyncService : IBankSyncService
             if (resolved.Success && !string.IsNullOrWhiteSpace(resolved.TaxNo))
             {
                 taxNo = resolved.TaxNo;
-                buyerName = resolved.DisplayName ?? tx.CounterpartyName ?? "Karşı Taraf";
+                buyerName = BankMovementParser.PreferCounterpartyDisplayName(
+                    tx.CounterpartyName,
+                    buyerName,
+                    resolved.DisplayName,
+                    taxNo) ?? tx.CounterpartyName ?? "Karşı Taraf";
 
                 if (resolved.CustomerId.HasValue)
                 {
@@ -1064,7 +1303,11 @@ public sealed class BankSyncService : IBankSyncService
                     if (customer is not null)
                     {
                         customerId = customer.Id;
-                        buyerName = customer.FullName;
+                        buyerName = BankMovementParser.PreferCounterpartyDisplayName(
+                            tx.CounterpartyName,
+                            customer.FullName,
+                            buyerName,
+                            taxNo) ?? customer.FullName;
                         address = customer.Address;
                         city = customer.City;
                         district = customer.District;
@@ -1125,12 +1368,26 @@ public sealed class BankSyncService : IBankSyncService
         if (string.IsNullOrWhiteSpace(buyerName))
             buyerName = tx.CounterpartyName ?? "Karşı Taraf";
 
-        buyerName = BankMovementParser.SanitizeCounterpartyDisplayName(buyerName, taxNo)
-            ?? BankMovementParser.SanitizeCounterpartyDisplayName(tx.CounterpartyName, taxNo)
-            ?? buyerName;
-
         try
         {
+            var bankProfile = await LoadBankSyncProfileAsync(tenantId, branchId, ct);
+            var vomsisTx = await EnsureVomsisDetailEnrichedAsync(ToImportDtoFromEntity(tx), bankProfile, ct);
+            buyerName = BankMovementParser.PreferCounterpartyDisplayName(
+                vomsisTx.SenderTitle ?? vomsisTx.SenderName,
+                tx.CounterpartyName,
+                buyerName,
+                taxNo) ?? buyerName;
+
+            var customerRow = new CustomerMatchRow(
+                customerId ?? Guid.Empty,
+                buyerName,
+                taxNo,
+                address,
+                city,
+                district,
+                email);
+            (address, city, district) = ResolveBuyerLocationFields(customerRow, vomsisTx);
+
             var description = string.IsNullOrWhiteSpace(tx.Description)
                 ? $"Banka tahsilatı - {buyerName}"
                 : tx.Description;
@@ -1154,28 +1411,37 @@ public sealed class BankSyncService : IBankSyncService
             tx.CounterpartyTaxNo = taxNo;
             if (!string.IsNullOrWhiteSpace(buyerName))
                 tx.CounterpartyName = buyerName;
-            tx.Status = BankImportStatuses.DraftCreated;
-            tx.StatusMessage = options.UseNihaiTuketici
-                ? "Manuel taslak (nihai tüketici)."
-                : customerId.HasValue || supplierId.HasValue || !string.IsNullOrWhiteSpace(options.ManualTaxNo)
-                    ? "Manuel eşleştirme ile taslak oluşturuldu."
-                    : $"Taslak oluşturuldu (TCKN/VKN: {taxNo}).";
             tx.InvoiceId = invoiceId;
             tx.EInvoiceDocumentId = documentId;
+
+            if (ShouldAutoSendIncoming(bankProfile, tx.Amount))
+            {
+                await TryPatchLinkedCollectionDraftAddressAsync(tenantId, tx, bankProfile, ct);
+                await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                tx.Status = BankImportStatuses.AutoSendQueued;
+                tx.StatusMessage =
+                    $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL).";
+            }
+            else
+            {
+                tx.Status = BankImportStatuses.DraftCreated;
+                tx.StatusMessage = options.UseNihaiTuketici
+                    ? "Manuel taslak (nihai tüketici)."
+                    : customerId.HasValue || supplierId.HasValue || !string.IsNullOrWhiteSpace(options.ManualTaxNo)
+                        ? "Manuel eşleştirme ile taslak oluşturuldu."
+                        : $"Taslak oluşturuldu (TCKN/VKN: {taxNo}).";
+            }
+
             await _db.SaveChangesAsync(ct);
 
-            await _taxResolver.LearnAsync(new CounterpartyLearnInput(
-                tenantId, tx.CounterpartyName, tx.CounterpartyIban, taxNo,
-                CounterpartyIdentitySources.BankImport, customerId, supplierId), ct);
-
             return new BankImportActionResult
-            {
-                Success = true,
-                InvoiceId = invoiceId,
-                EInvoiceDocumentId = documentId,
-                Status = tx.Status,
-                Message = tx.StatusMessage
-            };
+                {
+                    Success = true,
+                    InvoiceId = invoiceId,
+                    EInvoiceDocumentId = documentId,
+                    Status = tx.Status,
+                    Message = tx.StatusMessage
+                };
         }
         catch (Exception ex)
         {
@@ -1268,17 +1534,15 @@ public sealed class BankSyncService : IBankSyncService
             vomsisTx ?? ToImportDtoFromEntity(entity),
             bankProfile,
             ct);
-        var city = customer.City;
-        var district = customer.District;
-        ApplyVomsisBranchAddress(ref city, ref district, enrichedTx);
+        var (address, city, district) = ResolveBuyerLocationFields(customer, enrichedTx);
 
         return await _workflow.CreateCollectionDraftAsync(new CollectionDraftInput(
             tenantId,
             branchId,
-            customer.Id,
+            customer.Id == Guid.Empty ? null : customer.Id,
             ResolveDraftBuyerName(entity, customer),
             taxNo,
-            customer.Address,
+            address,
             city,
             district,
             customer.Email,
@@ -1292,17 +1556,55 @@ public sealed class BankSyncService : IBankSyncService
     {
         var taxNo = entity.CounterpartyTaxNo;
         var bankName = BankMovementParser.SanitizeCounterpartyDisplayName(entity.CounterpartyName, taxNo);
-        var customerName = BankMovementParser.SanitizeCounterpartyDisplayName(customer.FullName, taxNo);
+        if (BankMovementParser.HasReliableCounterpartyName(bankName, taxNo))
+            return bankName!;
 
-        if (!string.IsNullOrWhiteSpace(bankName))
+        var customerName = BankMovementParser.SanitizeCounterpartyDisplayName(customer.FullName, taxNo);
+        return customerName ?? bankName ?? customer.FullName?.Trim() ?? "Karşı Taraf";
+    }
+
+    private static (string? Address, string? City, string? District) ResolveBuyerLocationFields(
+        CustomerMatchRow customer,
+        VomsisTransactionImportDto? vomsisTx)
+    {
+        var address = customer.Address;
+        var city = customer.City;
+        var district = customer.District;
+
+        if (string.IsNullOrWhiteSpace(city) || string.IsNullOrWhiteSpace(district))
         {
-            if (string.IsNullOrWhiteSpace(customerName) ||
-                BankMovementParser.LooksLikeTransferLabel(customerName) ||
-                bankName.Length > customerName.Length)
-                return bankName;
+            var (parsedCity, parsedDistrict) = ParseBuyerCityDistrictFromAddress(address);
+            city = CoalesceText(city, parsedCity);
+            district = CoalesceText(district, parsedDistrict);
         }
 
-        return customerName ?? bankName ?? customer.FullName?.Trim() ?? "Karşı Taraf";
+        // Banka şube il/ilçesi alıcı adresi değildir; yalnızca cari/adres bilgisi yoksa son çare.
+        if ((string.IsNullOrWhiteSpace(city) || string.IsNullOrWhiteSpace(district)) && vomsisTx is not null)
+        {
+            var (branchCity, branchDistrict) = VomsisTaxFieldHelper.ResolveCityDistrict(
+                vomsisTx.BankBranchName,
+                vomsisTx.BankBranchCity,
+                vomsisTx.BankBranchDistrict,
+                null);
+            city = CoalesceText(city, branchCity);
+            district = CoalesceText(district, branchDistrict);
+        }
+
+        return (address, city, district);
+    }
+
+    private static (string? City, string? District) ParseBuyerCityDistrictFromAddress(string? address)
+    {
+        if (string.IsNullOrWhiteSpace(address))
+            return (null, null);
+
+        var match = Regex.Match(address.Trim(), @"([^\s/]+)\s*/\s*([^\s/]+)\s*$", RegexOptions.IgnoreCase);
+        if (!match.Success)
+            return (null, null);
+
+        var district = match.Groups[1].Value.Trim().ToUpperInvariant();
+        var city = match.Groups[2].Value.Trim().ToUpperInvariant();
+        return (city, district);
     }
 
     private static void ApplyCounterpartyFields(BankImportTransaction entity, VomsisTransactionImportDto tx)
@@ -1315,8 +1617,19 @@ public sealed class BankSyncService : IBankSyncService
             tx.SenderTitle,
             tx.Description,
             taxNo);
-        entity.CounterpartyTaxNo = taxNo;
-        entity.CounterpartyIban = NormalizeIban(tx.SenderIban);
+        if (!string.IsNullOrWhiteSpace(taxNo))
+            entity.CounterpartyTaxNo = taxNo;
+        entity.CounterpartyIban = NormalizeIban(tx.SenderIban) ?? entity.CounterpartyIban;
+
+        if (!string.IsNullOrWhiteSpace(tx.BankBranchName))
+            entity.BankBranchName = tx.BankBranchName.Trim();
+        var city = tx.BankBranchCity;
+        var district = tx.BankBranchDistrict;
+        ApplyVomsisBranchAddress(ref city, ref district, tx);
+        if (!string.IsNullOrWhiteSpace(city))
+            entity.BankBranchCity = city;
+        if (!string.IsNullOrWhiteSpace(district))
+            entity.BankBranchDistrict = district;
     }
 
     private async Task<VomsisTransactionImportDto> EnrichFromVomsisDetailAsync(
@@ -1324,11 +1637,15 @@ public sealed class BankSyncService : IBankSyncService
         BankSyncProfile? bankProfile,
         CancellationToken ct)
     {
-        if (HasTaxInImportDto(tx) && HasBranchAddressInImportDto(tx))
+        if (HasBranchAddressInImportDto(tx) && HasVerifiedDekontTax(tx))
             return tx;
         if (bankProfile is null ||
             string.IsNullOrWhiteSpace(bankProfile.VomsisAppKey) ||
             string.IsNullOrWhiteSpace(bankProfile.VomsisAppSecret))
+            return tx;
+
+        // Canlıda dekont App Service IP'sinden çekilemez; worker import sırasında doldurur.
+        if (ShouldUseWorkerProxy(bankProfile, _config.GetValue("BankSync:PreferWorkerForVomsisPull", true)))
             return tx;
 
         try
@@ -1364,10 +1681,16 @@ public sealed class BankSyncService : IBankSyncService
         if (tx is null)
             return;
 
-        if (string.IsNullOrWhiteSpace(city) && !string.IsNullOrWhiteSpace(tx.BankBranchCity))
-            city = tx.BankBranchCity;
-        if (string.IsNullOrWhiteSpace(district) && !string.IsNullOrWhiteSpace(tx.BankBranchDistrict))
-            district = tx.BankBranchDistrict;
+        var (parsedCity, parsedDistrict) = VomsisTaxFieldHelper.ResolveCityDistrict(
+            tx.BankBranchName,
+            tx.BankBranchCity,
+            tx.BankBranchDistrict,
+            tx.Description);
+
+        if (string.IsNullOrWhiteSpace(city) && !string.IsNullOrWhiteSpace(parsedCity))
+            city = parsedCity;
+        if (string.IsNullOrWhiteSpace(district) && !string.IsNullOrWhiteSpace(parsedDistrict))
+            district = parsedDistrict;
     }
 
     private static VomsisTransactionImportDto ToImportDtoFromEntity(BankImportTransaction entity)
@@ -1384,7 +1707,10 @@ public sealed class BankSyncService : IBankSyncService
             SenderName = entity.CounterpartyName,
             SenderTitle = entity.CounterpartyName,
             SenderTaxNo = entity.CounterpartyTaxNo,
-            SenderIban = entity.CounterpartyIban
+            SenderIban = entity.CounterpartyIban,
+            BankBranchName = entity.BankBranchName,
+            BankBranchCity = entity.BankBranchCity,
+            BankBranchDistrict = entity.BankBranchDistrict
         };
 
     private async Task<BankSyncProfile?> LoadBankSyncProfileAsync(
@@ -1431,33 +1757,55 @@ public sealed class BankSyncService : IBankSyncService
 
         try
         {
-            _vomsis.Configure(bankProfile.VomsisAppKey, bankProfile.VomsisAppSecret);
-            var detail = await _vomsis.GetTransactionDetailAsync(entity.ExternalId, ct);
-            if (detail is null)
+            var preferWorker = _config.GetValue("BankSync:PreferWorkerForVomsisPull", true);
+            VomsisTransactionImportDto enriched;
+
+            // Canlıda App Service Vomsis'e/VM:5080'e erişemez. Bu hareketi worker pending kuyruğuna yaz.
+            if (preferWorker)
             {
+                await _profileService.EnqueuePendingEnrichAsync(tenantId, branchId, entity.ExternalId, ct);
                 return new BankImportTaxRefreshResult
                 {
-                    Success = false,
-                    Message = "Vomsis dekont/detay yanıtı alınamadı."
+                    Success = true,
+                    Queued = true,
+                    Message =
+                        $"Vomsis dekont sorgusu worker kuyruğuna alındı (id={entity.ExternalId}). " +
+                        "1-2 dakika bekleyip Yenile yapın. Worker bu hareketin dekontunu çekip TCKN/şube yazar."
                 };
             }
-
-            var importDto = new VomsisTransactionImportDto
+            else
             {
-                ExternalId = entity.ExternalId,
-                ExternalKey = entity.ExternalKey,
-                VomsisAccountId = entity.VomsisAccountId,
-                Amount = entity.Amount,
-                Currency = entity.Currency,
-                Type = entity.TransactionType,
-                Description = entity.Description,
-                SenderName = entity.CounterpartyName,
-                SenderTitle = entity.CounterpartyName,
-                SenderTaxNo = entity.CounterpartyTaxNo,
-                SenderIban = entity.CounterpartyIban
-            };
-            var enriched = VomsisTransactionMapper.MergeDetailIntoImportDto(importDto, detail);
+                _vomsis.Configure(bankProfile.VomsisAppKey, bankProfile.VomsisAppSecret);
+                var detail = await _vomsis.GetTransactionDetailAsync(entity.ExternalId, ct);
+                if (detail is null)
+                {
+                    return new BankImportTaxRefreshResult
+                    {
+                        Success = false,
+                        Message = "Vomsis dekont/detay yanıtı alınamadı."
+                    };
+                }
+
+                var importDto = new VomsisTransactionImportDto
+                {
+                    ExternalId = entity.ExternalId,
+                    ExternalKey = entity.ExternalKey,
+                    VomsisAccountId = entity.VomsisAccountId,
+                    Amount = entity.Amount,
+                    Currency = entity.Currency,
+                    Type = entity.TransactionType,
+                    Description = entity.Description,
+                    SenderName = entity.CounterpartyName,
+                    SenderTitle = entity.CounterpartyName,
+                    SenderTaxNo = IsPlaceholderTax(entity.CounterpartyTaxNo) ? null : entity.CounterpartyTaxNo,
+                    SenderIban = entity.CounterpartyIban
+                };
+                enriched = VomsisTransactionMapper.MergeDetailIntoImportDto(importDto, detail);
+            }
+
             ApplyCounterpartyFields(entity, enriched);
+            if (entity.InvoiceId.HasValue)
+                await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
 
             if (!HasValidTaxDigits(entity.CounterpartyTaxNo))
             {
@@ -1481,22 +1829,32 @@ public sealed class BankSyncService : IBankSyncService
                 entity.CounterpartyTaxNo,
                 entity.CounterpartyIban,
                 entity.Description,
-                IsIncomingTransfer: true), ct);
+                IsIncomingTransfer: true,
+                AllowNihaiTuketici: false), ct);
 
-            if (resolved.Success && !string.IsNullOrWhiteSpace(resolved.TaxNo))
+            if (resolved.Success && !string.IsNullOrWhiteSpace(resolved.TaxNo) && !IsPlaceholderTax(resolved.TaxNo))
             {
                 entity.CounterpartyTaxNo = NormalizeTaxNo(resolved.TaxNo);
-                if (!string.IsNullOrWhiteSpace(resolved.DisplayName))
-                    entity.CounterpartyName = BankMovementParser.SanitizeCounterpartyDisplayName(resolved.DisplayName, entity.CounterpartyTaxNo)
-                        ?? entity.CounterpartyName;
+                entity.CounterpartyName = BankMovementParser.PreferCounterpartyDisplayName(
+                    enriched.SenderTitle ?? enriched.SenderName,
+                    entity.CounterpartyName,
+                    resolved.DisplayName,
+                    resolved.TaxNo) ?? entity.CounterpartyName;
                 entity.MatchedCustomerId = resolved.CustomerId;
                 entity.Status = BankImportStatuses.Pending;
                 entity.StatusMessage = resolved.Message ?? "Vomsis dekontundan TCKN/VKN alındı.";
+                await TryPatchLinkedCollectionDraftTaxAsync(tenantId, entity, ct);
+            }
+            else if (HasValidTaxDigits(entity.CounterpartyTaxNo) && !IsPlaceholderTax(entity.CounterpartyTaxNo))
+            {
+                entity.Status = BankImportStatuses.Pending;
+                entity.StatusMessage = "Vomsis dekontundan TCKN/VKN alındı.";
+                await TryPatchLinkedCollectionDraftTaxAsync(tenantId, entity, ct);
             }
             else
             {
                 entity.Status = BankImportStatuses.MissingTaxId;
-                entity.StatusMessage = resolved.Message ?? "TCKN/VKN alındı ancak mükellef doğrulaması tamamlanamadı.";
+                entity.StatusMessage = resolved.Message ?? "Vomsis dekontunda geçerli TCKN/VKN bulunamadı.";
             }
 
             await _db.SaveChangesAsync(ct);
@@ -1511,14 +1869,134 @@ public sealed class BankSyncService : IBankSyncService
         }
         catch (Exception ex)
         {
-            return new BankImportTaxRefreshResult { Success = false, Message = ex.Message };
+            var message = VomsisIpErrorHelper.IsIpBlockedError(ex.Message)
+                ? VomsisIpErrorHelper.BuildBlockedMessage(ex.Message) +
+                  "\n\nNot: Canlıda TCKN/VKN sorgusu Azure VM worker IP'si üzerinden yapılmalıdır. " +
+                  "'Hareketleri Çek' ile yeniden senkron deneyin."
+                : ex.Message;
+            return new BankImportTaxRefreshResult { Success = false, Message = message };
         }
+    }
+
+    public async Task<BankImportTaxRefreshResult> ApplyVomsisEnrichmentAsync(
+        Guid tenantId,
+        Guid branchId,
+        VomsisEnrichmentApplyDto enrichment,
+        CancellationToken ct)
+    {
+        await _schema.EnsureAsync(ct);
+        if (enrichment is null || enrichment.ExternalId <= 0)
+            return new BankImportTaxRefreshResult { Success = false, Message = "ExternalId zorunludur." };
+
+        var entity = await _db.BankImportTransactions
+            .FirstOrDefaultAsync(x =>
+                x.TenantId == tenantId &&
+                x.BranchId == branchId &&
+                x.Provider == ProviderVomsis &&
+                !x.IsDeleted &&
+                (x.ExternalId == enrichment.ExternalId ||
+                 (!string.IsNullOrWhiteSpace(enrichment.ExternalKey) && x.ExternalKey == enrichment.ExternalKey)), ct);
+
+        if (entity is null)
+            return new BankImportTaxRefreshResult
+            {
+                Success = false,
+                Message = $"Banka hareketi bulunamadı (externalId={enrichment.ExternalId})."
+            };
+
+        var dto = new VomsisTransactionImportDto
+        {
+            ExternalId = enrichment.ExternalId,
+            ExternalKey = enrichment.ExternalKey ?? entity.ExternalKey,
+            Amount = entity.Amount,
+            Currency = entity.Currency,
+            Type = entity.TransactionType,
+            Description = entity.Description,
+            SenderName = CoalesceText(enrichment.SenderName, entity.CounterpartyName),
+            SenderTitle = CoalesceText(enrichment.SenderTitle, enrichment.SenderName, entity.CounterpartyName),
+            SenderTaxNo = CoalesceText(enrichment.SenderTaxNo,
+                IsPlaceholderTax(entity.CounterpartyTaxNo) ? null : entity.CounterpartyTaxNo),
+            SenderIban = entity.CounterpartyIban,
+            BankBranchName = CoalesceText(enrichment.BankBranchName, entity.BankBranchName),
+            BankBranchCity = CoalesceText(enrichment.BankBranchCity, entity.BankBranchCity),
+            BankBranchDistrict = CoalesceText(enrichment.BankBranchDistrict, entity.BankBranchDistrict)
+        };
+
+        ApplyCounterpartyFields(entity, dto);
+
+        var hasTax = HasValidTaxDigits(entity.CounterpartyTaxNo) && !IsPlaceholderTax(entity.CounterpartyTaxNo);
+        if (hasTax && entity.Status == BankImportStatuses.MissingTaxId)
+        {
+            entity.Status = BankImportStatuses.Pending;
+            entity.StatusMessage = "Vomsis dekontundan TCKN/VKN alındı.";
+        }
+        else if (!string.IsNullOrWhiteSpace(entity.BankBranchName) ||
+                 !string.IsNullOrWhiteSpace(entity.BankBranchCity))
+        {
+            entity.StatusMessage = CoalesceText(
+                entity.StatusMessage,
+                "Vomsis dekontundan şube/adres bilgisi güncellendi.");
+        }
+
+        var bankProfile = await LoadBankSyncProfileAsync(tenantId, branchId, ct);
+        if (entity.InvoiceId.HasValue)
+        {
+            if (hasTax)
+                await TryPatchLinkedCollectionDraftTaxAsync(tenantId, entity, ct);
+            await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+        }
+
+        await RemovePendingEnrichIdAsync(tenantId, branchId, enrichment.ExternalId, ct);
+        await _db.SaveChangesAsync(ct);
+
+        return new BankImportTaxRefreshResult
+        {
+            Success = hasTax ||
+                      !string.IsNullOrWhiteSpace(entity.BankBranchName) ||
+                      !string.IsNullOrWhiteSpace(entity.BankBranchCity),
+            Message = hasTax
+                ? "TCKN/VKN ve şube bilgisi Vomsis dekontundan uygulandı."
+                : (!string.IsNullOrWhiteSpace(entity.BankBranchName)
+                    ? "Şube bilgisi uygulandı; TCKN/VKN dekontta yok veya okunamadı."
+                    : "Dekont zenginleştirmesi uygulandı ancak TCKN/şube boş."),
+            CounterpartyTaxNo = entity.CounterpartyTaxNo,
+            CounterpartyName = entity.CounterpartyName,
+            BankBranchName = entity.BankBranchName,
+            BankBranchCity = entity.BankBranchCity,
+            BankBranchDistrict = entity.BankBranchDistrict,
+            Status = entity.Status
+        };
+    }
+
+    private async Task RemovePendingEnrichIdAsync(
+        Guid tenantId,
+        Guid branchId,
+        long externalId,
+        CancellationToken ct)
+    {
+        var profile = await _db.BankSyncProfiles
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
+        if (profile is null || string.IsNullOrWhiteSpace(profile.PendingEnrichExternalIdsJson))
+            return;
+
+        var ids = BankSyncProfileService.ParsePendingEnrichIds(profile.PendingEnrichExternalIdsJson)
+            .Where(x => x != externalId)
+            .ToArray();
+        profile.PendingEnrichExternalIdsJson = ids.Length == 0
+            ? null
+            : System.Text.Json.JsonSerializer.Serialize(ids);
     }
 
     private static bool HasValidTaxDigits(string? taxNo)
     {
         var digits = NormalizeTaxNo(taxNo);
         return digits.Length is 10 or 11;
+    }
+
+    private static void ApplyVomsisTransactionDate(BankImportTransaction entity, VomsisTransactionImportDto tx)
+    {
+        if (tx.TransactionDateUtc.HasValue && tx.TransactionDateUtc.Value != default)
+            entity.TransactionDateUtc = tx.TransactionDateUtc.Value;
     }
 
     private static BankImportTransaction CreateEntity(
@@ -1545,10 +2023,39 @@ public sealed class BankSyncService : IBankSyncService
         };
     }
 
+    private static string NormalizeVomsisTxType(string? type)
+    {
+        var t = (type ?? "").Trim().ToLowerInvariant()
+            .Replace('ı', 'i')
+            .Replace('İ', 'i')
+            .Replace('ş', 's')
+            .Replace('Ş', 's')
+            .Replace('ğ', 'g')
+            .Replace('Ğ', 'g')
+            .Replace('ü', 'u')
+            .Replace('Ü', 'u')
+            .Replace('ö', 'o')
+            .Replace('Ö', 'o')
+            .Replace('ç', 'c')
+            .Replace('Ç', 'c');
+        return t;
+    }
+
+    private static bool IsOutgoingTryTransfer(BankImportTransaction entity)
+        => string.Equals(NormalizeVomsisTxType(entity.TransactionType), "borclu", StringComparison.OrdinalIgnoreCase)
+           && IsTryCurrency(entity.Currency);
+
+    private static bool IsIncomingTryTransfer(BankImportTransaction entity)
+        => string.Equals(NormalizeVomsisTxType(entity.TransactionType), "alacakli", StringComparison.OrdinalIgnoreCase)
+           && IsTryCurrency(entity.Currency);
+
+    private static bool HasBankImportDraft(BankImportTransaction entity)
+        => entity.InvoiceId.HasValue || entity.EInvoiceDocumentId.HasValue;
+
     private static bool IsQualifyingIncomingTransfer(string txType, decimal amount, string currency, string? description)
     {
         if (amount <= 0m) return false;
-        if (!string.Equals(txType, "alacakli", StringComparison.OrdinalIgnoreCase)) return false;
+        if (!string.Equals(NormalizeVomsisTxType(txType), "alacakli", StringComparison.OrdinalIgnoreCase)) return false;
         if (!IsTryCurrency(currency)) return false;
 
         var desc = (description ?? "").Trim();
@@ -1587,23 +2094,42 @@ public sealed class BankSyncService : IBankSyncService
         BankSyncProfile? bankProfile,
         decimal amountTl)
     {
-        if (ShouldAutoSendIncoming(bankProfile, amountTl))
-            return false;
+        // Bankadan gelen otomatik fatura yalnızca otomatik talimat eşiğini geçen hareketlerde oluşturulur/gönderilir.
+        // Eşik altı veya talimat kapalıysa taslak dahi oluşturulmaz.
+        _ = profile;
+        _ = bankProfile;
+        _ = amountTl;
+        return false;
+    }
 
-        if (bankProfile?.AutoInstructionIncomingEnabled == true)
-            return true;
-
+    private static string? ValidateIncomingCollectionWorkmanship(
+        EInvoiceProfile? profile,
+        decimal amountTl)
+    {
         var settings = EInvoiceProfileSettingsCodec.Decode(profile?.IntegratorCompanyCode);
-        if (!settings.AutoDraftEnabled)
-            return false;
+        if (!EInvoiceProfileSettingsCodec.HasAnyWorkmanshipRules(settings.WorkmanshipRules))
+        {
+            return "Özel matrah işçilik kuralları tanımlı değil. Fatura Ayarları > Özel Matrah İçin İşçilik Belirleme bölümünden 24K/22K/18K/14K/8K aralıklarını ekleyin.";
+        }
 
-        if (settings.AutoDraftMinTotal.HasValue && settings.AutoDraftMinTotal.Value > 0m && amountTl < settings.AutoDraftMinTotal.Value)
-            return false;
-        if (settings.AutoDraftMaxTotal.HasValue && settings.AutoDraftMaxTotal.Value > 0m && amountTl > settings.AutoDraftMaxTotal.Value)
-            return false;
+        if (EInvoiceProfileSettingsCodec.ListMatchingCollectionWorkmanshipRules(settings.WorkmanshipRules, amountTl).Count == 0)
+        {
+            return $"Tutar ({amountTl:N2} TL) için eşleşen özel matrah işçilik kuralı yok. Fatura Ayarları > Özel Matrah İçin İşçilik Belirleme aralıklarını kontrol edin.";
+        }
 
-        // Bankadan gelen TL havaleler Tahsilat sayılır; ödeme yöntemi listesinde Tahsilat kapalı olsa da işlenir.
-        return true;
+        return null;
+    }
+
+    private static string IncomingBelowThresholdMessage(BankSyncProfile? bankProfile)
+    {
+        if (bankProfile is null || !bankProfile.AutoInstructionIncomingEnabled)
+            return "Eşleşti; otomatik talimat kapalı — taslak oluşturulmadı.";
+
+        var min = bankProfile.AutoInstructionIncomingMinAmount;
+        if (!min.HasValue || min.Value <= 0m)
+            return "Eşleşti; otomatik talimat alt limiti tanımlı değil — taslak oluşturulmadı.";
+
+        return $"Tutar otomatik talimat sınırının altında (<{min.Value:N0} TL); taslak oluşturulmadı.";
     }
 
     private static bool ShouldSkipForAccountFilter(
@@ -1630,16 +2156,195 @@ public sealed class BankSyncService : IBankSyncService
         BankSyncProfile? bankProfile,
         CancellationToken ct)
     {
-        if (HasTaxInImportDto(tx))
+        if (bankProfile is null ||
+            string.IsNullOrWhiteSpace(bankProfile.VomsisAppKey) ||
+            string.IsNullOrWhiteSpace(bankProfile.VomsisAppSecret))
             return tx;
 
-        if (_config.GetValue("BankSync:EnrichTaxFromDetailOnImport", false) ||
-            _config.GetValue("BankSync:EnrichTaxFromDetailWhenMissing", true))
-        {
-            return await EnrichFromVomsisDetailAsync(tx, bankProfile, ct);
-        }
+        if (!_config.GetValue("BankSync:EnrichTaxFromDetailOnImport", false) &&
+            !_config.GetValue("BankSync:EnrichTaxFromDetailWhenMissing", true))
+            return tx;
 
-        return tx;
+        if (HasVerifiedDekontTax(tx) && HasReliableImportTitle(tx))
+            return tx;
+
+        // Canlıda Vomsis yalnızca VM IP'sinden açılır; App Service IP'si ip_not_found alır.
+        // TCKN/VKN zenginleştirmesi worker tarafında yapılır.
+        if (ShouldUseWorkerProxy(bankProfile, _config.GetValue("BankSync:PreferWorkerForVomsisPull", true)))
+            return tx;
+
+        return await EnrichFromVomsisDetailAsync(tx, bankProfile, ct);
+    }
+
+    private static bool ShouldAttemptExistingUpgrade(BankImportTransaction entity, BankSyncProfile? bankProfile)
+    {
+        if (entity.Status is BankImportStatuses.Rejected)
+            return false;
+        if (IsPlaceholderTax(entity.CounterpartyTaxNo))
+            return true;
+        if (string.IsNullOrWhiteSpace(entity.CounterpartyTaxNo) ||
+            string.IsNullOrWhiteSpace(entity.BankBranchName) ||
+            string.IsNullOrWhiteSpace(entity.BankBranchCity) ||
+            string.IsNullOrWhiteSpace(entity.BankBranchDistrict))
+            return true;
+        if (entity.Status is BankImportStatuses.DraftCreated &&
+            entity.InvoiceId.HasValue &&
+            ShouldAutoSendIncoming(bankProfile, entity.Amount))
+            return true;
+        if (!IsOutgoingTryTransfer(entity) &&
+            !entity.InvoiceId.HasValue &&
+            IsIncomingTryTransfer(entity) &&
+            ShouldAutoSendIncoming(bankProfile, entity.Amount) &&
+            entity.Status is BankImportStatuses.Pending
+                or BankImportStatuses.NoCustomerMatch
+                or BankImportStatuses.MissingTaxId
+                or BankImportStatuses.Skipped)
+            return true;
+        if (IsOutgoingTryTransfer(entity) &&
+            !entity.EInvoiceDocumentId.HasValue &&
+            ShouldAutoSendOutgoing(bankProfile, entity.Amount) &&
+            entity.Status is BankImportStatuses.Pending
+                or BankImportStatuses.MissingTaxId
+                or BankImportStatuses.Skipped)
+            return true;
+        return entity.Status is BankImportStatuses.MissingTaxId
+            or BankImportStatuses.Pending
+            or BankImportStatuses.NoCustomerMatch
+            or BankImportStatuses.Skipped;
+    }
+
+    private static bool NeedsDekontEnrichment(BankImportTransaction entity, VomsisTransactionImportDto tx)
+    {
+        var entityMissingTax = string.IsNullOrWhiteSpace(entity.CounterpartyTaxNo) ||
+                               IsPlaceholderTax(entity.CounterpartyTaxNo);
+
+        // Worker dekonttan TCKN getirdiyse mevcut MissingTaxId satırını güncelle.
+        if (entityMissingTax && HasVerifiedDekontTax(tx))
+            return true;
+
+        if (IsPlaceholderTax(entity.CounterpartyTaxNo))
+            return true;
+        if (HasVerifiedDekontTax(tx))
+            return false;
+        if (!entityMissingTax)
+            return false;
+        return entity.Status is BankImportStatuses.MissingTaxId
+            or BankImportStatuses.Pending
+            or BankImportStatuses.NoCustomerMatch
+            or BankImportStatuses.Skipped;
+    }
+
+    private static bool HasVerifiedDekontTax(VomsisTransactionImportDto tx)
+    {
+        var tax = NormalizeTaxNo(tx.SenderTaxNo);
+        return IsValidTaxNo(tax) && !IsPlaceholderTax(tax);
+    }
+
+    private static bool IsPlaceholderTax(string? taxNo)
+        => string.Equals(
+            NormalizeTaxNo(taxNo),
+            CounterpartyTaxResolverService.NihaiTuketiciTckn,
+            StringComparison.Ordinal);
+
+    private static bool HasReliableImportTitle(VomsisTransactionImportDto tx)
+        => BankMovementParser.HasReliableCounterpartyName(
+            CoalesceText(tx.SenderTitle, tx.SenderName),
+            tx.SenderTaxNo);
+
+    private async Task TryPatchLinkedCollectionDraftAddressAsync(
+        Guid tenantId,
+        BankImportTransaction entity,
+        BankSyncProfile? bankProfile,
+        CancellationToken ct)
+    {
+        if (!entity.InvoiceId.HasValue)
+            return;
+
+        var invoice = await _db.Invoices
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == entity.InvoiceId.Value, ct);
+        if (invoice is null || string.IsNullOrWhiteSpace(invoice.CollectionMetaJson))
+            return;
+
+        if (!entity.MatchedCustomerId.HasValue || entity.MatchedCustomerId.Value == Guid.Empty)
+            return;
+
+        var customer = await _db.Customers.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == entity.MatchedCustomerId.Value && !x.IsDeleted, ct);
+        if (customer is null)
+            return;
+
+        try
+        {
+            var node = JsonNode.Parse(invoice.CollectionMetaJson)?.AsObject();
+            if (node is null)
+                return;
+
+            var currentCity = node["BuyerCity"]?.GetValue<string>() ?? node["buyerCity"]?.GetValue<string>();
+            var currentDistrict = node["BuyerDistrict"]?.GetValue<string>() ?? node["buyerDistrict"]?.GetValue<string>();
+            var currentAddress = node["BuyerAddress"]?.GetValue<string>() ?? node["buyerAddress"]?.GetValue<string>();
+
+            var address = CoalesceText(currentAddress, customer.Address);
+            var city = CoalesceText(currentCity, customer.City);
+            var district = CoalesceText(currentDistrict, customer.District);
+            if (string.IsNullOrWhiteSpace(city) || string.IsNullOrWhiteSpace(district))
+            {
+                var (parsedCity, parsedDistrict) = ParseBuyerCityDistrictFromAddress(address);
+                city = CoalesceText(city, parsedCity);
+                district = CoalesceText(district, parsedDistrict);
+            }
+
+            if (string.Equals(currentCity, city, StringComparison.Ordinal) &&
+                string.Equals(currentDistrict, district, StringComparison.Ordinal) &&
+                string.Equals(currentAddress, address, StringComparison.Ordinal))
+                return;
+
+            if (!string.IsNullOrWhiteSpace(address))
+                node["BuyerAddress"] = address;
+            if (!string.IsNullOrWhiteSpace(city))
+                node["BuyerCity"] = city;
+            if (!string.IsNullOrWhiteSpace(district))
+                node["BuyerDistrict"] = district;
+            invoice.CollectionMetaJson = node.ToJsonString();
+        }
+        catch
+        {
+            // Meta güncellenemezse işlem devam eder.
+        }
+    }
+
+    private async Task TryPatchLinkedCollectionDraftTaxAsync(
+        Guid tenantId,
+        BankImportTransaction entity,
+        CancellationToken ct)
+    {
+        if (!entity.InvoiceId.HasValue || IsPlaceholderTax(entity.CounterpartyTaxNo))
+            return;
+
+        var invoice = await _db.Invoices
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.Id == entity.InvoiceId.Value, ct);
+        if (invoice is null || string.IsNullOrWhiteSpace(invoice.CollectionMetaJson))
+            return;
+
+        try
+        {
+            var node = JsonNode.Parse(invoice.CollectionMetaJson)?.AsObject();
+            if (node is null)
+                return;
+
+            var currentTax = NormalizeTaxNo(node["BuyerTaxNumber"]?.GetValue<string>() ?? node["buyerTaxNumber"]?.GetValue<string>());
+            var nextTax = NormalizeTaxNo(entity.CounterpartyTaxNo);
+            if (string.Equals(currentTax, nextTax, StringComparison.Ordinal) && !IsPlaceholderTax(currentTax))
+                return;
+
+            node["BuyerTaxNumber"] = nextTax;
+            if (!string.IsNullOrWhiteSpace(entity.CounterpartyName))
+                node["BuyerName"] = entity.CounterpartyName!.Trim();
+            invoice.CollectionMetaJson = node.ToJsonString();
+        }
+        catch
+        {
+            // Meta güncellenemezse banka satırı yine de güncellenmiş olur.
+        }
     }
 
     private static bool HasTaxInImportDto(VomsisTransactionImportDto tx)
@@ -1660,21 +2365,108 @@ public sealed class BankSyncService : IBankSyncService
         BankSyncImportResult result,
         CancellationToken ct)
     {
-        if (entity.InvoiceId.HasValue)
+        var placeholderTax = IsPlaceholderTax(entity.CounterpartyTaxNo);
+
+        if (entity.Status is BankImportStatuses.Rejected)
             return false;
 
-        if (entity.Status is BankImportStatuses.DraftCreated or BankImportStatuses.AutoSendQueued or BankImportStatuses.Rejected)
+        // Giden havaleler (borclu) bu yola düşmemeli; e-Fatura/e-Arşiv oluşturulmaz.
+        var earlyType = NormalizeVomsisTxType(entity.TransactionType ?? tx.Type);
+        var earlyCurrency = NormalizeCurrency(entity.Currency ?? tx.Currency);
+        if (string.Equals(earlyType, "borclu", StringComparison.OrdinalIgnoreCase) &&
+            IsTryCurrency(earlyCurrency))
             return false;
 
+        // Önce worker'dan gelen TCKN/şube alanlarını uygula (DraftCreated olsa bile).
+        // Eski erken return'ler mevcut taslaklarda il/ilçe ve TCKN backfill'ini engelliyordu.
         var enrichedTx = await EnsureTaxEnrichedAsync(tx, bankProfile, ct);
         ApplyCounterpartyFields(entity, enrichedTx);
 
-        var txType = (enrichedTx.Type ?? entity.TransactionType ?? "").Trim().ToLowerInvariant();
+        var hasTaxNow = HasValidTaxDigits(entity.CounterpartyTaxNo) && !IsPlaceholderTax(entity.CounterpartyTaxNo);
+        if (hasTaxNow && entity.Status == BankImportStatuses.MissingTaxId)
+        {
+            entity.Status = BankImportStatuses.Pending;
+            entity.StatusMessage = "Vomsis dekontundan TCKN/VKN alındı.";
+        }
+
+        if (entity.InvoiceId.HasValue)
+        {
+            if (hasTaxNow)
+                await TryPatchLinkedCollectionDraftTaxAsync(tenantId, entity, ct);
+            await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+        }
+
+        if (entity.Status is BankImportStatuses.DraftCreated &&
+            entity.InvoiceId.HasValue &&
+            ShouldAutoSendIncoming(bankProfile, entity.Amount))
+        {
+            try
+            {
+                await _workflow.QueueManualSendAsync(tenantId, entity.InvoiceId.Value, null, ct);
+                entity.Status = BankImportStatuses.AutoSendQueued;
+                entity.StatusMessage =
+                    $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL).";
+                await _db.SaveChangesAsync(ct);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                entity.StatusMessage = "Otomatik gönderim başarısız: " + ex.Message;
+                await _db.SaveChangesAsync(ct);
+                return true;
+            }
+        }
+
+        if (entity.Status is BankImportStatuses.DraftCreated or BankImportStatuses.AutoSendQueued)
+        {
+            await _db.SaveChangesAsync(ct);
+            return hasTaxNow ||
+                   !string.IsNullOrWhiteSpace(entity.BankBranchName) ||
+                   !string.IsNullOrWhiteSpace(entity.BankBranchCity);
+        }
+
+        if (placeholderTax && entity.InvoiceId.HasValue && hasTaxNow)
+        {
+            entity.StatusMessage = "Vomsis dekontundan gerçek TCKN/VKN ile güncellendi.";
+            await _db.SaveChangesAsync(ct);
+            return true;
+        }
+
+        if (entity.InvoiceId.HasValue)
+        {
+            await _db.SaveChangesAsync(ct);
+            return hasTaxNow ||
+                   !string.IsNullOrWhiteSpace(entity.BankBranchName) ||
+                   !string.IsNullOrWhiteSpace(entity.BankBranchCity);
+        }
+
+        if (!NeedsDekontEnrichment(entity, tx) &&
+            string.IsNullOrWhiteSpace(tx.BankBranchName) &&
+            string.IsNullOrWhiteSpace(tx.BankBranchCity) &&
+            hasTaxNow &&
+            !string.IsNullOrWhiteSpace(entity.BankBranchName))
+            return false;
+
+        var txType = NormalizeVomsisTxType(enrichedTx.Type ?? entity.TransactionType);
         var currency = NormalizeCurrency(enrichedTx.Currency ?? entity.Currency);
         var amount = entity.Amount;
 
-        if (!IsQualifyingIncomingTransfer(txType, amount, currency, enrichedTx.Description ?? entity.Description))
-            return false;
+        // Tip alanı bozulmuş olsa bile mevcut MissingTaxId satırını TCKN ile güncellemeye devam et.
+        var qualifying = IsQualifyingIncomingTransfer(
+            txType, amount, currency, enrichedTx.Description ?? entity.Description);
+        if (!qualifying && entity.Status is not BankImportStatuses.MissingTaxId)
+        {
+            if (entity.Status is BankImportStatuses.Skipped or BankImportStatuses.Pending)
+            {
+                await _db.SaveChangesAsync(ct);
+                if (entity.InvoiceId.HasValue)
+                    await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+                return HasValidTaxDigits(entity.CounterpartyTaxNo) ||
+                       !string.IsNullOrWhiteSpace(entity.BankBranchCity);
+            }
+
+            return HasValidTaxDigits(entity.CounterpartyTaxNo);
+        }
 
         if (entity.Status is not (
             BankImportStatuses.Skipped or
@@ -1692,22 +2484,25 @@ public sealed class BankSyncService : IBankSyncService
             entity.CounterpartyTaxNo,
             entity.CounterpartyIban,
             entity.Description,
-            IsIncomingTransfer: true), ct);
+            IsIncomingTransfer: true,
+            AllowNihaiTuketici: false), ct);
 
-        if (!resolved.Success || string.IsNullOrWhiteSpace(resolved.TaxNo))
+        if (!resolved.Success || string.IsNullOrWhiteSpace(resolved.TaxNo) || IsPlaceholderTax(resolved.TaxNo))
         {
-            if (string.IsNullOrWhiteSpace(entity.CounterpartyTaxNo))
+            if (string.IsNullOrWhiteSpace(entity.CounterpartyTaxNo) || IsPlaceholderTax(entity.CounterpartyTaxNo))
             {
                 entity.Status = BankImportStatuses.MissingTaxId;
                 entity.StatusMessage = resolved.Message ?? "TCKN/VKN bulunamadı.";
             }
-            return !string.IsNullOrWhiteSpace(entity.CounterpartyTaxNo);
+            return !string.IsNullOrWhiteSpace(entity.CounterpartyTaxNo) && !IsPlaceholderTax(entity.CounterpartyTaxNo);
         }
 
-        entity.CounterpartyTaxNo = resolved.TaxNo;
-        if (!string.IsNullOrWhiteSpace(resolved.DisplayName))
-            entity.CounterpartyName = BankMovementParser.SanitizeCounterpartyDisplayName(resolved.DisplayName, resolved.TaxNo)
-                ?? resolved.DisplayName;
+        entity.CounterpartyTaxNo = NormalizeTaxNo(resolved.TaxNo);
+        entity.CounterpartyName = BankMovementParser.PreferCounterpartyDisplayName(
+            enrichedTx.SenderTitle ?? enrichedTx.SenderName,
+            entity.CounterpartyName,
+            resolved.DisplayName,
+            resolved.TaxNo) ?? entity.CounterpartyName;
 
         CustomerMatchRow? customer = null;
         if (resolved.CustomerId.HasValue)
@@ -1728,6 +2523,49 @@ public sealed class BankSyncService : IBankSyncService
 
         if (customer is null && !resolved.IsNihaiTuketici)
         {
+            if (ShouldAutoSendIncoming(bankProfile, amount) &&
+                IsValidTaxNo(NormalizeTaxNo(entity.CounterpartyTaxNo)))
+            {
+                var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                if (workmanshipError is not null)
+                {
+                    entity.Status = BankImportStatuses.Pending;
+                    entity.StatusMessage = workmanshipError;
+                }
+                else
+                {
+                    try
+                    {
+                        var counterparty = new CustomerMatchRow(
+                            Guid.Empty,
+                            entity.CounterpartyName ?? resolved.DisplayName ?? "Karşı Taraf",
+                            entity.CounterpartyTaxNo!,
+                            null,
+                            null,
+                            null,
+                            null);
+                        var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                            tenantId, branchId, counterparty, entity.CounterpartyTaxNo!, amount, entity, enrichedTx, bankProfile, ct);
+                        await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+                        await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                        entity.Status = BankImportStatuses.AutoSendQueued;
+                        entity.StatusMessage =
+                            $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL, cari eşleşmesiz).";
+                        entity.InvoiceId = invoiceId;
+                        entity.EInvoiceDocumentId = documentId;
+                        result.DraftCreated++;
+                    }
+                    catch (Exception ex)
+                    {
+                        entity.Status = BankImportStatuses.Pending;
+                        entity.StatusMessage = "Otomatik gönderim başarısız: " + ex.Message;
+                    }
+                }
+
+                await _db.SaveChangesAsync(ct);
+                return true;
+            }
+
             entity.Status = BankImportStatuses.NoCustomerMatch;
             entity.StatusMessage = resolved.Message ?? "Karşı taraf cari kayıtlarda bulunamadı.";
             await _db.SaveChangesAsync(ct);
@@ -1741,78 +2579,134 @@ public sealed class BankSyncService : IBankSyncService
 
             if (ShouldAutoSendIncoming(bankProfile, amount))
             {
-                try
-                {
-                    var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
-                        tenantId, branchId, customer, taxNo, amount, entity, ct);
-                    await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
-                    entity.Status = BankImportStatuses.AutoSendQueued;
-                    entity.StatusMessage = $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL).";
-                    entity.InvoiceId = invoiceId;
-                    entity.EInvoiceDocumentId = documentId;
-                    result.DraftCreated++;
-                }
-                catch (Exception ex)
+                var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                if (workmanshipError is not null)
                 {
                     entity.Status = BankImportStatuses.Pending;
-                    entity.StatusMessage = "Otomatik gönderim başarısız: " + ex.Message;
+                    entity.StatusMessage = workmanshipError;
+                }
+                else
+                {
+                    try
+                    {
+                        var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                            tenantId, branchId, customer, taxNo, amount, entity, enrichedTx, bankProfile, ct);
+                        await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+                        await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                        entity.Status = BankImportStatuses.AutoSendQueued;
+                        entity.StatusMessage = $"Otomatik e-Fatura/e-Arşiv gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionIncomingMinAmount:N0} TL).";
+                        entity.InvoiceId = invoiceId;
+                        entity.EInvoiceDocumentId = documentId;
+                        result.DraftCreated++;
+                    }
+                    catch (Exception ex)
+                    {
+                        entity.Status = BankImportStatuses.Pending;
+                        entity.StatusMessage = "Otomatik gönderim başarısız: " + ex.Message;
+                    }
                 }
             }
             else if (ShouldCreateIncomingBankDraft(profile, bankProfile, amount))
             {
-                try
-                {
-                    var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
-                        tenantId, branchId, customer, taxNo, amount, entity, ct);
-                    entity.Status = BankImportStatuses.DraftCreated;
-                    entity.StatusMessage = $"Otomatik taslak oluşturuldu ({resolved.Source}).";
-                    entity.InvoiceId = invoiceId;
-                    entity.EInvoiceDocumentId = documentId;
-                    result.DraftCreated++;
-                }
-                catch (Exception ex)
+                var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                if (workmanshipError is not null)
                 {
                     entity.Status = BankImportStatuses.Pending;
-                    entity.StatusMessage = "Taslak oluşturulamadı: " + ex.Message;
+                    entity.StatusMessage = workmanshipError;
+                }
+                else
+                {
+                    try
+                    {
+                        var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                            tenantId, branchId, customer, taxNo, amount, entity, enrichedTx, bankProfile, ct);
+                        entity.Status = BankImportStatuses.DraftCreated;
+                        entity.StatusMessage = $"Otomatik taslak oluşturuldu ({resolved.Source}).";
+                        entity.InvoiceId = invoiceId;
+                        entity.EInvoiceDocumentId = documentId;
+                        result.DraftCreated++;
+                    }
+                    catch (Exception ex)
+                    {
+                        entity.Status = BankImportStatuses.Pending;
+                        entity.StatusMessage = "Taslak oluşturulamadı: " + ex.Message;
+                    }
                 }
             }
-            else
+            else if (entity.InvoiceId is null)
             {
                 entity.Status = BankImportStatuses.Pending;
-                entity.StatusMessage = "Eşleşti; otomatik taslak ayarları kapalı veya tutar aralığı dışında.";
+                entity.StatusMessage = IncomingBelowThresholdMessage(bankProfile);
             }
 
-            await _taxResolver.LearnAsync(new CounterpartyLearnInput(
-                tenantId, entity.CounterpartyName, entity.CounterpartyIban, taxNo,
-                resolved.Source ?? CounterpartyIdentitySources.BankImport, customer.Id), ct);
         }
         else if (resolved.IsNihaiTuketici)
         {
-            var nihaiCustomer = await EnsureNihaiCustomerAsync(tenantId, branchId, ct);
-            entity.MatchedCustomerId = nihaiCustomer.Id;
-            var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
-                tenantId, branchId, nihaiCustomer, resolved.TaxNo!, amount, entity, ct);
-
             if (ShouldAutoSendIncoming(bankProfile, amount))
             {
-                await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
-                entity.Status = BankImportStatuses.AutoSendQueued;
-                entity.StatusMessage = "Otomatik e-Arşiv gönderim kuyruğuna alındı (nihai tüketici).";
+                var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                if (workmanshipError is not null)
+                {
+                    entity.Status = BankImportStatuses.Pending;
+                    entity.StatusMessage = workmanshipError;
+                }
+                else
+                {
+                    try
+                    {
+                        var nihaiCustomer = await EnsureNihaiCustomerAsync(tenantId, branchId, ct);
+                        entity.MatchedCustomerId = nihaiCustomer.Id;
+                        var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                            tenantId, branchId, nihaiCustomer, resolved.TaxNo!, amount, entity, enrichedTx, bankProfile, ct);
+                        await TryPatchLinkedCollectionDraftAddressAsync(tenantId, entity, bankProfile, ct);
+                        await _workflow.QueueManualSendAsync(tenantId, invoiceId, null, ct);
+                        entity.Status = BankImportStatuses.AutoSendQueued;
+                        entity.StatusMessage = "Otomatik e-Arşiv gönderim kuyruğuna alındı (nihai tüketici).";
+                        entity.InvoiceId = invoiceId;
+                        entity.EInvoiceDocumentId = documentId;
+                        result.DraftCreated++;
+                    }
+                    catch (Exception ex)
+                    {
+                        entity.Status = BankImportStatuses.Pending;
+                        entity.StatusMessage = "Nihai tüketici taslağı oluşturulamadı: " + ex.Message;
+                    }
+                }
             }
             else if (ShouldCreateIncomingBankDraft(profile, bankProfile, amount))
             {
-                entity.Status = BankImportStatuses.DraftCreated;
-                entity.StatusMessage = "Otomatik taslak (nihai tüketici).";
+                var workmanshipError = ValidateIncomingCollectionWorkmanship(profile, amount);
+                if (workmanshipError is not null)
+                {
+                    entity.Status = BankImportStatuses.Pending;
+                    entity.StatusMessage = workmanshipError;
+                }
+                else
+                {
+                    try
+                    {
+                        var nihaiCustomer = await EnsureNihaiCustomerAsync(tenantId, branchId, ct);
+                        entity.MatchedCustomerId = nihaiCustomer.Id;
+                        var (invoiceId, documentId) = await CreateDraftForCustomerAsync(
+                            tenantId, branchId, nihaiCustomer, resolved.TaxNo!, amount, entity, enrichedTx, bankProfile, ct);
+                        entity.Status = BankImportStatuses.DraftCreated;
+                        entity.StatusMessage = "Otomatik taslak (nihai tüketici).";
+                        entity.InvoiceId = invoiceId;
+                        entity.EInvoiceDocumentId = documentId;
+                        result.DraftCreated++;
+                    }
+                    catch (Exception ex)
+                    {
+                        entity.Status = BankImportStatuses.Pending;
+                        entity.StatusMessage = "Nihai tüketici taslağı oluşturulamadı: " + ex.Message;
+                    }
+                }
             }
-            else
+            else if (entity.InvoiceId is null)
             {
                 entity.Status = BankImportStatuses.Pending;
-                entity.StatusMessage = "Nihai tüketici; otomatik taslak ayarları kapalı.";
+                entity.StatusMessage = IncomingBelowThresholdMessage(bankProfile);
             }
-
-            entity.InvoiceId = invoiceId;
-            entity.EInvoiceDocumentId = documentId;
-            result.DraftCreated++;
         }
 
         await _db.SaveChangesAsync(ct);
@@ -1848,8 +2742,9 @@ public sealed class BankSyncService : IBankSyncService
         BankSyncImportResult result,
         CancellationToken ct)
     {
-        var entity = CreateEntity(tenantId, branchId, tx, currency, txType, amount);
-        ApplyCounterpartyFields(entity, tx);
+        var enrichedTx = await EnsureTaxEnrichedAsync(tx, bankProfile, ct);
+        var entity = CreateEntity(tenantId, branchId, enrichedTx, currency, txType, amount);
+        ApplyCounterpartyFields(entity, enrichedTx);
 
         if (!ShouldAutoSendOutgoing(bankProfile, amount))
         {
@@ -1871,6 +2766,87 @@ public sealed class BankSyncService : IBankSyncService
             return;
         }
 
+        await TryCreateOutgoingExpenseSlipDraftAsync(
+            tenantId, branchId, entity, bankProfile, result, ct);
+
+        _db.BankImportTransactions.Add(entity);
+        result.Imported++;
+    }
+
+    private async Task<bool> TryUpgradeExistingOutgoingAsync(
+        BankImportTransaction entity,
+        VomsisTransactionImportDto tx,
+        Guid tenantId,
+        Guid branchId,
+        BankSyncProfile? bankProfile,
+        BankSyncImportResult result,
+        CancellationToken ct)
+    {
+        if (entity.Status is BankImportStatuses.Rejected)
+            return false;
+
+        var enrichedTx = await EnsureTaxEnrichedAsync(tx, bankProfile, ct);
+        ApplyCounterpartyFields(entity, enrichedTx);
+
+        // Giden havale asla e-Fatura/e-Arşiv taslağına dönüştürülmez.
+        if (entity.InvoiceId.HasValue)
+        {
+            entity.StatusMessage =
+                "Giden havale e-Fatura/e-Arşiv ile ilişkilendirilmişti; yeni işlemler Gider Pusulası taslağına yazılır.";
+            await _db.SaveChangesAsync(ct);
+            return true;
+        }
+
+        if (entity.Status is BankImportStatuses.DraftCreated or BankImportStatuses.AutoSendQueued)
+        {
+            if (entity.EInvoiceDocumentId.HasValue)
+            {
+                await _db.SaveChangesAsync(ct);
+                return true;
+            }
+        }
+
+        if (!ShouldAutoSendOutgoing(bankProfile, entity.Amount))
+        {
+            if (entity.Status is BankImportStatuses.Skipped or BankImportStatuses.Pending)
+            {
+                if (bankProfile?.AutoInstructionOutgoingEnabled == true)
+                {
+                    entity.Status = BankImportStatuses.Pending;
+                    entity.StatusMessage =
+                        $"Giden havale — otomatik gider pusulası eşiği altında (<{bankProfile.AutoInstructionOutgoingMinAmount:N0} TL).";
+                }
+                await _db.SaveChangesAsync(ct);
+                return true;
+            }
+
+            return HasValidTaxDigits(entity.CounterpartyTaxNo);
+        }
+
+        if (entity.Status is not (
+            BankImportStatuses.Skipped or
+            BankImportStatuses.MissingTaxId or
+            BankImportStatuses.Pending or
+            BankImportStatuses.NoCustomerMatch))
+        {
+            await _db.SaveChangesAsync(ct);
+            return HasValidTaxDigits(entity.CounterpartyTaxNo);
+        }
+
+        await TryCreateOutgoingExpenseSlipDraftAsync(
+            tenantId, branchId, entity, bankProfile, result, ct);
+        await _db.SaveChangesAsync(ct);
+        return true;
+    }
+
+    private async Task TryCreateOutgoingExpenseSlipDraftAsync(
+        Guid tenantId,
+        Guid branchId,
+        BankImportTransaction entity,
+        BankSyncProfile? bankProfile,
+        BankSyncImportResult result,
+        CancellationToken ct)
+    {
         var resolved = await _taxResolver.ResolveAsync(new CounterpartyResolveInput(
             tenantId,
             branchId,
@@ -1887,15 +2863,15 @@ public sealed class BankSyncService : IBankSyncService
             entity.StatusMessage = resolved.Message ?? "Giden havale için TCKN/VKN bulunamadı.";
             result.MissingTaxId++;
             result.PendingReview++;
-            _db.BankImportTransactions.Add(entity);
-            result.Imported++;
             return;
         }
 
         entity.CounterpartyTaxNo = resolved.TaxNo;
-        if (!string.IsNullOrWhiteSpace(resolved.DisplayName))
-            entity.CounterpartyName = BankMovementParser.SanitizeCounterpartyDisplayName(resolved.DisplayName, resolved.TaxNo)
-                ?? resolved.DisplayName;
+        entity.CounterpartyName = BankMovementParser.PreferCounterpartyDisplayName(
+            null,
+            entity.CounterpartyName,
+            resolved.DisplayName,
+            resolved.TaxNo) ?? entity.CounterpartyName;
         if (resolved.CustomerId.HasValue)
             entity.MatchedCustomerId = resolved.CustomerId;
         else if (resolved.SupplierId.HasValue)
@@ -1904,30 +2880,24 @@ public sealed class BankSyncService : IBankSyncService
         var buyerName = entity.CounterpartyName ?? resolved.DisplayName ?? "Karşı Taraf";
         try
         {
-            var expenseSlipId = await CreateAndQueueExpenseSlipAsync(
+            var expenseSlipId = await CreateExpenseSlipDraftFromBankAsync(
                 tenantId, branchId, entity, resolved.TaxNo, buyerName, ct);
-            entity.Status = BankImportStatuses.AutoSendQueued;
+            entity.Status = BankImportStatuses.DraftCreated;
             entity.StatusMessage =
-                $"Otomatik gider pusulası gönderim kuyruğuna alındı (≥{bankProfile!.AutoInstructionOutgoingMinAmount:N0} TL).";
+                $"Gider Pusulası taslağı oluşturuldu (≥{bankProfile!.AutoInstructionOutgoingMinAmount:N0} TL). Gider Pusulası sekmesinden gönderin.";
             entity.EInvoiceDocumentId = expenseSlipId;
+            entity.InvoiceId = null;
             result.DraftCreated++;
-            await _taxResolver.LearnAsync(new CounterpartyLearnInput(
-                tenantId, entity.CounterpartyName, entity.CounterpartyIban, resolved.TaxNo,
-                resolved.Source ?? CounterpartyIdentitySources.BankImport,
-                resolved.CustomerId, resolved.SupplierId), ct);
         }
         catch (Exception ex)
         {
             entity.Status = BankImportStatuses.Pending;
-            entity.StatusMessage = "Otomatik gider pusulası oluşturulamadı: " + ex.Message;
+            entity.StatusMessage = "Gider Pusulası taslağı oluşturulamadı: " + ex.Message;
             result.PendingReview++;
         }
-
-        _db.BankImportTransactions.Add(entity);
-        result.Imported++;
     }
 
-    private async Task<Guid> CreateAndQueueExpenseSlipAsync(
+    private async Task<Guid> CreateExpenseSlipDraftFromBankAsync(
         Guid tenantId,
         Guid branchId,
         BankImportTransaction entity,
@@ -1935,27 +2905,54 @@ public sealed class BankSyncService : IBankSyncService
         string buyerName,
         CancellationToken ct)
     {
+        await _expenseSlipSchema.EnsureAsync(ct);
+
         var profile = await _db.EInvoiceProfiles
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && x.IsActive, ct);
         var senderTaxNo = NormalizeTaxNo(profile?.TaxNumber);
         if (senderTaxNo.Length is not (10 or 11))
-            throw new InvalidOperationException("Gider pusulası gönderimi için aktif şube e-fatura profilinde geçerli Vergi No zorunludur.");
+            throw new InvalidOperationException("Gider pusulası için aktif şube e-fatura profilinde geçerli Vergi No zorunludur.");
+
+        var settings = EInvoiceProfileSettingsCodec.Decode(profile?.IntegratorCompanyCode);
+        var karat = EInvoiceProfileSettingsCodec.ResolveRandomExpenseSlipKarat(settings.WorkmanshipRules, entity.Amount);
+        var productType = EInvoiceProfileSettingsCodec.BuildExpenseSlipProductType(karat);
+        var workmanship = EInvoiceProfileSettingsCodec.BuildExpenseSlipWorkmanship(karat);
+
+        IReadOnlyDictionary<string, decimal>? adjustedSell = null;
+        try
+        {
+            adjustedSell = await _rates.GetAdjustedSellRatesByCodeAsync(tenantId, branchId, ct);
+        }
+        catch
+        {
+            // Kur servisi geçici ulaşılamazsa ham kura düş.
+        }
+
+        var unitPrice = _rates.GetKaratGramSellPrice(karat, "HAS", adjustedSell);
+        if (unitPrice <= 0m)
+            unitPrice = _rates.GetKaratGramSellPrice(karat);
+        if (unitPrice <= 0m)
+            throw new InvalidOperationException($"{karat} altın kuru bulunamadı; gider pusulası taslağı oluşturulamadı.");
+
+        var grandTotal = decimal.Round(Math.Max(0m, entity.Amount), 2, MidpointRounding.AwayFromZero);
+        var quantityGram = Math.Round(grandTotal / unitPrice, 6, MidpointRounding.AwayFromZero);
+        if (quantityGram <= 0m)
+            throw new InvalidOperationException("Gram miktarı hesaplanamadı (tutar / ayar kuru).");
 
         var docNo = await BuildExpenseSlipDocumentNoAsync(tenantId, branchId, ct);
-        var workmanship = TruncateText(entity.Description ?? "Banka ödemesi", 256);
-        var productType = "Altın";
         var payload = JsonSerializer.Serialize(new
         {
             branchId,
             buyerName = buyerName.Trim(),
             buyerTaxNumber = taxNo,
-            grandTotal = entity.Amount,
+            grandTotal,
             workmanship,
             productType,
-            quantityGram = 1m,
-            unitPrice = entity.Amount,
-            lineTotal = entity.Amount,
+            karat,
+            quantityGram,
+            unitPrice,
+            lineTotal = grandTotal,
             currency = "TRY",
             description = entity.Description?.Trim(),
             source = "BankImport"
@@ -1966,14 +2963,13 @@ public sealed class BankSyncService : IBankSyncService
             TenantId = tenantId,
             BranchId = branchId,
             DocumentNo = docNo,
-            Status = "Queued",
+            Status = "Draft",
             Currency = "TRY",
-            GrandTotal = entity.Amount,
+            GrandTotal = grandTotal,
             BuyerName = buyerName.Trim(),
             BuyerTaxNumber = taxNo,
             Description = entity.Description?.Trim(),
-            PayloadJson = payload,
-            SubmittedAt = DateTime.UtcNow
+            PayloadJson = payload
         };
         _db.ExpenseSlipDocuments.Add(row);
         _db.ExpenseSlipAuditLogs.Add(new ExpenseSlipAuditLog
@@ -1981,7 +2977,7 @@ public sealed class BankSyncService : IBankSyncService
             TenantId = tenantId,
             BranchId = branchId,
             DocumentId = row.Id,
-            Action = "AutoQueueFromBankImport",
+            Action = "AutoDraftFromBankImport",
             StatusBefore = null,
             StatusAfter = row.Status,
             IsSuccess = true,
@@ -1989,6 +2985,113 @@ public sealed class BankSyncService : IBankSyncService
         });
         await _db.SaveChangesAsync(ct);
         return row.Id;
+    }
+
+    private async Task<BankImportActionResult> CreateOutgoingExpenseSlipDraftFromImportAsync(
+        Guid tenantId,
+        Guid branchId,
+        BankImportTransaction tx,
+        Guid? matchedPartyId,
+        CreateBankImportDraftOptions? options,
+        CancellationToken ct)
+    {
+        options ??= new CreateBankImportDraftOptions();
+        string taxNo;
+        string buyerName;
+
+        if (options.UseNihaiTuketici)
+        {
+            taxNo = CounterpartyTaxResolverService.NihaiTuketiciTckn;
+            buyerName = CounterpartyTaxResolverService.NihaiTuketiciName;
+        }
+        else if (options.CustomerId is Guid cid && cid != Guid.Empty)
+        {
+            var customer = await _db.Customers.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == cid && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
+            if (customer is null)
+                return Fail("Müşteri bulunamadı.");
+            buyerName = customer.FullName;
+            taxNo = NormalizeTaxNo(CoalesceText(options.ManualTaxNo, customer.NationalId, tx.CounterpartyTaxNo));
+        }
+        else if (options.SupplierId is Guid sid && sid != Guid.Empty)
+        {
+            var supplier = await _db.Suppliers.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == sid && x.TenantId == tenantId && !x.IsDeleted && x.IsActive, ct);
+            if (supplier is null)
+                return Fail("Tedarikçi bulunamadı.");
+            buyerName = supplier.CompanyName;
+            taxNo = NormalizeTaxNo(CoalesceText(options.ManualTaxNo, supplier.TaxNumber, tx.CounterpartyTaxNo));
+        }
+        else if (matchedPartyId is Guid mid && mid != Guid.Empty)
+        {
+            var customer = await _db.Customers.AsNoTracking()
+                .FirstOrDefaultAsync(x => x.Id == mid && x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct);
+            if (customer is null)
+                return Fail("Müşteri bulunamadı.");
+            buyerName = customer.FullName;
+            taxNo = NormalizeTaxNo(CoalesceText(customer.NationalId, tx.CounterpartyTaxNo));
+        }
+        else if (!string.IsNullOrWhiteSpace(options.ManualTaxNo))
+        {
+            taxNo = NormalizeTaxNo(options.ManualTaxNo);
+            buyerName = CoalesceText(
+                BankMovementParser.SanitizeCounterpartyDisplayName(options.ManualBuyerName, taxNo),
+                BankMovementParser.SanitizeCounterpartyDisplayName(tx.CounterpartyName, taxNo)) ?? "Karşı Taraf";
+        }
+        else
+        {
+            var resolved = await _taxResolver.ResolveAsync(new CounterpartyResolveInput(
+                tenantId,
+                branchId,
+                tx.CounterpartyName,
+                tx.CounterpartyTaxNo,
+                tx.CounterpartyIban,
+                tx.Description,
+                IsIncomingTransfer: false,
+                AllowNihaiTuketici: false), ct);
+            taxNo = NormalizeTaxNo(resolved.TaxNo ?? tx.CounterpartyTaxNo);
+            buyerName = resolved.DisplayName
+                ?? BankMovementParser.SanitizeCounterpartyDisplayName(tx.CounterpartyName, taxNo)
+                ?? "Karşı Taraf";
+        }
+
+        if (!IsValidTaxNo(taxNo))
+            return Fail("Giden havale için geçerli TCKN/VKN bulunamadı.");
+
+        buyerName = BankMovementParser.SanitizeCounterpartyDisplayName(buyerName, taxNo)
+            ?? BankMovementParser.SanitizeCounterpartyDisplayName(tx.CounterpartyName, taxNo)
+            ?? buyerName;
+
+        try
+        {
+            tx.CounterpartyTaxNo = taxNo;
+            if (!string.IsNullOrWhiteSpace(buyerName))
+                tx.CounterpartyName = buyerName;
+            if (matchedPartyId is Guid partyId && partyId != Guid.Empty)
+                tx.MatchedCustomerId = partyId;
+            else if (options.CustomerId is Guid optCid && optCid != Guid.Empty)
+                tx.MatchedCustomerId = optCid;
+
+            var expenseSlipId = await CreateExpenseSlipDraftFromBankAsync(
+                tenantId, branchId, tx, taxNo, buyerName, ct);
+            tx.InvoiceId = null;
+            tx.EInvoiceDocumentId = expenseSlipId;
+            tx.Status = BankImportStatuses.DraftCreated;
+            tx.StatusMessage = "Gider Pusulası taslağı oluşturuldu.";
+            await _db.SaveChangesAsync(ct);
+
+            return new BankImportActionResult
+            {
+                Success = true,
+                EInvoiceDocumentId = expenseSlipId,
+                Status = tx.Status,
+                Message = tx.StatusMessage
+            };
+        }
+        catch (Exception ex)
+        {
+            return Fail(ex.Message);
+        }
     }
 
     private async Task<string> BuildExpenseSlipDocumentNoAsync(Guid tenantId, Guid branchId, CancellationToken ct)
@@ -2103,9 +3206,14 @@ public static class VomsisTaxFieldHelper
 {
     private static readonly string[] TaxFieldTokens =
     [
-        "sender_taxno", "sender_tax_no", "payer_tax_no", "receiver_taxno", "receiver_tax_no",
-        "related_vkn", "ilgili_vkn", "related_tax_no", "ilgili_tax_no", "counterparty_tax_no",
-        "tax_no", "taxno", "vkn", "tckn", "identity_number", "national_id", "vergi_no"
+        "sender_taxno", "sender_tax_no", "sender_tckn", "payer_tax_no", "payer_tckn",
+        "receiver_taxno", "receiver_tax_no", "receiver_tckn",
+        "related_vkn", "related_tckn", "related_tax_no", "related_vkn_tckn",
+        "ilgili_vkn", "ilgili_tckn", "ilgili_tax_no", "ilgili_vkn_tckn", "ilgili_kimlik",
+        "counterparty_tax_no", "counterparty_tckn",
+        "tax_no", "taxno", "vkn", "tckn", "vkn_tckn", "tckn_vkn",
+        "identity_number", "national_id", "national_id_no", "vergi_no", "vergi_kimlik_no",
+        "tc_kimlik", "tc_kimlik_no", "kimlik_no", "identity_no", "id_number"
     ];
 
     private static readonly string[] TitleFieldTokens =
@@ -2119,8 +3227,55 @@ public static class VomsisTaxFieldHelper
     ];
 
     private static readonly Regex VomsisBranchCityDistrictRegex = new(
-        @"^\s*(?<district>[^/]+)\s*/\s*(?<city>[^/\s]+)\s*(?:Subesi|Şubesi|SUBESI|Sube|Şube|Branch)?\s*$",
+        @"^\s*(?<district>[^/]+?)\s*/\s*(?<city>[^/]+?)\s*(?:Subesi|Şubesi|SUBESI|Sube|Şube|Branch)?\s*$",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    private static readonly Regex VomsisBranchCityDistrictInlineRegex = new(
+        @"(?<district>[\p{L}\p{M}]+(?:\s+[\p{L}\p{M}]+)?)\s*/\s*(?<city>[\p{L}\p{M}]+(?:\s+[\p{L}\p{M}]+)?)\s*(?:Subesi|Şubesi|SUBESI|Sube|Şube|Branch)?",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+    public static (string? City, string? District) ResolveCityDistrict(
+        string? branchName,
+        string? branchCity,
+        string? branchDistrict,
+        string? description)
+    {
+        if (!string.IsNullOrWhiteSpace(branchCity) && !string.IsNullOrWhiteSpace(branchDistrict))
+            return (FormatLocationName(branchCity, upper: true), FormatLocationName(branchDistrict, upper: false));
+
+        var fromBranch = ParseCityDistrictFromBranchName(branchName);
+        if (!string.IsNullOrWhiteSpace(fromBranch.City) && !string.IsNullOrWhiteSpace(fromBranch.District))
+            return fromBranch;
+
+        return ParseCityDistrictFromText(description);
+    }
+
+    public static (string? City, string? District) ParseCityDistrictFromText(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            return (null, null);
+
+        var match = VomsisBranchCityDistrictInlineRegex.Match(text.Trim());
+        if (!match.Success)
+            return (null, null);
+
+        var district = FormatLocationName(match.Groups["district"].Value, upper: false);
+        var city = FormatLocationName(match.Groups["city"].Value, upper: true);
+        if (string.IsNullOrWhiteSpace(city) || string.IsNullOrWhiteSpace(district))
+            return (null, null);
+
+        return (city, district);
+    }
+
+    private static string FormatLocationName(string value, bool upper)
+    {
+        var trimmed = value.Trim();
+        if (trimmed.Length == 0)
+            return trimmed;
+        return upper
+            ? trimmed.ToUpper(new CultureInfo("tr-TR"))
+            : char.ToUpper(trimmed[0], new CultureInfo("tr-TR")) + trimmed[1..].ToLower(new CultureInfo("tr-TR"));
+    }
 
     public static string? ResolveTaxNo(params string?[] candidates)
     {
@@ -2178,16 +3333,22 @@ public static class VomsisTaxFieldHelper
         if (string.IsNullOrWhiteSpace(branchName))
             return (null, null);
 
-        var match = VomsisBranchCityDistrictRegex.Match(branchName.Trim());
+        // Vomsis "i̇" (combining dot) gönderebiliyor.
+        var text = branchName.Trim().Normalize(NormalizationForm.FormC).Replace("\u0307", "", StringComparison.Ordinal);
+        text = Regex.Replace(text, @"\s*(?:Subesi|Şubesi|SUBESI|Sube|Şube|Branch)\s*$", "", RegexOptions.IgnoreCase).Trim();
+
+        var match = VomsisBranchCityDistrictRegex.Match(text);
+        if (!match.Success)
+            match = VomsisBranchCityDistrictInlineRegex.Match(text);
         if (!match.Success)
             return (null, null);
 
-        var district = match.Groups["district"].Value.Trim();
-        var city = match.Groups["city"].Value.Trim().ToUpperInvariant();
+        var district = FormatLocationName(match.Groups["district"].Value.Trim(), upper: false);
+        var city = FormatLocationName(match.Groups["city"].Value.Trim(), upper: true);
         if (string.IsNullOrWhiteSpace(city) || string.IsNullOrWhiteSpace(district))
             return (null, null);
 
-        return (city, district.ToUpperInvariant());
+        return (city, district);
     }
 
     private static string? ExtractTaxNoFromElement(JsonElement element)
@@ -2286,24 +3447,37 @@ public static class VomsisTaxFieldHelper
         return null;
     }
 
-    private static bool IsTaxFieldName(string name)
-    {
-        var normalized = name.Replace("-", "_", StringComparison.Ordinal).ToLowerInvariant();
-        return TaxFieldTokens.Any(token => normalized.Contains(token, StringComparison.Ordinal));
-    }
-
     private static bool IsTitleFieldName(string name)
     {
-        var normalized = name.Replace("-", "_", StringComparison.Ordinal).ToLowerInvariant();
+        var normalized = NormalizeFieldToken(name);
         return TitleFieldTokens.Any(token => normalized.Contains(token, StringComparison.Ordinal));
     }
 
     private static bool IsBranchFieldName(string name)
     {
-        var normalized = name.Replace("-", "_", StringComparison.Ordinal).ToLowerInvariant();
+        var normalized = NormalizeFieldToken(name);
         return BranchFieldTokens.Any(token =>
             string.Equals(normalized, token, StringComparison.Ordinal) ||
             normalized.EndsWith("_" + token, StringComparison.Ordinal));
+    }
+
+    private static bool IsTaxFieldName(string name)
+    {
+        var normalized = NormalizeFieldToken(name);
+        return TaxFieldTokens.Any(token => normalized.Contains(token, StringComparison.Ordinal));
+    }
+
+    private static string NormalizeFieldToken(string name)
+    {
+        var normalized = name.Replace("-", "_", StringComparison.Ordinal).ToLowerInvariant();
+        normalized = normalized
+            .Replace('ü', 'u')
+            .Replace('ö', 'o')
+            .Replace('ı', 'i')
+            .Replace('ş', 's')
+            .Replace('ç', 'c')
+            .Replace('ğ', 'g');
+        return normalized;
     }
 
     private static string? ReadJsonString(JsonElement value)
@@ -2385,6 +3559,39 @@ public static class BankMovementParser
                text.StartsWith("GON", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Mobil Havale", StringComparison.OrdinalIgnoreCase) ||
                text.Contains("Gelen Havale", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Vomsis ilgili ünvan / dekont adının güvenilir olup olmadığını kontrol eder.</summary>
+    public static bool HasReliableCounterpartyName(string? value, string? knownTaxNo = null)
+    {
+        var sanitized = SanitizeCounterpartyDisplayName(value, knownTaxNo);
+        return !string.IsNullOrWhiteSpace(sanitized) && !LooksLikeTransferLabel(sanitized);
+    }
+
+    /// <summary>Dekont ünvanını (ilgili_unvan) açıklama ve EDM ünvanına tercih eder.</summary>
+    public static string? PreferCounterpartyDisplayName(
+        string? vomsisTitleOrName,
+        string? currentName,
+        string? resolvedName,
+        string? knownTaxNo = null)
+    {
+        foreach (var candidate in new[]
+                 {
+                     SanitizeCounterpartyDisplayName(vomsisTitleOrName, knownTaxNo),
+                     SanitizeCounterpartyDisplayName(currentName, knownTaxNo),
+                     SanitizeCounterpartyDisplayName(resolvedName, knownTaxNo)
+                 })
+        {
+            if (HasReliableCounterpartyName(candidate, knownTaxNo))
+                return candidate;
+        }
+
+        return new[]
+        {
+            SanitizeCounterpartyDisplayName(vomsisTitleOrName, knownTaxNo),
+            SanitizeCounterpartyDisplayName(currentName, knownTaxNo),
+            SanitizeCounterpartyDisplayName(resolvedName, knownTaxNo)
+        }.FirstOrDefault(x => !string.IsNullOrWhiteSpace(x));
     }
 
     public static string? ExtractCounterpartyName(string? description)

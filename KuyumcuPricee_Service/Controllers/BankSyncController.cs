@@ -57,6 +57,25 @@ public sealed class BankSyncController : ControllerBase
         return Ok(result);
     }
 
+    /// <summary>VM worker: tek hareket için dekonttan gelen TCKN/şube bilgisini uygular.</summary>
+    [HttpPost("vomsis/apply-enrichment")]
+    [AllowAnonymous]
+    public async Task<IActionResult> ApplyEnrichment([FromBody] VomsisEnrichmentApplyDto req, CancellationToken ct)
+    {
+        if (req is null || req.ExternalId <= 0)
+            return BadRequest(new { error = "ExternalId zorunludur." });
+
+        var tid = _tenant.TenantId;
+        var bid = _tenant.BranchId ?? Guid.Empty;
+        if (tid == Guid.Empty || bid == Guid.Empty)
+            return BadRequest(new { error = "TenantId ve BranchId zorunludur (header)." });
+
+        var result = await _bankSync.ApplyVomsisEnrichmentAsync(tid, bid, req, ct);
+        if (!result.Success)
+            return BadRequest(result);
+        return Ok(result);
+    }
+
     /// <summary>VM worker: manuel sync talebini tamamlandı olarak işaretler.</summary>
     [HttpPost("vomsis/sync-complete")]
     [AllowAnonymous]
@@ -250,6 +269,45 @@ public sealed class BankSyncController : ControllerBase
         if (cfg is null)
             return NotFound(new { error = "Banka sync profili bulunamadı veya devre dışı." });
         return Ok(cfg);
+    }
+
+    /// <summary>VM worker: senkron edilecek şube kuyruğu (x-app-key). tenantId/branchIds boşsa tüm yapılandırılmış profiller.</summary>
+    [HttpGet("profile/worker/branches")]
+    [AllowAnonymous]
+    public async Task<IActionResult> GetWorkerBranches(
+        [FromQuery] Guid? tenantId,
+        [FromQuery] string? branchIds,
+        CancellationToken ct)
+    {
+        var tid = tenantId is { } t && t != Guid.Empty
+            ? t
+            : (_tenant.TenantId != Guid.Empty ? _tenant.TenantId : (Guid?)null);
+
+        var branchFilter = ParseBranchIdList(branchIds);
+        if (branchFilter is null &&
+            _tenant.BranchId is { } sessionBranch &&
+            sessionBranch != Guid.Empty)
+        {
+            branchFilter = [sessionBranch];
+        }
+
+        var items = await _profile.GetWorkerBranchQueueAsync(tid, branchFilter, ct);
+        return Ok(items);
+    }
+
+    private static IReadOnlyCollection<Guid>? ParseBranchIdList(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return null;
+
+        var ids = raw
+            .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(x => Guid.TryParse(x, out var g) ? g : Guid.Empty)
+            .Where(x => x != Guid.Empty)
+            .Distinct()
+            .ToList();
+
+        return ids.Count == 0 ? null : ids;
     }
 
     public sealed class VomsisImportReq

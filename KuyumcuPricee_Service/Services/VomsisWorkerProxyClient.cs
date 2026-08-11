@@ -72,6 +72,58 @@ public sealed class VomsisWorkerProxyClient
         };
     }
 
+    public async Task<BankImportTaxRefreshResult> EnrichTaxAsync(
+        Guid tenantId,
+        Guid branchId,
+        long externalId,
+        string? erpApiBaseUrl,
+        CancellationToken ct)
+    {
+        var workerUrl = (_config["BankSync:WorkerTriggerUrl"] ?? "").Trim().TrimEnd('/');
+        if (string.IsNullOrWhiteSpace(workerUrl))
+            throw new InvalidOperationException("Vomsis worker adresi (BankSync:WorkerTriggerUrl) tanımlı değil.");
+
+        var query = new List<string>
+        {
+            "tenantId=" + Uri.EscapeDataString(tenantId.ToString()),
+            "branchId=" + Uri.EscapeDataString(branchId.ToString()),
+            "externalId=" + Uri.EscapeDataString(externalId.ToString())
+        };
+        if (!string.IsNullOrWhiteSpace(erpApiBaseUrl))
+            query.Add("erpApiBaseUrl=" + Uri.EscapeDataString(erpApiBaseUrl.Trim().TrimEnd('/')));
+
+        using var req = new HttpRequestMessage(HttpMethod.Post, workerUrl + "/enrich-tax?" + string.Join("&", query));
+        var syncKey = _config["BankSync:WorkerSyncKey"];
+        if (!string.IsNullOrWhiteSpace(syncKey))
+            req.Headers.Add("x-sync-key", syncKey);
+
+        _logger.LogInformation("Vomsis worker dekont TCKN/VKN sorgusu: externalId={ExternalId}", externalId);
+        using var resp = await _http.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        var parsed = JsonSerializer.Deserialize<WorkerTaxEnrichResponse>(body, JsonOptions);
+        if (!resp.IsSuccessStatusCode)
+        {
+            return new BankImportTaxRefreshResult
+            {
+                Success = false,
+                Message = parsed?.Message ?? TryReadError(body) ?? body
+            };
+        }
+
+        return new BankImportTaxRefreshResult
+        {
+            Success = parsed?.Success == true &&
+                      (!string.IsNullOrWhiteSpace(parsed.CounterpartyTaxNo) ||
+                       !string.IsNullOrWhiteSpace(parsed.BankBranchName)),
+            Message = parsed?.Message,
+            CounterpartyTaxNo = parsed?.CounterpartyTaxNo,
+            CounterpartyName = parsed?.CounterpartyName,
+            BankBranchName = parsed?.BankBranchName,
+            BankBranchCity = parsed?.BankBranchCity,
+            BankBranchDistrict = parsed?.BankBranchDistrict
+        };
+    }
+
     private static string? TryReadError(string body)
     {
         try
@@ -105,5 +157,16 @@ public sealed class VomsisWorkerProxyClient
         public int MissingTaxId { get; set; }
         public int NoCustomerMatch { get; set; }
         public string? SummaryMessage { get; set; }
+    }
+
+    private sealed class WorkerTaxEnrichResponse
+    {
+        public bool Success { get; set; }
+        public string? Message { get; set; }
+        public string? CounterpartyTaxNo { get; set; }
+        public string? CounterpartyName { get; set; }
+        public string? BankBranchName { get; set; }
+        public string? BankBranchCity { get; set; }
+        public string? BankBranchDistrict { get; set; }
     }
 }

@@ -398,27 +398,11 @@ public sealed class CustomerTransactionsController : ControllerBase
         if (string.IsNullOrEmpty(targetLedgerSide))
             targetLedgerSide = ledgerSide;
 
-        var (tgtGrossBorc, tgtGrossAlacak) = await GetCustomerConversionGrossAsync(tenantId, req.CustomerId, branchId, tgtU, ct);
-        var targetIsOpposite = CustomerFinanceHelper.IsLedgerBorc(ledgerSide)
-            ? tgtGrossAlacak > 0m
-            : tgtGrossBorc > 0m;
-
-        if (targetIsOpposite)
-        {
-            if (CustomerFinanceHelper.IsLedgerAlacak(targetLedgerSide))
-            {
-                if (tgtGrossAlacak + 0.0005m < tgtAmt)
-                    throw new InvalidOperationException("Hedef alacak miktarı yetersiz.");
-            }
-            else if (tgtGrossBorc + 0.0005m < tgtAmt)
-            {
-                throw new InvalidOperationException("Hedef borç miktarı yetersiz.");
-            }
-        }
+        var targetUseReduction = CustomerFinanceHelper.ShouldTargetUseReduction(ledgerSide, targetLedgerSide);
 
         var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
         ApplyCustomerConversionReduction(bal, tenantId, req.CustomerId, branchId, srcU, srcAmt, ledgerSide, srcRate, note, txDate, batchId);
-        if (targetIsOpposite)
+        if (targetUseReduction)
             ApplyCustomerConversionReduction(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, targetLedgerSide, tgtRate, note, txDate, batchId);
         else
             ApplyCustomerConversionAddition(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, targetLedgerSide, tgtRate, note, txDate, batchId);

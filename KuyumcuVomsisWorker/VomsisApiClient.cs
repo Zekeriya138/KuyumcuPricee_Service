@@ -3,6 +3,7 @@ using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.RegularExpressions;
 
 namespace KuyumcuVomsisWorker;
 
@@ -10,11 +11,17 @@ public sealed class VomsisApiClient
 {
     private const int MaxDateWindowDays = 7;
 
+    private static readonly Regex TaxDigitsRegex = new(
+        @"\b(\d{10}|\d{11})\b",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private readonly HttpClient _http;
     private readonly IConfiguration _config;
     private readonly ILogger<VomsisApiClient> _logger;
     private string? _token;
     private DateTime _tokenExpiresUtc = DateTime.MinValue;
+    private string? _runtimeAppKey;
+    private string? _runtimeAppSecret;
 
     public VomsisApiClient(HttpClient http, IConfiguration config, ILogger<VomsisApiClient> logger)
     {
@@ -32,9 +39,6 @@ public sealed class VomsisApiClient
         _token = null;
         _tokenExpiresUtc = DateTime.MinValue;
     }
-
-    private string? _runtimeAppKey;
-    private string? _runtimeAppSecret;
 
     public async Task<IReadOnlyList<VomsisTransaction>> GetTransactionsAsync(DateTime beginUtc, DateTime endUtc, CancellationToken ct)
     {
@@ -66,30 +70,106 @@ public sealed class VomsisApiClient
             .ToList();
     }
 
-    private static bool IsWithinUtcRange(VomsisTransaction tx, DateTime beginUtc, DateTime endUtc)
+    public async Task<VomsisTransaction?> GetTransactionDetailAsync(long transactionId, CancellationToken ct)
     {
-        var dt = ParseSystemDate(tx.SystemDate);
-        if (!dt.HasValue)
-            return true;
+        await EnsureTokenAsync(ct);
 
-        return dt.Value >= beginUtc && dt.Value <= endUtc;
-    }
-
-    private static DateTime? ParseSystemDate(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return null;
-        var formats = new[]
+        var url = $"api/v2/transactions/{transactionId.ToString(CultureInfo.InvariantCulture)}";
+        using var req = new HttpRequestMessage(HttpMethod.Get, url);
+        req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _token);
+        using var resp = await _http.SendAsync(req, ct);
+        var body = await resp.Content.ReadAsStringAsync(ct);
+        if (!resp.IsSuccessStatusCode)
         {
-            "yyyy-MM-dd HH:mm:ss",
-            "yyyy-MM-ddTHH:mm:ss",
-            "dd-MM-yyyy HH:mm:ss",
-            "dd.MM.yyyy HH:mm:ss"
-        };
-        if (DateTime.TryParseExact(value, formats, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var dt))
-            return dt.ToUniversalTime();
-        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out dt))
-            return dt.ToUniversalTime();
-        return null;
+            _logger.LogWarning(
+                "Vomsis transaction detail HTTP {Code} for id {Id}: {Body}",
+                (int)resp.StatusCode,
+                transactionId,
+                Truncate(body, 400));
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("status", out var statusEl) &&
+                !string.Equals(statusEl.GetString(), "success", StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning("Vomsis transaction detail başarısız (id={Id}): {Body}", transactionId, Truncate(body, 400));
+                return null;
+            }
+
+            var txElement = ResolveTransactionElement(root) ?? root;
+            var tx = JsonSerializer.Deserialize<VomsisTransaction>(txElement.GetRawText(), JsonOptions) ?? new VomsisTransaction { Id = transactionId };
+
+            var taxFromJson = ExtractBestTaxNo(txElement);
+            if (!string.IsNullOrWhiteSpace(taxFromJson))
+                tx.SenderTaxno = taxFromJson;
+
+            var titleFromJson = ExtractTitleFromElement(txElement);
+            if (!string.IsNullOrWhiteSpace(titleFromJson))
+            {
+                tx.RelatedTitle ??= titleFromJson;
+                tx.SenderTitle ??= titleFromJson;
+            }
+
+            if (txElement.ValueKind == JsonValueKind.Object)
+            {
+                if (txElement.TryGetProperty("sender_branch", out var senderBranchEl) &&
+                    senderBranchEl.ValueKind == JsonValueKind.String)
+                    tx.SenderBranch ??= senderBranchEl.GetString();
+                if (txElement.TryGetProperty("receiver_branch", out var receiverBranchEl) &&
+                    receiverBranchEl.ValueKind == JsonValueKind.String)
+                    tx.ReceiverBranch ??= receiverBranchEl.GetString();
+                if (txElement.TryGetProperty("sender_identity_number", out var senderIdentityEl) &&
+                    senderIdentityEl.ValueKind == JsonValueKind.String)
+                    tx.SenderIdentityNumber ??= senderIdentityEl.GetString();
+                if (txElement.TryGetProperty("opponent_taxno", out var opponentTaxEl) &&
+                    opponentTaxEl.ValueKind == JsonValueKind.String)
+                    tx.OpponentTaxNo ??= opponentTaxEl.GetString();
+                if (txElement.TryGetProperty("opponent_tax_no", out var opponentTaxAltEl) &&
+                    opponentTaxAltEl.ValueKind == JsonValueKind.String)
+                    tx.OpponentTaxNo ??= opponentTaxAltEl.GetString();
+            }
+
+            // Karşı taraf şubesi: kendi hesap (account) şubesini ASLA alma.
+            var branchFromJson = ExtractCounterpartyBranchName(txElement);
+            if (!string.IsNullOrWhiteSpace(branchFromJson))
+            {
+                tx.BranchName ??= branchFromJson;
+                tx.SubeAdi ??= branchFromJson;
+            }
+
+            var resolvedTax = VomsisTransactionMapper.ResolveCounterpartyTaxNo(tx);
+            if (string.IsNullOrWhiteSpace(resolvedTax))
+            {
+                var keys = txElement.ValueKind == JsonValueKind.Object
+                    ? string.Join(",", txElement.EnumerateObject().Select(p => p.Name).Take(40))
+                    : txElement.ValueKind.ToString();
+                _logger.LogWarning(
+                    "Vomsis detail'de TCKN/VKN bulunamadı (id={Id}). Keys={Keys}. BodyPreview={Body}",
+                    transactionId,
+                    keys,
+                    Truncate(body, 800));
+            }
+            else
+            {
+                tx.SenderTaxno = resolvedTax;
+                _logger.LogInformation(
+                    "Vomsis detail TCKN/VKN bulundu (id={Id}, tax={Tax}, branch={Branch})",
+                    transactionId,
+                    resolvedTax,
+                    Coalesce(VomsisTransactionMapper.ResolveBranchName(tx)) ?? "-");
+            }
+
+            return tx;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Vomsis transaction detail parse hatası (id={Id})", transactionId);
+            return null;
+        }
     }
 
     private async Task<IReadOnlyList<VomsisTransaction>> FetchTransactionsWindowAsync(
@@ -136,6 +216,275 @@ public sealed class VomsisApiClient
         _token = auth.Token;
         _tokenExpiresUtc = DateTime.UtcNow.AddHours(23);
         _logger.LogInformation("Vomsis token alındı.");
+    }
+
+    private static JsonElement? ResolveTransactionElement(JsonElement root)
+    {
+        if (root.TryGetProperty("transaction", out var transaction))
+            return UnwrapObjectOrFirstArrayItem(transaction);
+        if (root.TryGetProperty("data", out var data))
+        {
+            if (data.ValueKind == JsonValueKind.Object)
+            {
+                if (data.TryGetProperty("transaction", out var nested))
+                    return UnwrapObjectOrFirstArrayItem(nested);
+                return data;
+            }
+
+            if (data.ValueKind == JsonValueKind.Array)
+                return UnwrapObjectOrFirstArrayItem(data);
+        }
+
+        if (root.TryGetProperty("id", out _) || root.TryGetProperty("key", out _))
+            return root;
+
+        return null;
+    }
+
+    private static JsonElement? UnwrapObjectOrFirstArrayItem(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+            return element;
+        if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var item in element.EnumerateArray())
+            {
+                if (item.ValueKind == JsonValueKind.Object)
+                    return item;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ExtractBestTaxNo(JsonElement element)
+    {
+        var preferred = ExtractTaxByPreferredKeys(element);
+        if (!string.IsNullOrWhiteSpace(preferred))
+            return preferred;
+
+        return ExtractAnyTaxDigits(element);
+    }
+
+    private static string? ExtractTaxByPreferredKeys(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+            return null;
+
+        foreach (var prop in element.EnumerateObject())
+        {
+            var name = prop.Name;
+            var looksTax =
+                name.Contains("tax", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("vkn", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("tckn", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("kimlik", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("identity", StringComparison.OrdinalIgnoreCase) ||
+                name.Contains("vergi", StringComparison.OrdinalIgnoreCase);
+
+            if (looksTax)
+            {
+                var digits = DigitsFromJsonValue(prop.Value);
+                if (digits.Length is 10 or 11)
+                    return digits;
+            }
+
+            if (prop.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+            {
+                var nested = ExtractTaxByPreferredKeys(prop.Value);
+                if (!string.IsNullOrWhiteSpace(nested))
+                    return nested;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ExtractAnyTaxDigits(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.Object:
+                foreach (var prop in element.EnumerateObject())
+                {
+                    var nested = ExtractAnyTaxDigits(prop.Value);
+                    if (!string.IsNullOrWhiteSpace(nested))
+                        return nested;
+                }
+                break;
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    var nested = ExtractAnyTaxDigits(item);
+                    if (!string.IsNullOrWhiteSpace(nested))
+                        return nested;
+                }
+                break;
+            case JsonValueKind.String:
+            case JsonValueKind.Number:
+            {
+                var digits = DigitsFromJsonValue(element);
+                if (digits.Length is 10 or 11)
+                    return digits;
+                break;
+            }
+        }
+
+        return null;
+    }
+
+    private static string DigitsFromJsonValue(JsonElement value)
+    {
+        var raw = value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString() ?? "",
+            JsonValueKind.Number => value.ToString(),
+            _ => ""
+        };
+        if (string.IsNullOrWhiteSpace(raw))
+            return "";
+
+        var match = TaxDigitsRegex.Match(raw);
+        if (match.Success)
+            return match.Groups[1].Value;
+
+        return new string(raw.Where(char.IsDigit).ToArray());
+    }
+
+    private static string? ExtractTitleFromElement(JsonElement element)
+    {
+        foreach (var key in new[] { "related_title", "ilgili_unvan", "sender_title", "sender_name", "title", "payer_name", "opponent_title", "receiver_name", "reciever_name" })
+        {
+            if (element.ValueKind == JsonValueKind.Object &&
+                element.TryGetProperty(key, out var el) &&
+                el.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(el.GetString()))
+                return el.GetString()!.Trim();
+        }
+
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var prop in element.EnumerateObject())
+            {
+                if (prop.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+                {
+                    var nested = ExtractTitleFromElement(prop.Value);
+                    if (!string.IsNullOrWhiteSpace(nested))
+                        return nested;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Karşı taraf şube adı. Kendi banka hesabının account.branch_name değerini bilerek yok sayar.
+    /// </summary>
+    private static string? ExtractCounterpartyBranchName(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.Object)
+            return null;
+
+        foreach (var key in new[]
+                 {
+                     "sender_branch", "receiver_branch", "opponent_branch",
+                     "branch_name", "sube_adi", "sube_ad", "bank_branch_name"
+                 })
+        {
+            if (element.TryGetProperty(key, out var el) &&
+                el.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(el.GetString()))
+            {
+                var text = el.GetString()!.Trim();
+                if (text.Contains('/') || key.Contains("branch", StringComparison.OrdinalIgnoreCase) ||
+                    key.Contains("sube", StringComparison.OrdinalIgnoreCase))
+                    return text;
+            }
+        }
+
+        // İç içe alanlar — "account" kendi şubemiz, atla.
+        foreach (var prop in element.EnumerateObject())
+        {
+            if (string.Equals(prop.Name, "account", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(prop.Name, "bank_account", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (prop.Value.ValueKind is JsonValueKind.Object or JsonValueKind.Array)
+            {
+                var nested = ExtractCounterpartyBranchName(prop.Value);
+                if (!string.IsNullOrWhiteSpace(nested))
+                    return nested;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ResolveTaxNo(params string?[] values)
+    {
+        foreach (var value in values)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+                continue;
+            var digits = new string(value.Where(char.IsDigit).ToArray());
+            if (digits.Length is 10 or 11)
+                return digits;
+        }
+
+        return null;
+    }
+
+    private static string? Coalesce(params string?[] values)
+    {
+        foreach (var v in values)
+            if (!string.IsNullOrWhiteSpace(v))
+                return v.Trim();
+        return null;
+    }
+
+    private static string Truncate(string? value, int max)
+    {
+        if (string.IsNullOrEmpty(value)) return "";
+        return value.Length <= max ? value : value[..max];
+    }
+
+    private static bool IsWithinUtcRange(VomsisTransaction tx, DateTime beginUtc, DateTime endUtc)
+    {
+        var dt = ParseSystemDate(tx.SystemDate);
+        if (!dt.HasValue)
+            return true;
+
+        return dt.Value >= beginUtc && dt.Value <= endUtc;
+    }
+
+    private static DateTime? ParseSystemDate(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var formats = new[]
+        {
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-ddTHH:mm:ss",
+            "dd-MM-yyyy HH:mm:ss",
+            "dd.MM.yyyy HH:mm:ss",
+            "dd.MM.yyyy HH:mm"
+        };
+
+        TimeZoneInfo turkey;
+        try { turkey = TimeZoneInfo.FindSystemTimeZoneById("Turkey Standard Time"); }
+        catch
+        {
+            try { turkey = TimeZoneInfo.FindSystemTimeZoneById("Europe/Istanbul"); }
+            catch { turkey = TimeZoneInfo.CreateCustomTimeZone("Turkey", TimeSpan.FromHours(3), "Turkey", "Turkey"); }
+        }
+
+        if (DateTime.TryParseExact(value, formats, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
+            return TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(dt, DateTimeKind.Unspecified), turkey);
+        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out dt))
+            return TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(dt, DateTimeKind.Unspecified), turkey);
+        return null;
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()
@@ -206,4 +555,43 @@ public sealed class VomsisTransaction
 
     [JsonPropertyName("receiver_tax_no")]
     public string? ReceiverTaxNoAlt { get; set; }
+
+    [JsonPropertyName("ilgili_tckn")]
+    public string? IlgiliTckn { get; set; }
+
+    [JsonPropertyName("related_tckn")]
+    public string? RelatedTckn { get; set; }
+
+    [JsonPropertyName("sender_tckn")]
+    public string? SenderTckn { get; set; }
+
+    [JsonPropertyName("payer_tckn")]
+    public string? PayerTckn { get; set; }
+
+    [JsonPropertyName("tc_kimlik_no")]
+    public string? TcKimlikNo { get; set; }
+
+    [JsonPropertyName("branch_name")]
+    public string? BranchName { get; set; }
+
+    [JsonPropertyName("sube_adi")]
+    public string? SubeAdi { get; set; }
+
+    [JsonPropertyName("opponent_title")]
+    public string? OpponentTitle { get; set; }
+
+    [JsonPropertyName("opponent_taxno")]
+    public string? OpponentTaxNo { get; set; }
+
+    [JsonPropertyName("sender_branch")]
+    public string? SenderBranch { get; set; }
+
+    [JsonPropertyName("receiver_branch")]
+    public string? ReceiverBranch { get; set; }
+
+    [JsonPropertyName("sender_identity_number")]
+    public string? SenderIdentityNumber { get; set; }
+
+    [JsonPropertyName("identity_number")]
+    public string? IdentityNumber { get; set; }
 }

@@ -1094,6 +1094,9 @@ namespace kuyumcu_infrastructure.Persistence
                 e.Property(x => x.CounterpartyName).HasMaxLength(256);
                 e.Property(x => x.CounterpartyTaxNo).HasMaxLength(32);
                 e.Property(x => x.CounterpartyIban).HasMaxLength(64);
+                e.Property(x => x.BankBranchName).HasMaxLength(256);
+                e.Property(x => x.BankBranchCity).HasMaxLength(64);
+                e.Property(x => x.BankBranchDistrict).HasMaxLength(64);
                 e.Property(x => x.Status).HasMaxLength(32).IsRequired();
                 e.Property(x => x.StatusMessage).HasMaxLength(500);
                 e.Property(x => x.Amount).HasColumnType("decimal(18,4)");

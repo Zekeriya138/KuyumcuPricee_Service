@@ -257,8 +257,8 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
         <cbc:CompanyID schemeID=""{Xml(ResolveTaxSchemeId(sellerTax))}"">{Xml(sellerTax)}</cbc:CompanyID>
         <cac:TaxScheme><cbc:Name>{Xml(ToInvoiceDisplayName(profile?.TaxOffice ?? "VERGI DAIRESI"))}</cbc:Name></cac:TaxScheme>
       </cac:PartyTaxScheme>
-      {BuildSellerPartyLegalEntityXml(sellerTax, sellerPersonName)}
-      {BuildPersonXmlIfTckn(sellerTax, sellerPersonName)}
+      {BuildSellerPartyLegalEntityXml(sellerTax, sellerPersonName ?? sellerName)}
+      {BuildPersonXmlIfTckn(sellerTax, sellerPersonName ?? sellerName)}
     </cac:Party>
   </cac:AccountingSupplierParty>
   <cac:AccountingCustomerParty>
@@ -1131,18 +1131,21 @@ public sealed class UblInvoiceBuilder : IUblInvoiceBuilder
     }
 
     /// <summary>
-    /// TCKN (şahıs) için Person; gönderici tarafında firma adının altında ad soyad gösterilir.
-    /// Alıcı şahıs ise PartyName yazılmaz, yalnızca Person kullanılır (çift görünüm engellenir).
+    /// TCKN (şahıs) için Person zorunludur (EDM/GİB Schematron).
+    /// Ad boş olsa bile FirstName/FamilyName üretilir; aksi halde schemeID=TCKN reddedilir.
     /// </summary>
     private static string BuildPersonXmlIfTckn(string? taxNo, string? personName)
     {
-        if (DigitsOnly(taxNo).Length != 11 || string.IsNullOrWhiteSpace(personName))
+        if (DigitsOnly(taxNo).Length != 11)
             return string.Empty;
 
-        var display = ToInvoiceDisplayName(personName);
+        var display = ToInvoiceDisplayName(string.IsNullOrWhiteSpace(personName) ? "AD SOYAD" : personName);
         var parts = display.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var firstName = parts.Length > 0 ? parts[0] : "AD";
-        var familyName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : "SOYAD";
+        var familyName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : (parts.Length == 1 ? parts[0] : "SOYAD");
+        // Tek kelimelik isimde FamilyName boş kalmasın (Schematron/FirstName+FamilyName).
+        if (string.IsNullOrWhiteSpace(familyName))
+            familyName = firstName;
         return $@"<cac:Person>
       <cbc:FirstName>{Xml(firstName)}</cbc:FirstName>
       <cbc:FamilyName>{Xml(familyName)}</cbc:FamilyName>

@@ -99,7 +99,11 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
 
     public async Task<CounterpartyResolveResult> ResolveAsync(CounterpartyResolveInput input, CancellationToken ct)
     {
-        var name = CoalesceText(input.CounterpartyName, BankMovementParser.ExtractCounterpartyName(input.Description));
+        var nameFromCounterparty = BankMovementParser.SanitizeCounterpartyDisplayName(input.CounterpartyName, input.CounterpartyTaxNo);
+        var nameFromDescription = BankMovementParser.ExtractCounterpartyName(input.Description);
+        var name = BankMovementParser.HasReliableCounterpartyName(nameFromCounterparty, input.CounterpartyTaxNo)
+            ? nameFromCounterparty
+            : CoalesceText(nameFromCounterparty, nameFromDescription);
         var normalizedName = BankMovementParser.NormalizeName(name);
         var normalizedIban = NormalizeIban(input.CounterpartyIban);
 
@@ -109,7 +113,9 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
         if (IsAcceptableTaxNo(fromFields))
         {
             var edm = await TryEdmVerifyAsync(input.TenantId, input.BranchId, fromFields, ct);
-            var display = BankMovementParser.SanitizeCounterpartyDisplayName(edm?.Title ?? name, fromFields) ?? name;
+            var display = BankMovementParser.HasReliableCounterpartyName(nameFromCounterparty, fromFields)
+                ? nameFromCounterparty
+                : BankMovementParser.SanitizeCounterpartyDisplayName(edm?.Title ?? name, fromFields) ?? name;
             return CounterpartyResolveResult.Ok(
                 fromFields, display, null, null,
                 edm is not null ? CounterpartyIdentitySources.Edm : CounterpartyIdentitySources.Description,
@@ -131,18 +137,7 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
             }
         }
 
-        // 3) IBAN → global kimlik önbelleği
-        if (!string.IsNullOrWhiteSpace(normalizedIban))
-        {
-            var cached = await FindCacheByIbanAsync(normalizedIban, ct);
-            if (cached is not null)
-                return CounterpartyResolveResult.Ok(
-                    cached.TaxNo, cached.DisplayName ?? name,
-                    cached.LinkedCustomerId, cached.LinkedSupplierId,
-                    CounterpartyIdentitySources.IdentityCache);
-        }
-
-        // 4) IBAN → daha önce eşleşmiş banka hareketi
+        // 3) IBAN → daha önce eşleşmiş banka hareketi
         if (!string.IsNullOrWhiteSpace(normalizedIban))
         {
             var prev = await _db.BankImportTransactions
@@ -166,7 +161,7 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
             }
         }
 
-        // 5) İsim → müşteri (cari)
+        // 4) İsim → müşteri (cari)
         var customerMatch = await ResolveCustomerByNameAsync(input.TenantId, input.BranchId, name, ct);
         if (customerMatch is not null)
         {
@@ -175,7 +170,7 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
                 return CounterpartyResolveResult.Ok(tax, customerMatch.FullName, customerMatch.Id, null, CounterpartyIdentitySources.Customer);
         }
 
-        // 6) İsim → tedarikçi
+        // 5) İsim → tedarikçi
         var supplierMatch = await ResolveSupplierByNameAsync(input.TenantId, name, ct);
         if (supplierMatch is not null)
         {
@@ -184,31 +179,21 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
                 return CounterpartyResolveResult.Ok(tax, supplierMatch.CompanyName, null, supplierMatch.Id, CounterpartyIdentitySources.Supplier);
         }
 
-        // 7) Global önbellek → isim
-        if (!string.IsNullOrWhiteSpace(normalizedName))
-        {
-            var cachedByName = await _db.CounterpartyIdentityCaches
-                .AsNoTracking()
-                .Where(x => x.NormalizedName == normalizedName && !x.IsDeleted)
-                .OrderByDescending(x => x.LastSeenAtUtc)
-                .FirstOrDefaultAsync(ct);
-            if (cachedByName is not null && IsAcceptableTaxNo(cachedByName.TaxNo))
-                return CounterpartyResolveResult.Ok(
-                    cachedByName.TaxNo, cachedByName.DisplayName ?? name,
-                    cachedByName.LinkedCustomerId, cachedByName.LinkedSupplierId,
-                    CounterpartyIdentitySources.IdentityCache);
-        }
-
-        // 8) Geçerli TCKN/VKN varsa EDM doğrulama (tax biliniyor ama cari yok)
+        // 6) Geçerli TCKN/VKN varsa EDM doğrulama (tax biliniyor ama cari yok)
         if (IsAcceptableTaxNo(fromFields))
         {
             var edm = await TryEdmVerifyAsync(input.TenantId, input.BranchId, fromFields, ct);
+            var display = BankMovementParser.PreferCounterpartyDisplayName(
+                input.CounterpartyName,
+                name,
+                edm?.Title,
+                fromFields);
             return CounterpartyResolveResult.Ok(
-                fromFields, edm?.Title ?? name, null, null,
+                fromFields, display ?? name, null, null,
                 edm is not null ? CounterpartyIdentitySources.Edm : CounterpartyIdentitySources.Description);
         }
 
-        // 9) Nihai tüketici (yalnızca gelen, bireysel görünen)
+        // 7) Nihai tüketici (yalnızca gelen, bireysel görünen)
         if (input.AllowNihaiTuketici && input.IsIncomingTransfer && !IsLikelyCorporate(name))
         {
             return CounterpartyResolveResult.Ok(
@@ -227,61 +212,8 @@ public sealed class CounterpartyTaxResolverService : ICounterpartyTaxResolver
                 : $"'{name}' için TCKN/VKN bulunamadı. Cari kaydı güncelleyin veya manuel eşleştirin.");
     }
 
-    public async Task LearnAsync(CounterpartyLearnInput input, CancellationToken ct)
-    {
-        if (!IsAcceptableTaxNo(input.TaxNo)) return;
-
-        var normalizedIban = NormalizeIban(input.CounterpartyIban);
-        var normalizedName = BankMovementParser.NormalizeName(input.CounterpartyName);
-        if (string.IsNullOrWhiteSpace(normalizedIban) && string.IsNullOrWhiteSpace(normalizedName))
-            return;
-
-        CounterpartyIdentityCache? existing = null;
-        if (!string.IsNullOrWhiteSpace(normalizedIban))
-            existing = await _db.CounterpartyIdentityCaches
-                .FirstOrDefaultAsync(x => x.NormalizedIban == normalizedIban && !x.IsDeleted, ct);
-
-        existing ??= string.IsNullOrWhiteSpace(normalizedName)
-            ? null
-            : await _db.CounterpartyIdentityCaches
-                .FirstOrDefaultAsync(x => x.NormalizedName == normalizedName && x.TaxNo == input.TaxNo && !x.IsDeleted, ct);
-
-        if (existing is null)
-        {
-            _db.CounterpartyIdentityCaches.Add(new CounterpartyIdentityCache
-            {
-                NormalizedIban = normalizedIban,
-                NormalizedName = normalizedName ?? "",
-                TaxNo = input.TaxNo,
-                DisplayName = input.CounterpartyName?.Trim(),
-                Source = input.Source,
-                LinkedCustomerId = input.CustomerId,
-                LinkedSupplierId = input.SupplierId,
-                LearnedByTenantId = input.TenantId,
-                LastSeenAtUtc = DateTime.UtcNow
-            });
-        }
-        else
-        {
-            existing.TaxNo = input.TaxNo;
-            existing.DisplayName = input.CounterpartyName?.Trim() ?? existing.DisplayName;
-            existing.Source = input.Source;
-            existing.LinkedCustomerId = input.CustomerId ?? existing.LinkedCustomerId;
-            existing.LinkedSupplierId = input.SupplierId ?? existing.LinkedSupplierId;
-            existing.LastSeenAtUtc = DateTime.UtcNow;
-            if (string.IsNullOrWhiteSpace(existing.NormalizedIban) && !string.IsNullOrWhiteSpace(normalizedIban))
-                existing.NormalizedIban = normalizedIban;
-        }
-
-        await _db.SaveChangesAsync(ct);
-    }
-
-    private async Task<CounterpartyIdentityCache?> FindCacheByIbanAsync(string normalizedIban, CancellationToken ct)
-        => await _db.CounterpartyIdentityCaches
-            .AsNoTracking()
-            .Where(x => x.NormalizedIban == normalizedIban && !x.IsDeleted)
-            .OrderByDescending(x => x.LastSeenAtUtc)
-            .FirstOrDefaultAsync(ct);
+    public Task LearnAsync(CounterpartyLearnInput input, CancellationToken ct)
+        => Task.CompletedTask;
 
     private async Task<TaxpayerLookupResult?> TryEdmVerifyAsync(
         Guid tenantId, Guid branchId, string taxNo, CancellationToken ct)

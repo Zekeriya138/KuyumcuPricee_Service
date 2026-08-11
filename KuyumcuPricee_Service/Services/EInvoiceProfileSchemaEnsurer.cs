@@ -32,7 +32,7 @@ public sealed class EInvoiceProfileSchemaEnsurer
             if (_ensured && !force)
                 return;
 
-            await _db.Database.ExecuteSqlRawAsync(EnsureColumnsSql, ct);
+            await _db.Database.ExecuteSqlRawAsync(EnsureColumnsSql, Array.Empty<object>(), ct);
             _ensured = true;
             _logger.LogDebug("EInvoiceProfiles şema kolonları doğrulandı.");
         }

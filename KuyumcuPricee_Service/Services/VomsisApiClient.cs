@@ -295,6 +295,24 @@ public sealed class VomsisTransaction
 
     [JsonPropertyName("sube_adi")]
     public string? SubeAdi { get; set; }
+
+    [JsonPropertyName("ilgili_tckn")]
+    public string? IlgiliTckn { get; set; }
+
+    [JsonPropertyName("related_tckn")]
+    public string? RelatedTckn { get; set; }
+
+    [JsonPropertyName("sender_tckn")]
+    public string? SenderTckn { get; set; }
+
+    [JsonPropertyName("payer_tckn")]
+    public string? PayerTckn { get; set; }
+
+    [JsonPropertyName("tc_kimlik_no")]
+    public string? TcKimlikNo { get; set; }
+
+    [JsonPropertyName("identity_number")]
+    public string? IdentityNumber { get; set; }
 }
 
 public static class VomsisTransactionMapper
@@ -355,9 +373,15 @@ public static class VomsisTransactionMapper
     private static string? ResolveTaxNo(VomsisTransaction tx)
         => VomsisTaxFieldHelper.ResolveTaxNo(
             tx.SenderTaxno,
+            tx.SenderTckn,
             tx.PayerTaxNo,
+            tx.PayerTckn,
             tx.RelatedVkn,
+            tx.RelatedTckn,
             tx.IlgiliVkn,
+            tx.IlgiliTckn,
+            tx.TcKimlikNo,
+            tx.IdentityNumber,
             tx.ReceiverTaxno,
             tx.ReceiverTaxNoAlt);
 
@@ -372,21 +396,7 @@ public static class VomsisTransactionMapper
     }
 
     private static DateTime? ParseSystemDate(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return null;
-        var formats = new[]
-        {
-            "yyyy-MM-dd HH:mm:ss",
-            "yyyy-MM-ddTHH:mm:ss",
-            "dd-MM-yyyy HH:mm:ss",
-            "dd.MM.yyyy HH:mm:ss"
-        };
-        if (DateTime.TryParseExact(value, formats, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var dt))
-            return dt.ToUniversalTime();
-        if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out dt))
-            return dt.ToUniversalTime();
-        return null;
-    }
+        => VomsisDateHelper.ParseSystemDateToUtc(value);
 
     private static string? Coalesce(params string?[] values)
     {

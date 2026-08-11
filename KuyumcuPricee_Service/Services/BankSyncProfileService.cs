@@ -1,3 +1,4 @@
+using System.Text.Json;
 using kuyumcu_domain.Entities;
 using kuyumcu_infrastructure.Persistence;
 using Microsoft.EntityFrameworkCore;
@@ -10,7 +11,12 @@ public interface IBankSyncProfileService
     Task<BankSyncProfileDto> GetProfileAsync(Guid tenantId, Guid branchId, CancellationToken ct);
     Task<BankSyncProfileDto> SaveProfileAsync(Guid tenantId, SaveBankSyncProfileReq req, CancellationToken ct);
     Task<BankSyncWorkerConfigDto?> GetWorkerConfigAsync(Guid tenantId, Guid branchId, CancellationToken ct);
+    Task<List<BankSyncWorkerBranchQueueDto>> GetWorkerBranchQueueAsync(
+        Guid? tenantId,
+        IReadOnlyCollection<Guid>? branchIds,
+        CancellationToken ct);
     Task RequestManualSyncAsync(Guid tenantId, Guid branchId, CancellationToken ct);
+    Task EnqueuePendingEnrichAsync(Guid tenantId, Guid branchId, long externalId, CancellationToken ct);
     Task CompleteManualSyncAsync(Guid tenantId, Guid branchId, BankSyncPullResult result, CancellationToken ct);
     Task<BankSyncProfileDto> SaveAutoInstructionAsync(Guid tenantId, SaveBankAutoInstructionReq req, CancellationToken ct);
 }
@@ -57,6 +63,17 @@ public sealed class BankSyncWorkerConfigDto
     public int[] AllowedAccountIds { get; set; } = [];
     public int LookbackDays { get; set; } = 7;
     public DateTime? ManualSyncRequestedUtc { get; set; }
+    public long[] PendingEnrichExternalIds { get; set; } = [];
+}
+
+public sealed class BankSyncWorkerBranchQueueDto
+{
+    public Guid TenantId { get; set; }
+    public Guid BranchId { get; set; }
+    public DateTime? ManualSyncRequestedUtc { get; set; }
+    public int PollIntervalMinutes { get; set; } = 5;
+    public DateTime? LastWorkerSyncUtc { get; set; }
+    public bool HasPendingEnrich { get; set; }
 }
 
 public sealed class SaveBankSyncProfileReq
@@ -86,12 +103,18 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
     private readonly AppDbContext _db;
     private readonly IConfiguration _config;
     private readonly BankSyncSchemaEnsurer _schema;
+    private readonly ILogger<BankSyncProfileService> _logger;
 
-    public BankSyncProfileService(AppDbContext db, IConfiguration config, BankSyncSchemaEnsurer schema)
+    public BankSyncProfileService(
+        AppDbContext db,
+        IConfiguration config,
+        BankSyncSchemaEnsurer schema,
+        ILogger<BankSyncProfileService> logger)
     {
         _db = db;
         _config = config;
         _schema = schema;
+        _logger = logger;
     }
 
     public async Task<BankSyncProfileDto> GetProfileAsync(Guid tenantId, Guid branchId, CancellationToken ct)
@@ -108,7 +131,7 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
                 TenantId = tenantId,
                 BranchId = branchId,
                 IsEnabled = true,
-                PollIntervalMinutes = 5,
+                PollIntervalMinutes = 2,
                 AllowedAccountIds = "46",
                 LookbackDays = 7
             };
@@ -145,7 +168,7 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
         if (!string.IsNullOrWhiteSpace(req.ErpApiAppKey))
             profile.ErpApiAppKey = req.ErpApiAppKey.Trim();
 
-        profile.PollIntervalMinutes = Math.Clamp(req.PollIntervalMinutes, 1, 60);
+        profile.PollIntervalMinutes = Math.Clamp(req.PollIntervalMinutes > 0 ? req.PollIntervalMinutes : 2, 1, 60);
         profile.LookbackDays = Math.Clamp(req.LookbackDays, 1, 30);
         profile.AllowedAccountIds = NormalizeAccountIds(req.AllowedAccountIds);
 
@@ -179,8 +202,13 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
     {
         await _schema.EnsureAsync(ct);
         var profile = await _db.BankSyncProfiles
+            .IgnoreQueryFilters()
             .AsNoTracking()
-            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && x.IsEnabled, ct);
+            .FirstOrDefaultAsync(x =>
+                x.TenantId == tenantId &&
+                x.BranchId == branchId &&
+                x.IsEnabled &&
+                !x.IsDeleted, ct);
         if (profile is null || profile.IsDeleted)
             return null;
         if (string.IsNullOrWhiteSpace(profile.VomsisAppKey) || string.IsNullOrWhiteSpace(profile.VomsisAppSecret))
@@ -200,9 +228,81 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
             PollIntervalMinutes = Math.Clamp(profile.PollIntervalMinutes, 1, 60),
             LookbackDays = Math.Clamp(profile.LookbackDays, 1, 30),
             AllowedAccountIds = ParseAccountIds(profile.AllowedAccountIds),
-            ManualSyncRequestedUtc = profile.ManualSyncRequestedUtc
+            ManualSyncRequestedUtc = profile.ManualSyncRequestedUtc,
+            PendingEnrichExternalIds = ParsePendingEnrichIds(profile.PendingEnrichExternalIdsJson)
         };
     }
+
+    public async Task<List<BankSyncWorkerBranchQueueDto>> GetWorkerBranchQueueAsync(
+        Guid? tenantId,
+        IReadOnlyCollection<Guid>? branchIds,
+        CancellationToken ct)
+    {
+        await _schema.EnsureAsync(ct);
+
+        // Worker çağrısında TenantContext boş olabilir; global tenant filtresi
+        // TenantId==Empty ile tüm satırları gizler. Bu yüzden IgnoreQueryFilters kullanıyoruz.
+        var q = _db.BankSyncProfiles
+            .IgnoreQueryFilters()
+            .AsNoTracking()
+            .Where(x => !x.IsDeleted && x.IsEnabled);
+
+        if (tenantId.HasValue && tenantId.Value != Guid.Empty)
+            q = q.Where(x => x.TenantId == tenantId.Value);
+
+        if (branchIds is { Count: > 0 })
+            q = q.Where(x => branchIds.Contains(x.BranchId));
+
+        var profiles = await q.ToListAsync(ct);
+        var now = DateTime.UtcNow;
+
+        var readyProfiles = profiles.Where(IsWorkerProfileReady).ToList();
+        var skippedCount = profiles.Count - readyProfiles.Count;
+        
+        if (skippedCount > 0)
+        {
+            var skippedBranches = profiles
+                .Where(x => !IsWorkerProfileReady(x))
+                .Select(x => new { x.TenantId, x.BranchId, x.VomsisAppKey, x.VomsisAppSecret, x.ErpApiBaseUrl, x.ErpApiAppKey })
+                .ToList();
+            
+            foreach (var skipped in skippedBranches)
+            {
+                var missing = new List<string>();
+                if (string.IsNullOrWhiteSpace(skipped.VomsisAppKey)) missing.Add("VomsisAppKey");
+                if (string.IsNullOrWhiteSpace(skipped.VomsisAppSecret)) missing.Add("VomsisAppSecret");
+                if (string.IsNullOrWhiteSpace(skipped.ErpApiBaseUrl)) missing.Add("ErpApiBaseUrl");
+                if (string.IsNullOrWhiteSpace(skipped.ErpApiAppKey)) missing.Add("ErpApiAppKey");
+                
+                _logger.LogWarning(
+                    "Şube {BranchId} worker senkronundan hariç (eksik: {Missing})",
+                    skipped.BranchId,
+                    string.Join(", ", missing));
+            }
+        }
+
+        return readyProfiles
+            .Select(x => new BankSyncWorkerBranchQueueDto
+            {
+                TenantId = x.TenantId,
+                BranchId = x.BranchId,
+                ManualSyncRequestedUtc = x.ManualSyncRequestedUtc,
+                PollIntervalMinutes = Math.Clamp(x.PollIntervalMinutes, 1, 60),
+                LastWorkerSyncUtc = x.LastWorkerSyncUtc,
+                HasPendingEnrich = ParsePendingEnrichIds(x.PendingEnrichExternalIdsJson).Length > 0
+            })
+            .OrderByDescending(x => x.HasPendingEnrich ||
+                                    (x.ManualSyncRequestedUtc.HasValue &&
+                                     (now - x.ManualSyncRequestedUtc.Value).TotalMinutes < 15))
+            .ThenBy(x => x.LastWorkerSyncUtc ?? DateTime.MinValue)
+            .ToList();
+    }
+
+    private static bool IsWorkerProfileReady(BankSyncProfile profile) =>
+        !string.IsNullOrWhiteSpace(profile.VomsisAppKey) &&
+        !string.IsNullOrWhiteSpace(profile.VomsisAppSecret) &&
+        !string.IsNullOrWhiteSpace(profile.ErpApiBaseUrl) &&
+        !string.IsNullOrWhiteSpace(profile.ErpApiAppKey);
 
     public async Task RequestManualSyncAsync(Guid tenantId, Guid branchId, CancellationToken ct)
     {
@@ -213,6 +313,40 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
 
         profile.ManualSyncRequestedUtc = DateTime.UtcNow;
         await _db.SaveChangesAsync(ct);
+    }
+
+    public async Task EnqueuePendingEnrichAsync(Guid tenantId, Guid branchId, long externalId, CancellationToken ct)
+    {
+        if (externalId <= 0) return;
+        await _schema.EnsureAsync(ct);
+        var profile = await _db.BankSyncProfiles
+            .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId && !x.IsDeleted, ct)
+            ?? throw new InvalidOperationException("Vomsis ayarları bulunamadı.");
+
+        var ids = ParsePendingEnrichIds(profile.PendingEnrichExternalIdsJson).ToList();
+        if (!ids.Contains(externalId))
+            ids.Add(externalId);
+        if (ids.Count > 100)
+            ids = ids.TakeLast(100).ToList();
+
+        profile.PendingEnrichExternalIdsJson = JsonSerializer.Serialize(ids);
+        profile.ManualSyncRequestedUtc = DateTime.UtcNow;
+        await _db.SaveChangesAsync(ct);
+    }
+
+    public static long[] ParsePendingEnrichIds(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return [];
+        try
+        {
+            var ids = JsonSerializer.Deserialize<long[]>(json);
+            return ids?.Where(x => x > 0).Distinct().ToArray() ?? [];
+        }
+        catch
+        {
+            return [];
+        }
     }
 
     public async Task CompleteManualSyncAsync(Guid tenantId, Guid branchId, BankSyncPullResult result, CancellationToken ct)

@@ -206,6 +206,10 @@ public static class CustomerFinanceHelper
         return "";
     }
 
+    /// <summary>Kaynak borç + hedef alacak veya kaynak alacak + hedef borç → hedefte düşüm.</summary>
+    public static bool ShouldTargetUseReduction(string sourceLedgerSide, string targetLedgerSide)
+        => IsLedgerBorc(sourceLedgerSide) ? IsLedgerAlacak(targetLedgerSide) : IsLedgerBorc(targetLedgerSide);
+
     /// <summary>İşlem yönü: alacak sütunu (+) veya borç sütunu (−) net bakiye.</summary>
     public static string LedgerSideFromNetBalance(decimal netBalance)
         => netBalance < 0m ? LedgerBorc : LedgerAlacak;

@@ -60,6 +60,7 @@ public static class EdmUblSchemaNormalizer
             }
 
             EnsureSupplierSoleProprietorDisplay(root, soleProprietorName);
+            EnsureTcknPartiesHavePerson(root, soleProprietorName);
 
             // Gömülü UBL'de XML declaration olmamalı.
             return root.ToString(SaveOptions.DisableFormatting);
@@ -128,6 +129,36 @@ public static class EdmUblSchemaNormalizer
 
         if (!string.Equals(profileIdEl.Value, expectedProfileId, StringComparison.OrdinalIgnoreCase))
             profileIdEl.Value = expectedProfileId;
+    }
+
+    /// <summary>
+    /// EDM Schematron: schemeID=TCKN ise cac:Person zorunludur (gönderici ve alıcı).
+    /// </summary>
+    private static void EnsureTcknPartiesHavePerson(XElement root, string? soleProprietorName)
+    {
+        foreach (var party in root.Descendants(CacNs + "Party").ToList())
+        {
+            if (!IsSupplierTcknParty(party))
+                continue;
+
+            if (party.Element(CacNs + "Person") is not null)
+            {
+                FixMisplacedSupplierPersonElement(party);
+                continue;
+            }
+
+            var fallbackName =
+                (!string.IsNullOrWhiteSpace(soleProprietorName) &&
+                 party.Parent?.Name == CacNs + "AccountingSupplierParty")
+                    ? soleProprietorName
+                    : party.Element(CacNs + "PartyName")?.Element(CbcNs + "Name")?.Value;
+
+            if (string.IsNullOrWhiteSpace(fallbackName))
+                fallbackName = "AD SOYAD";
+
+            var personNode = BuildPersonElement(fallbackName);
+            InsertAfterSupplierPartyTaxScheme(party, personNode);
+        }
     }
 
     /// <summary>
@@ -254,7 +285,9 @@ public static class EdmUblSchemaNormalizer
         var display = personName.Trim().ToUpper(CultureInfo.GetCultureInfo("tr-TR"));
         var parts = display.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         var firstName = parts.Length > 0 ? parts[0] : "AD";
-        var familyName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : "SOYAD";
+        var familyName = parts.Length > 1 ? string.Join(" ", parts.Skip(1)) : firstName;
+        if (string.IsNullOrWhiteSpace(familyName))
+            familyName = "SOYAD";
         return new XElement(CacNs + "Person",
             new XElement(CbcNs + "FirstName", firstName),
             new XElement(CbcNs + "FamilyName", familyName));

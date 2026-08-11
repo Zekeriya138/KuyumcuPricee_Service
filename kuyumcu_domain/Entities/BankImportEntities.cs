@@ -23,6 +23,10 @@ public class BankImportTransaction : Entity, ITenantScoped
     public string? CounterpartyName { get; set; }
     public string? CounterpartyTaxNo { get; set; }
     public string? CounterpartyIban { get; set; }
+    /// <summary>Vomsis dekont şube adı (örn. Kadıköy / İstanbul Şubesi).</summary>
+    public string? BankBranchName { get; set; }
+    public string? BankBranchCity { get; set; }
+    public string? BankBranchDistrict { get; set; }
     public DateTime TransactionDateUtc { get; set; }
 
     /// <summary>Pending, DraftCreated, MissingTaxId, NoCustomerMatch, Rejected, Skipped</summary>
@@ -55,13 +59,16 @@ public class BankSyncProfile : Entity, ITenantScoped
     public string? VomsisAppSecret { get; set; }
     public string ErpApiBaseUrl { get; set; } = "";
     public string? ErpApiAppKey { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 2;
     /// <summary>Virgülle ayrılmış Vomsis hesap id listesi (örn. 46).</summary>
     public string AllowedAccountIds { get; set; } = "46";
     public int LookbackDays { get; set; } = 7;
 
     /// <summary>WPF/canlı API manuel çekim talebi — VM worker ERP'den okur.</summary>
     public DateTime? ManualSyncRequestedUtc { get; set; }
+
+    /// <summary>Worker'ın dekonttan zenginleştireceği Vomsis transaction id listesi (JSON dizi).</summary>
+    public string? PendingEnrichExternalIdsJson { get; set; }
 
     public DateTime? LastWorkerSyncUtc { get; set; }
     public int? LastWorkerSyncFetched { get; set; }

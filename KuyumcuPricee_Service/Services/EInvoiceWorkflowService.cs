@@ -113,6 +113,21 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         if (amount <= 0m)
             throw new InvalidOperationException("Tahsilat tutarı 0'dan büyük olmalıdır.");
 
+        var profileForRules = await _db.EInvoiceProfiles.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.TenantId == input.TenantId && x.BranchId == input.BranchId, ct);
+        var ruleSettings = EInvoiceProfileSettingsCodec.Decode(profileForRules?.IntegratorCompanyCode);
+        if (!EInvoiceProfileSettingsCodec.HasAnyWorkmanshipRules(ruleSettings.WorkmanshipRules))
+        {
+            throw new InvalidOperationException(
+                "Özel matrah işçilik kuralları tanımlı değil. Fatura Ayarları > Özel Matrah İçin İşçilik Belirleme bölümünden 24K/22K/18K/14K/8K aralıklarını ekleyin.");
+        }
+
+        if (EInvoiceProfileSettingsCodec.ListMatchingCollectionWorkmanshipRules(ruleSettings.WorkmanshipRules, amount).Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Tutar ({amount:N2} TL) için eşleşen özel matrah işçilik kuralı yok. Fatura Ayarları > Özel Matrah İçin İşçilik Belirleme aralıklarını kontrol edin.");
+        }
+
         var buyerTax = NormalizeTaxNo(input.BuyerTaxNumber);
         var buyerName = BankMovementParser.SanitizeCounterpartyDisplayName(input.BuyerName, buyerTax)
             ?? input.BuyerName?.Trim()
@@ -133,7 +148,8 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
                 if (lookup is not null)
                 {
                     docType = lookup.IsEInvoiceTaxpayer ? "EFatura" : "EArsiv";
-                    if (!string.IsNullOrWhiteSpace(lookup.Title))
+                    if (!string.IsNullOrWhiteSpace(lookup.Title) &&
+                        !BankMovementParser.HasReliableCounterpartyName(buyerName, buyerTax))
                     {
                         var lookupTitle = BankMovementParser.SanitizeCounterpartyDisplayName(lookup.Title, buyerTax)
                             ?? lookup.Title.Trim();
@@ -273,6 +289,54 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
            taxNo.Length is 10 or 11 &&
            !string.Equals(taxNo, CounterpartyTaxResolverService.NihaiTuketiciTckn, StringComparison.Ordinal);
 
+    private CollectionDraftMeta EnrichCollectionMetaAddressFromBankImport(Guid invoiceId, CollectionDraftMeta meta)
+    {
+        var bankTx = _db.BankImportTransactions.AsNoTracking()
+            .FirstOrDefault(x => x.InvoiceId == invoiceId && !x.IsDeleted);
+
+        Customer? customer = null;
+        if (bankTx?.MatchedCustomerId is Guid customerId && customerId != Guid.Empty)
+        {
+            customer = _db.Customers.AsNoTracking()
+                .FirstOrDefault(x => x.Id == customerId && !x.IsDeleted);
+        }
+
+        if (customer is null)
+            return meta;
+
+        var address = CoalesceText(meta.BuyerAddress, customer.Address);
+        var city = CoalesceText(meta.BuyerCity, customer.City);
+        var district = CoalesceText(meta.BuyerDistrict, customer.District);
+        if (string.IsNullOrWhiteSpace(city) || string.IsNullOrWhiteSpace(district))
+        {
+            var (parsedCity, parsedDistrict) = ParseCityDistrictFromAddress(address);
+            city = CoalesceText(city, parsedCity);
+            district = CoalesceText(district, parsedDistrict);
+        }
+
+        // Eski kayıtlarda alıcı il/ilçesi banka şubesinden kopyalanmış olabilir — cari adresini tercih et.
+        if (bankTx is not null &&
+            !string.IsNullOrWhiteSpace(bankTx.BankBranchCity) &&
+            string.Equals(meta.BuyerCity, bankTx.BankBranchCity, StringComparison.OrdinalIgnoreCase) &&
+            (string.IsNullOrWhiteSpace(bankTx.BankBranchDistrict) ||
+             string.Equals(meta.BuyerDistrict, bankTx.BankBranchDistrict, StringComparison.OrdinalIgnoreCase)))
+        {
+            city = CoalesceText(customer.City, ParseCityDistrictFromAddress(address).City);
+            district = CoalesceText(customer.District, ParseCityDistrictFromAddress(address).District);
+            address = CoalesceText(customer.Address, address);
+        }
+
+        if (string.IsNullOrWhiteSpace(city) && string.IsNullOrWhiteSpace(district) && string.IsNullOrWhiteSpace(address))
+            return meta;
+
+        return meta with
+        {
+            BuyerAddress = address,
+            BuyerCity = city,
+            BuyerDistrict = district
+        };
+    }
+
     private async Task<CollectionDraftMeta> RefreshCollectionDraftMetaAsync(
         Guid tenantId,
         Guid branchId,
@@ -296,7 +360,8 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
 
             var docType = lookup.IsEInvoiceTaxpayer ? "EFatura" : meta.DocumentType;
             var buyerName = meta.BuyerName;
-            if (!string.IsNullOrWhiteSpace(lookup.Title))
+            if (!string.IsNullOrWhiteSpace(lookup.Title) &&
+                !BankMovementParser.HasReliableCounterpartyName(meta.BuyerName, buyerTax))
             {
                 var lookupTitle = BankMovementParser.SanitizeCounterpartyDisplayName(lookup.Title, buyerTax)
                     ?? lookup.Title.Trim();
@@ -340,7 +405,9 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
 
         if (string.Equals(existing.BuyerName, meta.BuyerName, StringComparison.Ordinal) &&
             string.Equals(existing.DocumentType, meta.DocumentType, StringComparison.OrdinalIgnoreCase) &&
-            string.Equals(existing.ReceiverAlias, meta.ReceiverAlias, StringComparison.Ordinal))
+            string.Equals(existing.ReceiverAlias, meta.ReceiverAlias, StringComparison.Ordinal) &&
+            string.Equals(existing.BuyerCity, meta.BuyerCity, StringComparison.Ordinal) &&
+            string.Equals(existing.BuyerDistrict, meta.BuyerDistrict, StringComparison.Ordinal))
             return;
 
         invoice.CollectionMetaJson = JsonSerializer.Serialize(meta, CollectionMetaJsonOptions);
@@ -363,35 +430,45 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         if (amount <= 0m)
             return new List<ManualEInvoiceLineDraft>();
 
-        decimal hasSatis = 0m;
-        try
-        {
-            var sell = await _rates.GetAdjustedSellRatesByCodeAsync(tenantId, branchId, ct);
-            if (sell != null && sell.TryGetValue("G24_TRY", out var r) && r > 0m) hasSatis = r;
-        }
-        catch { /* fallback below */ }
-        if (hasSatis <= 0m) hasSatis = _rates.GetQuoteAskByCode("G24_TRY");
-        if (hasSatis <= 0m) hasSatis = _rates.GetQuoteBidByCode("G24_TRY");
-        if (hasSatis <= 0m)
-            throw new InvalidOperationException("Has altın kuru bulunamadı; taslak fatura oluşturulamadı.");
-
         var profile = await _db.EInvoiceProfiles.AsNoTracking()
             .FirstOrDefaultAsync(x => x.TenantId == tenantId && x.BranchId == branchId, ct);
         var settings = EInvoiceProfileSettingsCodec.Decode(profile?.IntegratorCompanyCode);
-        var specialCraftedVatRatePercent = EInvoiceProfileSettingsCodec.NormalizeVatPercent(settings.SpecialMatrahCraftedVatRatePercent);
-        var specialCraftedVatRateRatio = EInvoiceProfileSettingsCodec.VatPercentToRatio(settings.SpecialMatrahCraftedVatRatePercent);
+        if (!EInvoiceProfileSettingsCodec.HasAnyWorkmanshipRules(settings.WorkmanshipRules))
+        {
+            throw new InvalidOperationException(
+                "Özel matrah işçilik kuralları tanımlı değil. Fatura Ayarları > Özel Matrah İçin İşçilik Belirleme bölümünden 24K/22K/18K/14K/8K aralıklarını ekleyin.");
+        }
 
         var matchedRule = EInvoiceProfileSettingsCodec.ResolveCollectionWorkmanshipRule(
             settings.WorkmanshipRules,
             amount);
+        if (matchedRule is null)
+        {
+            throw new InvalidOperationException(
+                $"Tutar ({amount:N2} TL) için eşleşen özel matrah işçilik kuralı yok. Fatura Ayarları > Özel Matrah İçin İşçilik Belirleme aralıklarını kontrol edin.");
+        }
+
+        var karat = string.IsNullOrWhiteSpace(matchedRule.Karat) ? "24K" : matchedRule.Karat.Trim();
+        IReadOnlyDictionary<string, decimal>? adjustedSell = null;
+        try
+        {
+            adjustedSell = await _rates.GetAdjustedSellRatesByCodeAsync(tenantId, branchId, ct);
+        }
+        catch { /* fallback below */ }
+
+        var goldUnitPrice = _rates.GetKaratGramSellPrice(karat, "HAS", adjustedSell);
+        if (goldUnitPrice <= 0m)
+            goldUnitPrice = _rates.GetKaratGramSellPrice(karat);
+        if (goldUnitPrice <= 0m)
+            throw new InvalidOperationException($"{karat} altın kuru bulunamadı; taslak fatura oluşturulamadı.");
+
+        var specialCraftedVatRatePercent = EInvoiceProfileSettingsCodec.NormalizeVatPercent(settings.SpecialMatrahCraftedVatRatePercent);
+        var specialCraftedVatRateRatio = EInvoiceProfileSettingsCodec.VatPercentToRatio(settings.SpecialMatrahCraftedVatRatePercent);
 
         var saleGross = amount;
-        var ruleGross = matchedRule is not null
-            ? ResolveRuleWorkmanshipGross(saleGross, matchedRule.Percentage)
-            : 0m;
+        var ruleGross = ResolveRuleWorkmanshipGross(saleGross, matchedRule.Percentage);
         var goldTotal = Math.Max(0m, Math.Round(saleGross - ruleGross, 2, MidpointRounding.AwayFromZero));
 
-        var goldUnitPrice = hasSatis;
         var goldQty = goldUnitPrice > 0m
             ? Math.Max(0m, Math.Round(goldTotal / goldUnitPrice, 6, MidpointRounding.AwayFromZero))
             : 0m;
@@ -401,8 +478,7 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
             goldUnitPrice = Math.Round(goldTotal / goldQty, 2, MidpointRounding.AwayFromZero);
         }
 
-        const string productLabel = "Has Altın (Tahsilat Karşılığı)";
-        const string karat = "995";
+        var productLabel = JewelrySpecialBaseCalculator.BuildGoldLineName(karat);
         var lines = new List<ManualEInvoiceLineDraft>
         {
             new(
@@ -437,7 +513,7 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
 
             lines.Add(new ManualEInvoiceLineDraft(
                 2,
-                $"{productLabel} İşçiliği",
+                JewelrySpecialBaseCalculator.BuildWorkmanshipLineName(karat),
                 null,
                 null,
                 goldQty,
@@ -596,6 +672,7 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
         var collectionMeta = TryDeserializeCollectionMeta(invoice.CollectionMetaJson);
         if (collectionMeta is not null)
         {
+            collectionMeta = EnrichCollectionMetaAddressFromBankImport(invoiceId, collectionMeta);
             collectionMeta = await RefreshCollectionDraftMetaAsync(
                 tenantId,
                 invoice.BranchId,
@@ -616,8 +693,8 @@ public sealed class EInvoiceWorkflowService : IEInvoiceWorkflowService
                 string.IsNullOrWhiteSpace(collectionMeta.BuyerName) ? (customer?.FullName?.Trim() ?? string.Empty) : collectionMeta.BuyerName,
                 string.IsNullOrWhiteSpace(collectionMeta.BuyerTaxNumber) ? NormalizeTaxNo(customer?.NationalId) : collectionMeta.BuyerTaxNumber!,
                 collectionMeta.BuyerAddress ?? customer?.Address,
-                CoalesceText(collectionMeta.BuyerCity, customer?.City, companyCity),
-                CoalesceText(collectionMeta.BuyerDistrict, customer?.District, companyDistrict),
+                CoalesceText(collectionMeta.BuyerCity, customer?.City),
+                CoalesceText(collectionMeta.BuyerDistrict, customer?.District),
                 ResolvePostalCodeFromText(collectionMeta.BuyerAddress ?? customer?.Address ?? profile?.CompanyAddress),
                 invoice.InvoiceDate.ToLocalTime().ToString("dd.MM.yyyy"),
                 invoice.InvoiceDate.ToLocalTime().ToString("HH:mm:ss"),
