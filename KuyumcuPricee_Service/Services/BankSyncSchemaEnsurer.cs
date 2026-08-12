@@ -110,7 +110,7 @@ BEGIN
         [VomsisAppSecret] nvarchar(512) NULL,
         [ErpApiBaseUrl] nvarchar(512) NOT NULL,
         [ErpApiAppKey] nvarchar(256) NULL,
-        [PollIntervalMinutes] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_PollIntervalMinutes] DEFAULT(2),
+        [PollIntervalMinutes] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_PollIntervalMinutes] DEFAULT(1),
         [AllowedAccountIds] nvarchar(128) NOT NULL CONSTRAINT [DF_BankSyncProfiles_AllowedAccountIds] DEFAULT(N'46'),
         [LookbackDays] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_LookbackDays] DEFAULT(7),
         [IsDeleted] bit NOT NULL CONSTRAINT [DF_BankSyncProfiles_IsDeleted] DEFAULT(0),
@@ -167,10 +167,16 @@ BEGIN
         ALTER TABLE [dbo].[BankSyncProfiles] ADD [AutoInstructionOutgoingMinAmount] decimal(18,2) NULL;
     IF COL_LENGTH('BankSyncProfiles', 'PendingEnrichExternalIdsJson') IS NULL
         ALTER TABLE [dbo].[BankSyncProfiles] ADD [PendingEnrichExternalIdsJson] nvarchar(2000) NULL;
-    -- Eski varsayılan 5 dk; daha hızlı çekim için 2 dk'ya indir.
+    -- Eski varsayılan 5/2 dk; daha hızlı çekim için 1 dk'ya indir.
     UPDATE [dbo].[BankSyncProfiles]
-    SET [PollIntervalMinutes] = 2
-    WHERE [IsDeleted] = 0 AND [PollIntervalMinutes] = 5;
+    SET [PollIntervalMinutes] = 1
+    WHERE [IsDeleted] = 0 AND [PollIntervalMinutes] IN (2, 5);
+    -- Şişmiş dekont kuyruğu import'u geciktiriyordu; temizle (sonraki sync yeniden seçer).
+    UPDATE [dbo].[BankSyncProfiles]
+    SET [PendingEnrichExternalIdsJson] = NULL
+    WHERE [IsDeleted] = 0
+      AND [PendingEnrichExternalIdsJson] IS NOT NULL
+      AND LEN([PendingEnrichExternalIdsJson]) > 80;
 END
 """;
 

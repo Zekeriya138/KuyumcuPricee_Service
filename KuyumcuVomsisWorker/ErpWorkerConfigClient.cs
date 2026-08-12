@@ -212,7 +212,7 @@ public sealed class RemoteWorkerConfig
     public string? VomsisAppSecret { get; set; }
     public string ErpApiBaseUrl { get; set; } = "";
     public string? ErpApiAppKey { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 1;
     public int[] AllowedAccountIds { get; set; } = [];
     public int LookbackDays { get; set; } = 7;
     public DateTime? ManualSyncRequestedUtc { get; set; }
@@ -224,7 +224,7 @@ public sealed class RemoteWorkerBranchQueueItem
     public Guid TenantId { get; set; }
     public Guid BranchId { get; set; }
     public DateTime? ManualSyncRequestedUtc { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 1;
     public DateTime? LastWorkerSyncUtc { get; set; }
     public bool HasPendingEnrich { get; set; }
 }

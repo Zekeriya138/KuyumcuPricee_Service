@@ -59,7 +59,7 @@ public class BankSyncProfile : Entity, ITenantScoped
     public string? VomsisAppSecret { get; set; }
     public string ErpApiBaseUrl { get; set; } = "";
     public string? ErpApiAppKey { get; set; }
-    public int PollIntervalMinutes { get; set; } = 2;
+    public int PollIntervalMinutes { get; set; } = 1;
     /// <summary>Virgülle ayrılmış Vomsis hesap id listesi (örn. 46).</summary>
     public string AllowedAccountIds { get; set; } = "46";
     public int LookbackDays { get; set; } = 7;

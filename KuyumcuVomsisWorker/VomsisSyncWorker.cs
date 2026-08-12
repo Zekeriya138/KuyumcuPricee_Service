@@ -75,7 +75,7 @@ public sealed class VomsisSyncWorker : BackgroundService
         }
 
         var anyManual = false;
-        var minPollMinutes = 2;
+        var minPollMinutes = 1;
 
         foreach (var branch in dueBranches)
         {

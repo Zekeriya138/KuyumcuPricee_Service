@@ -280,13 +280,25 @@ public sealed class SupplierTransactionsController : ControllerBase
                 var targetUseReduction = CustomerFinanceHelper.ShouldTargetUseReduction(ledgerSide, targetLedgerSide);
 
                 var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
-                var srcDelta = CustomerFinanceHelper.BuildReductionLeg(ledgerSide, srcAmt).BalanceDelta;
-                var tgtDelta = targetUseReduction
-                    ? CustomerFinanceHelper.BuildReductionLeg(targetLedgerSide, tgtAmt).BalanceDelta
-                    : CustomerFinanceHelper.BuildAdditionLeg(targetLedgerSide, tgtAmt).BalanceDelta;
+                ApplySupplierConversionSplitReduction(
+                    bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcRate, note, txDate, batchId,
+                    ledgerSide, grossBorc, grossAlacak);
 
-                ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, srcU, srcAmt, srcDelta, srcRate, note, txDate, batchId, ledgerSide, useReduction: true);
-                lastEntity = ApplySupplierConversionSide(bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate, batchId, targetLedgerSide, targetUseReduction);
+                if (targetUseReduction)
+                {
+                    var (tgtGrossBorc, tgtGrossAlacak) = await GetSupplierConversionGrossAsync(tenantId, supplier.Id, branchId, tgtU, ct);
+                    lastEntity = ApplySupplierConversionSplitReduction(
+                        bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtRate, note, txDate, batchId,
+                        targetLedgerSide, tgtGrossBorc, tgtGrossAlacak);
+                }
+                else
+                {
+                    var tgtDelta = CustomerFinanceHelper.BuildAdditionLeg(targetLedgerSide, tgtAmt).BalanceDelta;
+                    lastEntity = ApplySupplierConversionSide(
+                        bal, tenantId, supplier.Id, branchId, tgtU, tgtAmt, tgtDelta, tgtRate, note, txDate, batchId,
+                        targetLedgerSide, useReduction: false);
+                }
+
                 lastEntityAdded = true;
             }
             else
@@ -827,6 +839,33 @@ public sealed class SupplierTransactionsController : ControllerBase
     {
         static string Safe(string? raw) => (raw ?? "").Replace("|", "/").Replace(";", ",").Trim();
         return $"[ZIYNET]|AD={Safe(ad)}|TIP={Safe(tip)}|ADET={adet.ToString("0.###", CultureInfo.InvariantCulture)}|REF={Safe(reference)}";
+    }
+
+    private SupplierTransaction ApplySupplierConversionSplitReduction(
+        SupplierBalance bal, Guid tenantId, Guid supplierId, Guid branchId,
+        BalanceConversionZiynetHelper.ConversionUnit unit,
+        decimal amount, decimal rate, string note, DateTime txDate, Guid batchId,
+        string primaryLedgerSide, decimal grossBorc, decimal grossAlacak)
+    {
+        SupplierTransaction? last = null;
+        foreach (var leg in CustomerFinanceHelper.BuildSplitReductionLegs(primaryLedgerSide, amount, grossBorc, grossAlacak))
+        {
+            decimal delta;
+            var useReduction = leg.IsSettleReduction;
+            if (useReduction)
+                delta = CustomerFinanceHelper.BuildReductionLeg(leg.LedgerSide, leg.Amount).BalanceDelta;
+            else
+                delta = CustomerFinanceHelper.BuildAdditionLeg(leg.LedgerSide, leg.Amount).BalanceDelta;
+
+            last = ApplySupplierConversionSide(
+                bal, tenantId, supplierId, branchId, unit, leg.Amount, delta, rate, note, txDate, batchId,
+                leg.LedgerSide, useReduction);
+        }
+
+        return last ?? ApplySupplierConversionSide(
+            bal, tenantId, supplierId, branchId, unit, amount,
+            CustomerFinanceHelper.BuildReductionLeg(primaryLedgerSide, amount).BalanceDelta,
+            rate, note, txDate, batchId, primaryLedgerSide, useReduction: true);
     }
 
     private SupplierTransaction ApplySupplierConversionSide(

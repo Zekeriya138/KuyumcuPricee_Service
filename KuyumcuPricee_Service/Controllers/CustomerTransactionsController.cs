@@ -401,9 +401,16 @@ public sealed class CustomerTransactionsController : ControllerBase
         var targetUseReduction = CustomerFinanceHelper.ShouldTargetUseReduction(ledgerSide, targetLedgerSide);
 
         var note = BalanceConversionZiynetHelper.BuildConversionNote(req.Description, srcAmt, srcU, tgtAmt, tgtU, useBuySrc, useBuyTgt);
-        ApplyCustomerConversionReduction(bal, tenantId, req.CustomerId, branchId, srcU, srcAmt, ledgerSide, srcRate, note, txDate, batchId);
+        ApplyCustomerConversionSplitReduction(
+            bal, tenantId, req.CustomerId, branchId, srcU, srcAmt, ledgerSide, srcRate, note, txDate, batchId,
+            grossBorc, grossAlacak);
         if (targetUseReduction)
-            ApplyCustomerConversionReduction(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, targetLedgerSide, tgtRate, note, txDate, batchId);
+        {
+            var (tgtGrossBorc, tgtGrossAlacak) = await GetCustomerConversionGrossAsync(tenantId, req.CustomerId, branchId, tgtU, ct);
+            ApplyCustomerConversionSplitReduction(
+                bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, targetLedgerSide, tgtRate, note, txDate, batchId,
+                tgtGrossBorc, tgtGrossAlacak);
+        }
         else
             ApplyCustomerConversionAddition(bal, tenantId, req.CustomerId, branchId, tgtU, tgtAmt, targetLedgerSide, tgtRate, note, txDate, batchId);
         bal.UpdatedAt = DateTime.UtcNow;
@@ -453,6 +460,21 @@ public sealed class CustomerTransactionsController : ControllerBase
             dovizRows = dovizRows.Concat(misclassified).ToList();
         }
         return CustomerFinanceHelper.ComputeGrossColumns(dovizRows);
+    }
+
+    private void ApplyCustomerConversionSplitReduction(
+        CustomerBalance bal, Guid tenantId, Guid customerId, Guid branchId,
+        BalanceConversionZiynetHelper.ConversionUnit unit,
+        decimal amount, string primaryLedgerSide, decimal rate, string note, DateTime txDate, Guid batchId,
+        decimal grossBorc, decimal grossAlacak)
+    {
+        foreach (var leg in CustomerFinanceHelper.BuildSplitReductionLegs(primaryLedgerSide, amount, grossBorc, grossAlacak))
+        {
+            if (leg.IsSettleReduction)
+                ApplyCustomerConversionReduction(bal, tenantId, customerId, branchId, unit, leg.Amount, leg.LedgerSide, rate, note, txDate, batchId);
+            else
+                ApplyCustomerConversionAddition(bal, tenantId, customerId, branchId, unit, leg.Amount, leg.LedgerSide, rate, note, txDate, batchId);
+        }
     }
 
     private void ApplyCustomerConversionReduction(

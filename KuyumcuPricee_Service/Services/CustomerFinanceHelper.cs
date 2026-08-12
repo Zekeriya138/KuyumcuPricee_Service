@@ -232,6 +232,52 @@ public static class CustomerFinanceHelper
             : (1, "Alacakli", qty);
     }
 
+    public readonly record struct BalanceConversionSplitLeg(decimal Amount, string LedgerSide, bool IsSettleReduction);
+
+    /// <summary>
+    /// Seçilen sütundan düşüm: sütun yetmezse kalan karşı brüt sütuna yansır (tahsilat/ödeme SPLIT mantığı).
+    /// </summary>
+    public static IReadOnlyList<BalanceConversionSplitLeg> BuildSplitReductionLegs(
+        string primaryLedgerSide, decimal amount, decimal grossBorc, decimal grossAlacak)
+    {
+        var legs = new List<BalanceConversionSplitLeg>();
+        var remaining = Math.Abs(amount);
+        if (remaining <= 0m) return legs;
+
+        if (IsLedgerBorc(primaryLedgerSide))
+        {
+            if (grossBorc > 0m)
+            {
+                var offset = Math.Min(grossBorc, remaining);
+                if (offset > 0m)
+                {
+                    legs.Add(new BalanceConversionSplitLeg(offset, LedgerBorc, true));
+                    remaining -= offset;
+                }
+            }
+
+            if (remaining > 0m)
+                legs.Add(new BalanceConversionSplitLeg(remaining, LedgerAlacak, false));
+        }
+        else
+        {
+            if (grossAlacak > 0m)
+            {
+                var offset = Math.Min(grossAlacak, remaining);
+                if (offset > 0m)
+                {
+                    legs.Add(new BalanceConversionSplitLeg(offset, LedgerAlacak, true));
+                    remaining -= offset;
+                }
+            }
+
+            if (remaining > 0m)
+                legs.Add(new BalanceConversionSplitLeg(remaining, LedgerBorc, false));
+        }
+
+        return legs;
+    }
+
     public static string ResolveVeresiyeLedgerSideAuto(decimal grossBorc, decimal grossAlacak)
     {
         var hasBorc = grossBorc > 0m;

@@ -30,48 +30,55 @@ public sealed class VomsisSyncRunner
         _vomsis.Configure(remote.VomsisAppKey!, remote.VomsisAppSecret!);
         _erp.Configure(remote);
 
-        // WPF "Vomsis Dekont" butonu bu id'leri kuyruğa yazar — import'tan bağımsız doğrudan uygula.
-        var pendingApplied = await ProcessPendingEnrichmentsAsync(remote, ct);
-
-        var lookbackDays = Math.Clamp(remote.LookbackDays, 1, 30);
+        // Manuel çekimde tam lookback; arka plan poll'da kısa pencere (daha hızlı liste).
+        var isManual = remote.ManualSyncRequestedUtc is DateTime req &&
+                       (DateTime.UtcNow - req).TotalMinutes < 15;
+        var lookbackDays = isManual
+            ? Math.Clamp(remote.LookbackDays, 1, 30)
+            : Math.Clamp(Math.Min(remote.LookbackDays, 2), 1, 30);
         var endUtc = DateTime.UtcNow;
         var beginUtc = endUtc.AddDays(-lookbackDays);
 
-        _logger.LogInformation("Vomsis hareketleri çekiliyor: {Begin} - {End}", beginUtc, endUtc);
+        _logger.LogInformation(
+            "Vomsis hareketleri çekiliyor: {Begin} - {End} (lookback={Days}g, manual={Manual})",
+            beginUtc, endUtc, lookbackDays, isManual);
         var raw = await _vomsis.GetTransactionsAsync(beginUtc, endUtc, ct);
+
+        // 1) Önce listeyi ERP'ye yaz — UI hemen güncellensin.
+        // 2) CompleteManualSync — "güncel çekiliyor" kalksın.
+        // 3) Sonra dekont zenginleştirme (pending + cycle).
         if (raw.Count == 0)
         {
             var empty = new VomsisSyncRunResult
             {
                 Success = true,
                 FetchedFromVomsis = 0,
-                Imported = pendingApplied,
-                SummaryMessage = pendingApplied > 0
-                    ? $"Bekleyen dekont zenginleştirmesi uygulandı: {pendingApplied}."
-                    : "Vomsis'te seçilen tarih aralığında hareket bulunamadı.",
+                Imported = 0,
+                SummaryMessage = "Vomsis'te seçilen tarih aralığında hareket bulunamadı.",
                 PollIntervalMinutes = remote.PollIntervalMinutes
             };
-            // Son sync zamanını her döngüde güncelle; aksi halde aralık bozulur.
             await _erp.CompleteManualSyncAsync(empty, ct);
+
+            var pendingOnly = await ProcessPendingEnrichmentsAsync(remote, ct);
+            if (pendingOnly > 0)
+            {
+                empty.Imported = pendingOnly;
+                empty.SummaryMessage = $"Bekleyen dekont zenginleştirmesi uygulandı: {pendingOnly}.";
+            }
+
             return empty;
         }
 
-        // Önce listeyi ERP'ye yaz — dekont detayı beklenmeden hareketler görünsün.
         var mappedQuick = raw.Select(VomsisTransactionMapper.ToErp).ToList();
         var import = await _erp.ImportAsync(mappedQuick, ct)
             ?? throw new InvalidOperationException("ERP import yanıtı boş.");
-
-        // Sonra TCKN/şube için dekont zenginleştir; mevcut satırlara patch uygula.
-        await EnrichMissingTaxFromDetailsAsync(raw, ct);
-        var mappedEnriched = raw.Select(VomsisTransactionMapper.ToErp).ToList();
-        var directApplied = await PushEnrichmentsToErpAsync(mappedEnriched, ct);
 
         var runResult = new VomsisSyncRunResult
         {
             Success = true,
             FetchedFromVomsis = raw.Count,
             Received = import.Received,
-            Imported = import.Imported + pendingApplied + directApplied,
+            Imported = import.Imported,
             SkippedDuplicate = import.SkippedDuplicate,
             SkippedFilter = import.SkippedFilter,
             DraftCreated = import.DraftCreated,
@@ -79,13 +86,29 @@ public sealed class VomsisSyncRunner
             MissingTaxId = import.MissingTaxId,
             NoCustomerMatch = import.NoCustomerMatch,
             SummaryMessage =
-                $"Vomsis: {raw.Count} hareket, ERP'ye {import.Imported} kayıt, " +
-                $"dekont patch: {pendingApplied + directApplied} " +
+                $"Vomsis: {raw.Count} hareket, ERP'ye {import.Imported} kayıt " +
                 $"(taslak: {import.DraftCreated}, bekleyen: {import.PendingReview}, atlandı: {import.SkippedFilter}).",
             PollIntervalMinutes = remote.PollIntervalMinutes
         };
 
+        // Import biter bitmez sync tamamlandı say — WPF beklemeyi bıraksın.
         await _erp.CompleteManualSyncAsync(runResult, ct);
+
+        var pendingApplied = await ProcessPendingEnrichmentsAsync(remote, ct);
+        await EnrichMissingTaxFromDetailsAsync(raw, ct);
+        var mappedEnriched = raw.Select(VomsisTransactionMapper.ToErp).ToList();
+        var directApplied = await PushEnrichmentsToErpAsync(mappedEnriched, ct);
+        var enrichTotal = pendingApplied + directApplied;
+        if (enrichTotal > 0)
+        {
+            runResult.Imported = import.Imported + enrichTotal;
+            runResult.SummaryMessage =
+                $"Vomsis: {raw.Count} hareket, ERP'ye {import.Imported} kayıt, " +
+                $"dekont patch: {enrichTotal} " +
+                $"(taslak: {import.DraftCreated}, bekleyen: {import.PendingReview}, atlandı: {import.SkippedFilter}).";
+            await _erp.CompleteManualSyncAsync(runResult, ct);
+        }
+
         return runResult;
     }
 
@@ -129,13 +152,23 @@ public sealed class VomsisSyncRunner
 
     private async Task<int> ProcessPendingEnrichmentsAsync(RemoteWorkerConfig remote, CancellationToken ct)
     {
-        var pendingIds = remote.PendingEnrichExternalIds ?? [];
+        const int maxPendingPerCycle = 10;
+        var pendingIds = (remote.PendingEnrichExternalIds ?? [])
+            .Where(id => id > 0)
+            .Distinct()
+            .Reverse() // kuyruğun sonu = en yeni enqueue
+            .Take(maxPendingPerCycle)
+            .ToArray();
         if (pendingIds.Length == 0)
             return 0;
 
-        _logger.LogInformation("Bekleyen dekont zenginleştirmesi: {Count} id", pendingIds.Length);
+        _logger.LogInformation(
+            "Bekleyen dekont zenginleştirmesi: {Count}/{Total} id (döngü limiti {Limit})",
+            pendingIds.Length,
+            remote.PendingEnrichExternalIds?.Length ?? 0,
+            maxPendingPerCycle);
         var applied = 0;
-        foreach (var externalId in pendingIds.Distinct())
+        foreach (var externalId in pendingIds)
         {
             ct.ThrowIfCancellationRequested();
             try
@@ -143,7 +176,9 @@ public sealed class VomsisSyncRunner
                 var detail = await _vomsis.GetTransactionDetailAsync(externalId, ct);
                 if (detail is null)
                 {
-                    _logger.LogWarning("Pending enrich: dekont alınamadı id={Id}", externalId);
+                    _logger.LogWarning("Pending enrich: dekont alınamadı id={Id} — kuyruktan düşülüyor", externalId);
+                    // Stuck kuyruk olmasın: boş patch ile id'yi temizlemeyi dene.
+                    await _erp.ApplyEnrichmentAsync(new ErpImportTransaction { ExternalId = externalId }, ct);
                     continue;
                 }
 
@@ -190,7 +225,7 @@ public sealed class VomsisSyncRunner
         IReadOnlyList<VomsisTransaction> raw,
         CancellationToken ct)
     {
-        const int maxDetailPerCycle = 25;
+        const int maxDetailPerCycle = 15;
 
         // Önce eksik TCKN/şube olanlar; en yeni hareketler önce (gecikmeyi azaltır).
         var candidates = raw
@@ -343,7 +378,7 @@ public sealed class VomsisSyncRunResult
     public int MissingTaxId { get; set; }
     public int NoCustomerMatch { get; set; }
     public string? SummaryMessage { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 1;
 
     public static VomsisSyncRunResult Fail(string message) => new() { Success = false, Error = message };
 }

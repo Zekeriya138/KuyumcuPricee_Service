@@ -889,7 +889,7 @@ BEGIN
         [VomsisAppSecret] nvarchar(512) NULL,
         [ErpApiBaseUrl] nvarchar(512) NOT NULL,
         [ErpApiAppKey] nvarchar(256) NULL,
-        [PollIntervalMinutes] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_PollIntervalMinutes] DEFAULT(2),
+        [PollIntervalMinutes] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_PollIntervalMinutes] DEFAULT(1),
         [AllowedAccountIds] nvarchar(128) NOT NULL CONSTRAINT [DF_BankSyncProfiles_AllowedAccountIds] DEFAULT(N'46'),
         [LookbackDays] int NOT NULL CONSTRAINT [DF_BankSyncProfiles_LookbackDays] DEFAULT(7),
         [IsDeleted] bit NOT NULL CONSTRAINT [DF_BankSyncProfiles_IsDeleted] DEFAULT(0),

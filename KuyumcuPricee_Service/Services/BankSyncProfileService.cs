@@ -30,7 +30,7 @@ public sealed class BankSyncProfileDto
     public bool HasVomsisAppSecret { get; set; }
     public string ErpApiBaseUrl { get; set; } = "";
     public bool HasErpApiAppKey { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 1;
     public string AllowedAccountIds { get; set; } = "46";
     public int LookbackDays { get; set; } = 7;
     public DateTime? ManualSyncRequestedUtc { get; set; }
@@ -59,7 +59,7 @@ public sealed class BankSyncWorkerConfigDto
     public string? VomsisAppSecret { get; set; }
     public string ErpApiBaseUrl { get; set; } = "";
     public string? ErpApiAppKey { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 1;
     public int[] AllowedAccountIds { get; set; } = [];
     public int LookbackDays { get; set; } = 7;
     public DateTime? ManualSyncRequestedUtc { get; set; }
@@ -71,7 +71,7 @@ public sealed class BankSyncWorkerBranchQueueDto
     public Guid TenantId { get; set; }
     public Guid BranchId { get; set; }
     public DateTime? ManualSyncRequestedUtc { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 1;
     public DateTime? LastWorkerSyncUtc { get; set; }
     public bool HasPendingEnrich { get; set; }
 }
@@ -84,7 +84,7 @@ public sealed class SaveBankSyncProfileReq
     public string? VomsisAppSecret { get; set; }
     public string? ErpApiBaseUrl { get; set; }
     public string? ErpApiAppKey { get; set; }
-    public int PollIntervalMinutes { get; set; } = 5;
+    public int PollIntervalMinutes { get; set; } = 1;
     public string? AllowedAccountIds { get; set; }
     public int LookbackDays { get; set; } = 7;
 }
@@ -131,7 +131,7 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
                 TenantId = tenantId,
                 BranchId = branchId,
                 IsEnabled = true,
-                PollIntervalMinutes = 2,
+                PollIntervalMinutes = 1,
                 AllowedAccountIds = "46",
                 LookbackDays = 7
             };
@@ -168,7 +168,7 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
         if (!string.IsNullOrWhiteSpace(req.ErpApiAppKey))
             profile.ErpApiAppKey = req.ErpApiAppKey.Trim();
 
-        profile.PollIntervalMinutes = Math.Clamp(req.PollIntervalMinutes > 0 ? req.PollIntervalMinutes : 2, 1, 60);
+        profile.PollIntervalMinutes = Math.Clamp(req.PollIntervalMinutes > 0 ? req.PollIntervalMinutes : 1, 1, 60);
         profile.LookbackDays = Math.Clamp(req.LookbackDays, 1, 30);
         profile.AllowedAccountIds = NormalizeAccountIds(req.AllowedAccountIds);
 
@@ -326,8 +326,8 @@ public sealed class BankSyncProfileService : IBankSyncProfileService
         var ids = ParsePendingEnrichIds(profile.PendingEnrichExternalIdsJson).ToList();
         if (!ids.Contains(externalId))
             ids.Add(externalId);
-        if (ids.Count > 100)
-            ids = ids.TakeLast(100).ToList();
+        if (ids.Count > 20)
+            ids = ids.TakeLast(20).ToList();
 
         profile.PendingEnrichExternalIdsJson = JsonSerializer.Serialize(ids);
         profile.ManualSyncRequestedUtc = DateTime.UtcNow;

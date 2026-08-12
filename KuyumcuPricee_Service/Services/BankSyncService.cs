@@ -287,6 +287,8 @@ public sealed class BankSyncService : IBankSyncService
         Guid branchId,
         CancellationToken ct)
     {
+        // Atlandı (komisyon/BSMV) kuyruğa alınmaz — import'u geciktirir.
+        // Yalnızca gerçekten TCKN/şube eksik anlamlı satırlar.
         var missingIds = await _db.BankImportTransactions.AsNoTracking()
             .Where(x =>
                 x.TenantId == tenantId &&
@@ -294,16 +296,19 @@ public sealed class BankSyncService : IBankSyncService
                 x.Provider == ProviderVomsis &&
                 !x.IsDeleted &&
                 x.ExternalId > 0 &&
+                x.Status != BankImportStatuses.Skipped &&
+                x.Status != BankImportStatuses.Rejected &&
+                x.Amount >= 1m &&
                 (x.Status == BankImportStatuses.MissingTaxId ||
-                 x.Status == BankImportStatuses.Skipped ||
+                 x.Status == BankImportStatuses.NoCustomerMatch ||
                  x.Status == BankImportStatuses.Pending ||
-                 x.CounterpartyTaxNo == null ||
-                 x.CounterpartyTaxNo == "" ||
-                 x.BankBranchName == null ||
-                 x.BankBranchName == ""))
+                 x.Status == BankImportStatuses.DraftCreated ||
+                 x.Status == BankImportStatuses.AutoSendQueued) &&
+                ((x.CounterpartyTaxNo == null || x.CounterpartyTaxNo == "") ||
+                 (x.BankBranchName == null || x.BankBranchName == "")))
             .OrderByDescending(x => x.TransactionDateUtc)
             .Select(x => x.ExternalId)
-            .Take(40)
+            .Take(10)
             .ToListAsync(ct);
 
         foreach (var id in missingIds)
@@ -1898,11 +1903,16 @@ public sealed class BankSyncService : IBankSyncService
                  (!string.IsNullOrWhiteSpace(enrichment.ExternalKey) && x.ExternalKey == enrichment.ExternalKey)), ct);
 
         if (entity is null)
+        {
+            // Worker kuyruğunda takılı id kalmasın.
+            await RemovePendingEnrichIdAsync(tenantId, branchId, enrichment.ExternalId, ct);
+            await _db.SaveChangesAsync(ct);
             return new BankImportTaxRefreshResult
             {
                 Success = false,
                 Message = $"Banka hareketi bulunamadı (externalId={enrichment.ExternalId})."
             };
+        }
 
         var dto = new VomsisTransactionImportDto
         {
